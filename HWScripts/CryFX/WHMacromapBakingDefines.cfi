@@ -1,0 +1,6 @@
+// WH[TBa]: this file shoud contain CTSW related to macromap baking,
+// it is replaced by Tools\MacromapGenerationReplacementFiles\Engine\Shaders\HWScripts\CryFx\WHMacromapBakingDefines.cfi
+// during the build process.
+
+// WH::RS: for macromap generator
+//#undef MACROMAP_BAKING

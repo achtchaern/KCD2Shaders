@@ -1,0 +1,481 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+// particle shader used from particle effects specifying a material
+// code for actual shader is shared
+
+#define USE_MATERIAL
+
+#include "Common.cfi"
+#include "GpuParticlesCommon.cfi"
+#include "ShadowCommon.cfi"
+#include "ParticleVT.cfi"
+#include "ModificatorVT.cfi"
+#include "ShadeLib.cfi"
+#include "ForwardShading.cfi"
+#include "LightVolumes.cfi"
+// WH[TBa]: changed order of includes, we need tiled shading constants in LightVolumes.cfi, also shadow defines in ParticleVT.cfi
+
+float Script : STANDARDSGLOBAL
+<
+	string Script =
+		"Public;"
+		"NoPreview;"
+#if %DEPTH_FIXUP
+		"DepthFixup;"
+#endif
+#if %REFRACTION
+		"Refractive;"
+		"ShaderDrawType = General;"
+#else
+		"ShaderDrawType = Light;"
+#endif
+		"ShaderType = Particle;";
+>;
+
+Texture2D customTex : register(t9)
+<
+#if %SCREEN_SPACE_DEFORMATION
+	UIName = "Refraction Normal";
+#elif %DEFORMATION
+	UIName = "Deformation Normal";
+#endif
+> = TM_Custom;
+
+Texture2D customSecondaryTex : register(t10)
+<
+	UIName = "Color Lookup Map";
+> = TM_CustomSecondary;
+
+#if %SECOND_DIFF
+	Texture2D customSecDiffTex : register(t7)
+	<
+		UIName = "Secondary Diffuse";
+	> = TM_DecalOverlay;
+#endif
+
+#if %SECOND_ALPHA
+	Texture2D customSecAlphaTex : register(t11)
+	<
+		UIName = "Secondary Alpha";
+	> = TM_Opacity;
+#endif
+
+#if %ALPHA_MASK || %SCREEN_MASK
+	Texture2D separateAlpha : register(t2)
+	<
+		UIName = "Separate Alpha";
+	> = TM_Specular;
+#endif
+
+Texture2D glowTex: register(t4)
+<
+	UIName = "Glow Map";
+> = TM_Detail;
+
+#if %FLOW_MAP || %MOTION_VECTOR
+Texture2D flowMapTex : register(t8)
+<
+	UIName = "Flow Map";
+> = TM_SubSurface;
+#endif
+
+#if %REFRACTION
+	float RefrBumpScale
+	<
+		register = REG_PM_PARAM_0.x;
+		string UIHelp = "Refraction bump scale \nMin value = 0, Max value = 2.0 \nCorrect name - RefrBumpScale";
+		string UIName = "Refraction Bump Scale";
+
+		string UIWidget = "slider";
+		float UIMin = 0.0;
+		float UIMax = 2.0;
+		float UIStep = 0.1;
+	> = 0.1;
+#endif
+
+#if %SCREEN_SPACE_DEFORMATION
+
+float AnimSpeed
+<
+	register = REG_PM_PARAM_0.y;
+	string UIName = "Perturbation Anim Speed";
+
+	string UIWidget = "slider";
+	float UIMin = -10.0;
+	float UIMax = 10.0;
+	float UIStep = 0.005;
+> = 0.2;
+
+float PerturbationScale
+<
+	register = REG_PM_PARAM_0.z;
+	string UIName = "Perturbation Tiling";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 32.0;
+	float UIStep = 0.005;
+> = 0.5;
+
+float PerturbationStrength
+<
+	register = REG_PM_PARAM_0.w;
+	string UIName = "Perturbation Amount";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.005;
+> = 0.01;
+
+#elif %DEFORMATION
+
+float DeformTile
+<
+	register = REG_PM_PARAM_1.x;
+	string UIHelp = "Deformation tiling, \nMin value = 0.0, Max value = 20.0 \nCorrect name - DeformTile";
+	string UIName = "Deform Tiling";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 20.0;
+	float UIStep = 0.005;
+> = 0.1;
+
+float DeformAmount
+<
+	register = REG_PM_PARAM_1.y;
+	string UIHelp = "How much Deformation shifts UVs, \nMin value = 0.0, Max value = 1.0 \nCorrect name - DeformAmount";
+	string UIName = "Deform Amount";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.05;
+
+// Introducing direction to deformation, losing compatibility with older materials but very useful and can be restored
+float DeformAnimSpeedX
+<
+	register = REG_PM_PARAM_1.z;
+	string UIHelp = "How fast Deformation moves along X axis, \nMin value = -50.0, Max value = 50.0 \nCorrect name - DeformAnimSpeedX";
+	string UIName = "Deform Anim Speed X";
+	string UIWidget = "slider";
+	float UIMin = -50.0;
+	float UIMax = 50.0;
+	float UIStep = 0.005;
+> = 0.1;
+
+float DeformAnimSpeedY
+<
+	register = REG_PM_PARAM_5.x;
+	string UIHelp = "How fast Deformation moves along Y axis, \nMin value = -50.0, Max value = 50.0 \nCorrect name - DeformAnimSpeedY";
+	string UIName = "Deform Anim Speed Y";
+	string UIWidget = "slider";
+	float UIMin = -50.0;
+	float UIMax = 50.0;
+	float UIStep = 0.005;
+> = 0.1;
+
+// added control to change amount for secondary deformation as its not always requiered
+float DeformOctavePower
+<
+	register = REG_PM_PARAM_5.w;
+	string UIHelp = "How much Deformation is applied a second time with higher tiling, \nMin value = 0.0, Max value = 3.0 \nCorrect name - DeformOctavePower";
+	string UIName = "Deform Second Octave Power;
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 3.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+// added control to aspect ratio (very usefull for ribbons)
+float DeformAspectRatio
+<
+	register = REG_PM_PARAM_6.z;
+	string UIHelp = "Scales Deformation on Y axis, \nMin value = 0.001, Max value = 10.0 \nCorrect name - DeformAspectRatio";
+	string UIName = "Deform Aspect Ratio;
+	string UIWidget = "slider";
+	float UIMin = 0.001;
+	float UIMax = 10.0;
+	float UIStep = 0.1;
+> = 1.0;
+#endif
+
+#if %COLOR_LOOKUP
+
+float ColLookupAmplitude
+<
+	register = REG_PM_PARAM_1.w;
+	string UIHelp = "Color Lookup Amplitude, \nMin value = 0, Max value = 32.0 \nCorrect name - ColLookupAmplitude";
+	string UIName = "Color Lookup Amplitude";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 32.0;
+	float UIStep = 0.005;
+> = 1.0;
+
+float ColLookupColPhase
+<
+	register = REG_PM_PARAM_2.x;
+	string UIHelp = "Color Lookup Phase, \nMin value = 0, Max value = 1.0 \nCorrect name - ColLookupColPhase";
+	string UIName = "Color Lookup Phase";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 32.0;
+	float UIStep = 0.005;
+> = 1.0;
+
+#endif
+
+#if %DEPTH_FIXUP
+min16float DepthFixupThreshold
+<
+	register = REG_PM_PARAM_2.z;
+	string UIHelp = "Min alpha for writing depth \nMin value = 0, Max value = 1.0 \nCorrect name - DepthFixupThreshold";
+	string UIName = "Depth Fixup Alpha Threshold";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.05;
+#endif
+
+#if %RADIAL_MAPPING
+half RadialHardness
+<
+	register = REG_PM_PARAM_2.w;
+	string UIHelp = "Linear Alpha Fallof towards the Edge. Lower values result in softer Edge \nMin value = 1.0, Max value = 255 \nCorrect name - RadialHardness";
+	string UIName = "Radial Alpha Edge Hardness";
+
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 255.0;
+	float UIStep = 0.1;
+> = 100;
+#endif
+
+#if %SECOND_DIFF
+half SecondDiffMulti
+<
+	register = REG_PM_PARAM_3.z;
+	string UIHelp = "How much secondary Diffuse blends on top of original Diffuse \nMin value = 0, Max value = 1.0 \nCorrect name - SecondDiffMulti";
+	string UIName = "Secondary Diffuse Multiplier";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.01;
+> = 0.50;
+
+half SecondDiffSpeedX
+<
+	register = REG_PM_PARAM_3.x;
+	string UIHelp = "How fast secondary Diffuse moves on X axis \nMin value = -50.0, Max value = 50.0 \nCorrect name - SecondDiffSpeedX";
+	string UIName = "Secondary Diffuse ScrollSpeed X";
+
+	string UIWidget = "slider";
+	float UIMin = -50.0;
+	float UIMax = 50.0;
+	float UIStep = 0.1;
+> = 1.00;
+
+half SecondDiffSpeedY
+<
+	register = REG_PM_PARAM_3.y;
+	string UIHelp = "How fast secondary Diffuse moves on Y axis \nMin value = -50.0, Max value = 50.0 \nCorrect name - SecondDiffSpeedY";
+	string UIName = "Secondary Diffuse ScrollSpeed Y";
+
+	string UIWidget = "slider";
+	float UIMin = -50.0;
+	float UIMax = 50.0;
+	float UIStep = 0.1;
+> = 1.00;
+
+half SecondDiffScale
+<
+	register = REG_PM_PARAM_3.w;
+	string UIHelp = "Secondary Diffuse tiling \nMin value = -0.01, Max value = 100.0 \nCorrect name - SecondDiffScale";
+	string UIName = "Secondary Diffuse Tiling";
+
+	string UIWidget = "slider";
+	float UIMin = 0.01;
+	float UIMax = 100.0;
+	float UIStep = 0.01;
+> = 1.00;
+#endif
+
+
+#if %SECOND_ALPHA || %SECOND_ALPHA_RGB
+half SecondAlphaMulti
+<
+	register = REG_PM_PARAM_4.z;
+	string UIHelp = "How much secondary Alpha contributes \nMin value = -10.0, Max value = 10.0 \nCorrect name - SecondAlphaMulti";
+	string UIName = "Secondary Alpha Multiplier";
+
+	string UIWidget = "slider";
+	float UIMin = -10.0;
+	float UIMax = 10.0;
+	float UIStep = 0.01;
+> = 1.00;
+
+half SecondAlphaSpeedX
+<
+	register = REG_PM_PARAM_4.x;
+	string UIHelp = "How fast secondary Alpha (Red Channel/Greyscale) moves on X axis \nMin value = -100.0, Max value = 100.0 \nCorrect name - SecondAlphaSpeedX";
+	string UIName = "Secondary Alpha ScrollSpeed X";
+
+	string UIWidget = "slider";
+	float UIMin = -100.0;
+	float UIMax = 100.0;
+	float UIStep = 0.1;
+> = 1.00;
+
+half SecondAlphaSpeedY
+<
+	register = REG_PM_PARAM_4.y;
+	string UIHelp = "How fast secondary Alpha (Red Channel/Greyscale) moves on Y axis \nMin value = -100.0, Max value = 100.0 \nCorrect name - SecondAlphaSpeedY";
+	string UIName = "Secondary Alpha ScrollSpeed Y";
+
+	string UIWidget = "slider";
+	float UIMin = -100.0;
+	float UIMax = 100.0;
+	float UIStep = 0.1;
+> = 1.00;
+
+half SecondAlphaScale
+<
+	register = REG_PM_PARAM_4.w;
+	string UIHelp = "Secondary Alpha (Red Channel/Greyscale) tiling  \nMin value = -0.01, Max value = 100.0 \nCorrect name - SecondAlphaScale";
+	string UIName = "Secondary Alpha Tiling";
+
+	string UIWidget = "slider";
+	float UIMin = 0.01;
+	float UIMax = 100.0;
+	float UIStep = 0.01;
+> = 1.00;
+
+#endif
+
+
+#if %SECOND_ALPHA_RGB
+half SecondAlphaRGBSpeedMulti
+<
+	register = REG_PM_PARAM_5.z;
+	string UIHelp = "How fast secondary Alpha G and B-Channel move in relation to R-Channel \nMin value = -50.0, Max value = 50.0 \nCorrect name - SecondAlphaRGBSpeedMulti";
+	string UIName = "Secondary AlphaRGB Speed Multiplier";
+
+	string UIWidget = "slider";
+	float UIMin = -50.0;
+	float UIMax = 50.0;
+	float UIStep = 0.01;
+> = 2.0;
+
+half SecondAlphaRGBScaleMulti
+<
+	register = REG_PM_PARAM_5.y;
+	string UIHelp = "Secondary Alpha G and B-Channel tiling in relation to R-Channel \nMin value = -50.0, Max value = 50.0 \nCorrect name - SecondAlphaRGBSpeedMulti";
+	string UIName = "Secondary AlphaRGB Tiling Multiplier";
+
+	string UIWidget = "slider";
+	float UIMin = 0.001;
+	float UIMax = 20.0;
+	float UIStep = 0.01;
+> = 0.7;
+
+#endif
+
+
+#if %GLOW_EDGE
+half GlowEdgeShift
+<
+	register = REG_PM_PARAM_6.x;
+	string UIHelp = "Sets the Center of the Glow Edge based on the Alpha amount \nMin value = 0.0, Max value = 1.0 \nCorrect name - GlowEdgeShift";
+	string UIName = "Glow Edge Shift";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.1;
+
+half GlowEdgeWidth
+<
+	register = REG_PM_PARAM_6.y;
+	string UIHelp = "Sets the Width of the Glow Edge based on Alpha amount \nMin value = 0.0, Max value = 2.0 \nCorrect name - GlowEdgeWidth";
+	string UIName = "Glow Edge Width";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.001;
+> = 0.1;
+#endif
+
+
+#if %MOTION_VECTOR
+half MotionVectorScale
+<
+	register = REG_PM_PARAM_7.z;
+	string UIHelp = "Motion Vector Multiplier, tweak this value based on Distance between frames \nMin value = 0.0, Max value = 5.0 \nCorrect name - MotionVectorScale";
+	string UIName = "Motion Vector Scale";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 5.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+#elif %FLOW_MAP
+half FlowStrength
+<
+	register = REG_PM_PARAM_7.z;
+	string UIHelp = "How far Flow Map shifts the UV \nMin value = -5.0, Max value = 5.0 \nCorrect name - FlowStrength";
+	string UIName = "Flow Strength";
+
+	string UIWidget = "slider";
+	float UIMin = -5.0;
+	float UIMax = 5.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+half FlowSpeed
+<
+	register = REG_PM_PARAM_7.w;
+	string UIHelp = "How fast Flow Map shifts the UV \nMin value = 0.0, Max value = 20.0 \nCorrect name - FlowSpeed";
+	string UIName = "Flow Speed";
+
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 20.0;
+	float UIStep = 0.01;
+> = 1.0;
+
+
+#elif %PIXELATE // we can asume pixelate not to be suported with flowmap and reuse sliders
+half PixelateHeight
+<
+	register = REG_PM_PARAM_7.z;
+	string UIHelp = "Pixel Amount on Y axis \nMin value = 1, Max value = 1024 \nCorrect name - PixelateHeight";
+	string UIName = "Pixelate Height";
+
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 1024.0;
+	float UIStep = 1.0;
+> = 8.0;
+
+half PixelateWidth
+<
+	register = REG_PM_PARAM_7.w;
+	string UIHelp = "Pixel Amount on X axis \nMin value = 1, Max value = 1024 \nCorrect name - PixelateWidth";
+	string UIName = "Pixelate Width";
+
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 1024.0;
+	float UIStep = 1.0;
+> = 8.0;
+#endif
+
+#include "Particles.cfi"

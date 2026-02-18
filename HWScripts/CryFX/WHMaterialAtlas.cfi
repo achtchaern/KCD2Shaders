@@ -1,0 +1,222 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6907
+
+#if MATERIAL_ATLAS
+
+//==============================================================================
+half MacroBumpScale // mutually exclusive with DetailBumpScale in %DETAIL_MAPPING
+<
+	register = REG_PM_PARAM_2.x;
+	string UIHelp = "Set macro bump scale";
+	string UIName = "Macro bump scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+half MacroDiffuseScale // mutually exclusive with DetailDiffuseScale in %DETAIL_MAPPING
+<
+	register = REG_PM_PARAM_2.y;
+	string UIHelp = "Set diffuse macro blend scale";
+	string UIName = "Macro diffuse scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+half MacroGlossScale // mutually exclusive with DetailGlossScale in %DETAIL_MAPPING
+<
+	register = REG_PM_PARAM_2.z;
+	string UIHelp = "Set gloss macro blend scale";
+	string UIName = "Macro gloss scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+half MacroSpecularScale
+<
+	register = REG_PM_PARAM_2.w;
+	string UIHelp = "Set specular macro blend scale";
+	string UIName = "Macro specular scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+//==============================================================================
+Texture2DArray<float4> MaterialAtlasDiffuseTex    : register(t57) = TS_MaterialAtlasDiffuse;
+Texture2DArray<float4> MaterialAtlasNormalTex     : register(t58) = TS_MaterialAtlasNormal;
+Texture2DArray<float4> MaterialAtlasSmoothnessTex : register(t59) = TS_MaterialAtlasSmoothness;
+Texture2DArray<float4> MaterialAtlasSpecularTex   : register(t60) = TS_MaterialAtlasSpecular;
+Texture2DArray<float4> MaterialAtlasMaskTex       : register(t61) = TS_MaterialAtlasMask;
+
+StructuredBuffer<S_ClothingMaterialInstance> MaterialInstanceBuffer : register(t72);
+StructuredBuffer<S_MaterialFeature> FeatureBuffer : register(t73);
+
+//==============================================================================
+int DecodeFeatureIndex(float4 vertexColor)
+{
+	int encodedIndexes = vertexColor.b * 255.f;
+	return encodedIndexes & 0x1f; // first 5 bits
+}
+
+//==============================================================================
+int FeatureColorToIndex(half3 featureColor)
+{
+	int featureIndex;
+	//featureIndex = round(round(featureColor.r) + round(featureColor.g) * 2.h + round(featureColor.b) * 4.h); //8-color
+	//featureIndex = (int(featureColor.r*2.999h) + int(featureColor.g*2.999h) * 3 + int(featureColor.b*2.999h) * 9); //27-color with int operations (not exactly the same)
+	featureIndex = round(round(featureColor.r * 2.h) + round(featureColor.g * 2.h) * 3.h + round(featureColor.b * 2.h) * 9.h); //27-color
+	return featureIndex;
+}
+
+//==============================================================================
+half3 FeatureIndexToColor(int featureIndex)
+{
+	half3 featureColor;
+	featureColor.r = (featureIndex % 3) * 0.5h;
+	featureColor.g = ((featureIndex / 3) % 3) * 0.5h;
+	featureColor.b = ((featureIndex / 9) % 3) * 0.5h;
+	return featureColor;
+}
+
+//==============================================================================
+int GetFeatureIndex(int vcFeatureIndex, float2 baseTC)
+{
+	if (vcFeatureIndex < FEATURE_COUNT) // use index from vertex color
+	{
+		return vcFeatureIndex + CD_FeatureOffsetWH;
+	}
+
+	half3 featureColor = GetTexture2D(detailTex, ssMaterialTrilinear, baseTC.xy).rgb;
+	int featureIndex = FeatureColorToIndex(featureColor);
+	featureIndex += CD_FeatureOffsetWH;
+	return featureIndex;
+}
+
+//==============================================================================
+void DiscardHiddenMaterialAtlasVertex(inout float4 hPosition, uint featureIndex)
+{
+	if (featureIndex < FEATURE_COUNT)
+	{
+		featureIndex += CD_FeatureOffsetWH;
+
+		float alphaTest = FeatureBuffer[featureIndex].alphaTest;
+		if (alphaTest >= 1.f)
+		{
+			hPosition.zw = sqrt(-1); // No NaN literal in HLSL
+		}
+	}
+}
+
+//==============================================================================
+void GetMaterialAtlasTC(inout float3 atlasTC[2], float2 baseTC, int featureIndex)
+{
+	const float3 baseUV = float3(baseTC.xy, 1.f);
+	float2 transformedUV;
+	transformedUV.x = dot(baseUV, FeatureBuffer[featureIndex].uvTransformCol0);
+	transformedUV.y = dot(baseUV, FeatureBuffer[featureIndex].uvTransformCol1);
+
+	atlasTC[0] = float3(transformedUV, FeatureBuffer[featureIndex].textureId);
+	atlasTC[1] = float3(transformedUV, FeatureBuffer[featureIndex].secondaryTextureId);
+}
+
+//==============================================================================
+half3 GetMaterialAtlasMask(float3 atlasTC[2])
+{
+	return MaterialAtlasMaskTex.Sample(ssMaterialTrilinear, atlasTC[0]).rgb;
+}
+
+//==============================================================================
+void ClipMaterialAtlasAlpha(float3 atlasTC[2], int featureIndex, half atlasBlendFactor)
+{
+	half atlasAlpha[2];
+
+	atlasAlpha[0] = MaterialAtlasDiffuseTex.Sample(ssMaterialTrilinear, atlasTC[0]).a;
+	atlasAlpha[1] = MaterialAtlasDiffuseTex.Sample(ssMaterialTrilinear, atlasTC[1]).a;
+
+	half microAlpha = lerp(atlasAlpha[0], atlasAlpha[1], atlasBlendFactor);
+	clip(microAlpha - FeatureBuffer[featureIndex].alphaTest);
+}
+
+//==============================================================================
+void ApplyMaterialAtlasNormal(inout half3 vNormalTS, float3 atlasTC[2], int featureIndex, half atlasBlendFactor)
+{
+	half3 atlasNormal[2] = { half3(0, 0, 1), half3(0, 0, 1) };
+
+	atlasNormal[0] = GetNormalMapAtlas(MaterialAtlasNormalTex, atlasTC[0]);
+	atlasNormal[1] = GetNormalMapAtlas(MaterialAtlasNormalTex, atlasTC[1]);
+
+	half3 microNormal = lerp(atlasNormal[0], atlasNormal[1], atlasBlendFactor);
+
+	half3 microNormalFixed;
+	microNormalFixed.x = dot(microNormal.xy, FeatureBuffer[featureIndex].normalsFixCol0);
+	microNormalFixed.y = dot(microNormal.xy, FeatureBuffer[featureIndex].normalsFixCol1);
+	microNormalFixed.z = microNormal.z;
+
+#if %NORMAL_MAP
+	vNormalTS.xy *= MacroBumpScale;
+#endif
+	vNormalTS.xy += microNormalFixed.xy;
+}
+
+//==============================================================================
+void ApplyMaterialAtlasSmoothness(inout half fSmoothness, float3 atlasTC[2], int featureIndex, half atlasBlendFactor)
+{
+	half atlasSmoothness[2] = { FeatureBuffer[featureIndex].smoothness, FeatureBuffer[featureIndex].smoothness };
+
+	atlasSmoothness[0] *= MaterialAtlasSmoothnessTex.Sample(ssMaterialTrilinear, atlasTC[0]).r;
+	atlasSmoothness[1] *= MaterialAtlasSmoothnessTex.Sample(ssMaterialTrilinear, atlasTC[1]).r;
+
+	const half microSmoothness = lerp(atlasSmoothness[0], atlasSmoothness[1], atlasBlendFactor);
+#if %NORMAL_MAP // Gloss is in normal texture
+	const half macroSmoothness = (fSmoothness * 2.0h - 1.0h) * MacroGlossScale;
+	fSmoothness = microSmoothness + microSmoothness * macroSmoothness;
+#else
+	fSmoothness = microSmoothness;
+#endif
+}
+
+//==============================================================================
+void ApplyMaterialAtlasAlbedo(inout half3 cAlbedo, float3 atlasTC[2], int featureIndex, half atlasBlendFactor)
+{
+	half3 atlasAlbedo[2];
+
+	atlasAlbedo[0] = MaterialAtlasDiffuseTex.Sample(ssMaterialTrilinear, atlasTC[0]).rgb;
+	atlasAlbedo[0] = TransformHSV(atlasAlbedo[0], FeatureBuffer[featureIndex].hue, FeatureBuffer[featureIndex].saturation, FeatureBuffer[featureIndex].brightness);
+
+	atlasAlbedo[1] = MaterialAtlasDiffuseTex.Sample(ssMaterialTrilinear, atlasTC[1]).rgb;
+	atlasAlbedo[1] = TransformHSV(atlasAlbedo[1], FeatureBuffer[featureIndex].secondaryHue, FeatureBuffer[featureIndex].secondarySaturation, FeatureBuffer[featureIndex].secondaryBrightness);
+
+	const half3 microAlbedo = lerp(atlasAlbedo[0], atlasAlbedo[1], atlasBlendFactor);
+	const half3 overlayMacroAlbedo = (cAlbedo * 2.0h - 1.0h) * MacroDiffuseScale;
+	cAlbedo = microAlbedo + microAlbedo * overlayMacroAlbedo;
+}
+
+//==============================================================================
+void ApplyMaterialAtlasReflectance(inout half3 cReflectance, float3 atlasTC[2], int featureIndex, half atlasBlendFactor)
+{
+	half3 atlasReflectance[2];
+
+	atlasReflectance[0] = MaterialAtlasSpecularTex.Sample(ssMaterialTrilinear, atlasTC[0]).rgb;
+	atlasReflectance[1] = MaterialAtlasSpecularTex.Sample(ssMaterialTrilinear, atlasTC[1]).rgb;
+
+	half3 microReflectance = FeatureBuffer[featureIndex].specular;
+	microReflectance *= lerp(atlasReflectance[0], atlasReflectance[1], atlasBlendFactor);
+
+#if %SPECULAR_MAP
+	const half3 overlayMacroReflectance = (cReflectance * 2.0h - 1.0h) * MacroSpecularScale;
+	cReflectance = microReflectance + microReflectance * overlayMacroReflectance;
+#else
+	cReflectance = microReflectance;
+#endif
+}
+
+#endif //MATERIAL_ATLAS

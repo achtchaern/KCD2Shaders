@@ -1,0 +1,258 @@
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "ShadowCommon.cfi"
+
+SShadowSamplingParams GetShadowSamplingParams()
+{
+    return cbShadowSamplingParams;
+}
+
+#include "VolumeLighting.cfi"
+
+////////////////////////////////////////////////////////////////////////////
+// Inject volumetric inscattering technique
+////////////////////////////////////////////////////////////////////////////
+RWTexture3D<float3> VolumetricFogInscatterOUT3 : register(u0);
+RWTexture3D<float4> VolumetricFogInscatterOUT4 : register(u0);
+
+[numthreads(BLOCK_SIZE_X, BLOCK_SIZE_Y, BLOCK_SIZE_Z)]
+void InjectVolumetricInscatteringCS(uint3 DispatchThreadID : SV_DispatchThreadID
+                                    ,uint GroupIndex : SV_GroupIndex
+                                    ,uint3 GroupID : SV_GroupID)
+{
+    SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	const uint3 dispatchSize = cbDispatch.DispatchSize.xyz;
+	uint bufferIdx = ( GroupID.z * dispatchSize.x * dispatchSize.y + GroupID.y * dispatchSize.x + GroupID.x);
+
+	if(GroupIndex == 0)
+	{
+		gridLightCount = LightCountInput[bufferIdx];
+	}
+
+	const uint threadNum = BLOCK_SIZE_X * BLOCK_SIZE_Y * BLOCK_SIZE_Z;
+	bufferIdx *= TILED_SHADING_MAX_NUM_LIGHTS;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	[loop] for(uint i = GroupIndex; i < gridLightCount; i += threadNum)
+	{
+		uint lightIndex = LightGridInput[bufferIdx + i];
+		gridLightIndices[i] = lightIndex;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+#if !%_RT_SAMPLE3
+	float globalAndLocalFogDensity = VolumetricFogDensityInput[DispatchThreadID.xyz].x;
+#endif
+
+	float3 localFogColor = VolumetricFogDensityColorInput[DispatchThreadID.xyz].xyz;
+
+	float maxDistance = params.farMinusNearDist + cbVolFogParams.DistributionParams.x;
+	float maxLinearZ = MaxDepthBuffer[DispatchThreadID.xy] * maxDistance;
+
+	const uint2 stencilTexel = ClipVolumeStencil.Load(int4(DispatchThreadID.xyz, 0));
+    const uint nStencilVal = GetStencilValueFromTexel(stencilTexel);
+
+    const uint clipVolumeStencilID = vfGetClipVolumeStencilID(nStencilVal);
+	const uint clipVolumeData = VL_TiledClipVolumeInfo[clipVolumeStencilID & MAX_CLIPVOLUMES].data;
+
+	// Barycentric interpolation for reconstructing position
+	const float3 pixelCoord = DispatchThreadID.xyz;
+	float2 vPixelUV = (pixelCoord.xy + 0.5f) * cbCommon.InscatteringBufSize.zw;
+	float3 vCamVec = ((1 - vPixelUV.x - vPixelUV.y) * cbCommon.FrustumTL.xyz + (vPixelUV.x * cbCommon.FrustumTR.xyz + (vPixelUV.y * cbCommon.FrustumBL.xyz)));
+
+	float n = dot(-CV_CameraFrontVector.xyz, vCamVec);
+	float3 normalizedCamVec = vCamVec / n;
+	float3 normalizedEyeRay = normalize(normalizedCamVec);
+
+	const float frameCount = params.framwCountJitter;
+	float jitter = GetJitterInternal(pixelCoord.xy, frameCount.xx);
+
+	// voxel depth range is biased to reduce light leaking.
+	float depthIndex = pixelCoord.z;
+	float depth = GetVolumetricFogLinearDepth(depthIndex);
+	float depthFront = GetVolumetricFogLinearDepth(depthIndex - 1);
+
+	float3 inscatter = float3(0.0f, 0.0f, 0.0f);
+
+#if !ENABLE_MAX_DEPTH_AWARE_INJECTION_AND_FILTERING
+	// early rejection with max-depth
+	float earlyRejectDepth = max(0.0f, GetVolumetricFogLinearDepth(pixelCoord.z) - EARLY_REJECTION_LENGTH);
+	if(earlyRejectDepth <= maxLinearZ)
+	{
+#else
+	// early rejection with max-depth
+	float earlyRejectDepth = GetVolumetricFogLinearDepth(depthIndex - 1.0f - EARLY_REJECTION_VOXELS);
+	earlyRejectDepth = min(earlyRejectDepth, depthFront - EARLY_REJECTION_LENGTH);
+	if(earlyRejectDepth < maxLinearZ)
+	{
+		// discard inscattering behind max-depth
+		if(depthFront < maxLinearZ && maxLinearZ <= depth)
+		{
+			depth = maxLinearZ;
+		}
+#endif
+
+		float3 inscatterRegularLights = 0.0f;
+		AccumulateInscatteringRegularLights(inscatterRegularLights, depth, depthFront, normalizedCamVec, normalizedEyeRay, jitter, maxLinearZ, clipVolumeData, clipVolumeStencilID);
+
+		// calculate global fog density
+		float d = lerp(depthFront, depth, jitter);
+		const float3 cameraToWorldPos = d * normalizedCamVec;
+		float globalFogDensity = GetExponentialHeightFogDensity(cameraToWorldPos, d);
+
+		// clip global fog by VisArea
+		globalFogDensity = (clipVolumeData & CLIPVOLUME_AFFECTED_BY_SUN) ? globalFogDensity : 0.0f;
+
+		bool exec = (clipVolumeData & CLIPVOLUME_AFFECTED_BY_SUN) != 0 ;
+
+#if %_RT_SAMPLE4
+		float shadowSun = 0.0f;
+		const float count = exec ? 2.0f : 0.0f;
+		[loop] for(float ri = 0; ri < count; ++ri)
+		{
+			shadowSun += AccumulateSunShadow(depth, depthFront, normalizedCamVec, jitter, ri, count, depthIndex, maxLinearZ);
+		}
+		shadowSun = (count > 0.0f) ? shadowSun / count : shadowSun;
+#elif %_RT_SAMPLE5
+		float shadowSun = 0.0f;
+		const float count = exec ? 4.0f : 0.0f;
+		[loop] for(float ri = 0; ri < count; ++ri)
+		{
+			shadowSun += AccumulateSunShadow(depth, depthFront, normalizedCamVec, jitter, ri, count, depthIndex, maxLinearZ);
+		}
+		shadowSun = (count > 0.0f) ? shadowSun / count : shadowSun;
+#else
+		float shadowSun = 0.0f;
+		if(exec)
+		{
+			shadowSun = AccumulateSunShadow(depth, depthFront, normalizedCamVec, jitter, 0, 1, depthIndex, maxLinearZ);
+		}
+#endif
+
+		inscatter = CombineInscatteringSunAndRegularLights(inscatterRegularLights, localFogColor, globalFogDensity, shadowSun, normalizedEyeRay, exec);
+
+		// add emissive from participating media.
+		inscatter += VolumetricFogEmissiveInput[DispatchThreadID.xyz].xyz;
+	}
+
+	inscatter.xyz = vfEncodeInscattering(inscatter.xyz);
+
+	//if(all(pixelCoord.xyz < float3(ScreenSize.xy, ScreenInfo.w)))
+	{
+#if %_RT_SAMPLE3
+		VolumetricFogInscatterOUT3[DispatchThreadID.xyz] = inscatter.xyz;
+#else
+		VolumetricFogInscatterOUT4[DispatchThreadID.xyz] = float4(inscatter.xyz, globalAndLocalFogDensity.x);
+#endif
+	}
+}
+
+technique InjectVolumetricInscattering
+{
+  pass p0
+  {
+    ComputeShader = InjectVolumetricInscatteringCS() VolumeLightInjectionCS;
+  }
+}
+
+
+[numthreads(BLOCK_SIZE_X, BLOCK_SIZE_Y, BLOCK_SIZE_Z)]
+void InjectFogDensityCS(uint3 DispatchThreadID : SV_DispatchThreadID
+												, uint GroupIndex : SV_GroupIndex, uint3 GroupID : SV_GroupID)
+{
+    SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+
+	float maxDistance = params.farMinusNearDist + cbVolFogParams.DistributionParams.x;
+	float maxLinearDepth = InjectFogDensityMaxDepthInput[DispatchThreadID.xy].x * maxDistance;
+
+	uint numVolumes = cbCommon.InjectDensityParams.y;
+
+	// Scale and bias for frustum to fit grid cells
+	float2 numTiles = ceil( cbCommon.VolBufSize.xy / float2(BLOCK_SIZE_X, BLOCK_SIZE_Y) );
+	float2 tileScale = numTiles / 2.0;
+	float2 tileBias = tileScale - float2( GroupID.xy );
+
+	float depthGridFront = GetVolumetricFogLinearDepth(float(GroupID.z) * BLOCK_SIZE_Z - 1);
+	float depthGridBack = GetVolumetricFogLinearDepth(float(GroupID.z) * BLOCK_SIZE_Z + 3);
+
+	CullFogVolume(tileScale, tileBias, numVolumes, GroupIndex, depthGridBack, depthGridFront);
+
+	// read number of volumes from group shared memory after culling.
+	numVolumes = countFogVolume;
+
+
+	const float3 pixelCoord = DispatchThreadID.xyz;
+
+	// read clip volume stencil value
+    const uint2 stencilTexel = VolumetricClipVolumeStencil.Load(int4(DispatchThreadID.xyz, 0));
+    const uint nStencilVal = GetStencilValueFromTexel(stencilTexel);
+
+    const uint clipVolumeStencilID = vfGetClipVolumeStencilID(nStencilVal);
+	const uint clipVolumeIndex = clipVolumeStencilID & MAX_CLIPVOLUMES;
+	const uint clipVolumeData = VL_TiledClipVolumeInfo[clipVolumeIndex].data;
+
+	// Barycentric interpolation for reconstructing position
+	float2 vPixelUV = (pixelCoord.xy + 0.5f) * cbCommon.VolBufSize.zw;
+	float3 vCamVec = ((1 - vPixelUV.x - vPixelUV.y) * cbCommon.FrustumTL.xyz + (vPixelUV.x * cbCommon.FrustumTR.xyz + (vPixelUV.y * cbCommon.FrustumBL.xyz)));
+	float n = dot(-CV_CameraFrontVector.xyz, vCamVec);
+	float3 normalizedCamVec = vCamVec / n;
+
+	float depthIndex = pixelCoord.z;
+	float depth = GetVolumetricFogLinearDepth(depthIndex);
+	float depthFront = GetVolumetricFogLinearDepth(depthIndex - 1.0f);
+
+
+	const float frameCount = params.framwCountJitter;
+	const float jitter = GetJitterInternal(pixelCoord.xy, frameCount.xx);
+
+	float density = 0.0f;
+	float3 densityColor = float3(0.0f, 0.0f, 0.0f);
+	float3 emissive = float3(0.0f, 0.0f, 0.0f);
+
+#if ENABLE_MAX_DEPTH_AWARE_INJECTION_AND_FILTERING
+	// early rejection with max-depth
+	float earlyRejectDepth = GetVolumetricFogLinearDepth(depthIndex - 1.0f - EARLY_REJECTION_VOXELS);
+	earlyRejectDepth = min(earlyRejectDepth, depthFront - EARLY_REJECTION_LENGTH);
+	if(earlyRejectDepth < maxLinearDepth)
+	{
+		// discard fog density behind max-depth
+		if(depthFront < maxLinearDepth && maxLinearDepth <= depth)
+		{
+			depth = maxLinearDepth;
+		}
+#endif
+
+	// global atmospheric fog
+	// densityColor isn't added here because it's done separately in InjectVolumetricInscatteringCS.
+	float d = lerp(depthFront, depth, jitter);
+	float3 cameraToWorldPos = d * normalizedCamVec;
+	density = GetExponentialHeightFogDensity(cameraToWorldPos, depth);// match this depth with the depth in InjectVolumetricInscatteringCS function.
+
+	// clip global fog by VisArea
+	density = (clipVolumeData & CLIPVOLUME_AFFECTED_BY_SUN) ? density : 0.0f;
+
+	// FogVolumes
+	float invDist = (depth - depthFront) > 0.000001f ? (1.0f / (depth - depthFront)) : 0.0f;
+	AccumulateDensityFogVolume(density.x, densityColor.xyz, emissive.xyz, numVolumes, clipVolumeIndex, normalizedCamVec, depth, depthFront, jitter, invDist);
+
+#if ENABLE_MAX_DEPTH_AWARE_INJECTION_AND_FILTERING
+	}
+#endif
+
+	//if(all(pixelCoord.xyz < float3(ScreenSize.xy, InjectFogDensityParams.x)))
+	{
+		VolumetricFogDensityOutput[DispatchThreadID.xyz] = density.x;
+		VolumetricFogColorDensityOutput[DispatchThreadID.xyz] = densityColor.rgb;
+		VolumetricFogEmissiveOutput[DispatchThreadID.xyz] = emissive.rgb;
+	}
+}
+
+technique InjectFogDensity
+{
+  pass p0
+  {
+    ComputeShader = InjectFogDensityCS() InjectFogDensityCS;
+  }
+}

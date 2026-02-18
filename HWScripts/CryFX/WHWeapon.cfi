@@ -1,0 +1,158 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-06-19
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-7117
+
+#if %WEAPON
+//=========================================================================
+Texture2D WeaponBloodRustSpecAndIntTex : register(t8)
+<
+	UIName = "Weapon Blood Rust";
+	UIDescription = "Contains rust diffuse in R, rust specular in G and blood diffuse intensity in B";
+> = TM_SubSurface;
+
+Texture2D WeaponMaskTex : register(t9)
+<
+	UIName = "Weapon Mask";
+	UIDescription = "R – rust, G – blood, B – edges, Alpha – zones";
+	sRGBLookup = false;
+> = TM_Custom;
+
+StructuredBuffer<S_WeaponMaterialInstance> MaterialInstanceBuffer : register(t72);
+
+//=========================================================================
+float4 WeaponBloodColor
+<
+	register = REG_PM_PARAM_9;
+	string UIHelp = "Weapon Blood Color";
+	string UIName = "Weapon Blood Color";
+	string UIWidget = "color";
+> = {0.3, 0.0, 0.0, 1.0};
+
+float WeaponBloodBlendFalloff
+<
+	register = REG_PM_PARAM_10.x;
+	string UIHelp = "Change falloff of blood blending";
+	string UIName = "Weapon Blood Falloff";
+	string UIWidget = "slider";
+	float UIMin = 0.1;
+	float UIMax = 128.0;
+	float UIStep = 1.0;
+> = 32.0;
+
+float WeaponBloodGloss
+<
+	register = REG_PM_PARAM_10.y;
+	string UIHelp = "Weapon blood glossiness";
+	string UIName = "Weapon Blood Gloss";
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 255.0;
+	float UIStep = 1.0;
+> = 130.0;
+
+float WeaponBloodSpecular
+<
+	register = REG_PM_PARAM_10.z;
+	string UIHelp = "Weapon blood specular";
+	string UIName = "Weapon Blood Specular";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.2;
+
+float WeaponBloodTexScale
+<
+	register = REG_PM_PARAM_10.w;
+	string UIHelp = "Weapon blood tex scale";
+	string UIName = "Weapon Blood Scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 16.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+float WeaponRustBlendFalloff
+<
+	register = REG_PM_PARAM_11.x;
+	string UIHelp = "Change falloff of rust blending";
+	string UIName = "Weapon Rust Falloff";
+	string UIWidget = "slider";
+	float UIMin = 0.1;
+	float UIMax = 128.0;
+	float UIStep = 1.0;
+> = 32.0;
+
+float WeaponRustBlend
+<
+	register = REG_PM_PARAM_11.y;
+	string UIHelp = "Weapon rust blend";
+	string UIName = "Weapon Rust Blend";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+float WeaponRustTexScale
+<
+	register = REG_PM_PARAM_11.z;
+	string UIHelp = "Weapon rust tex scale";
+	string UIName = "Weapon Rust Scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 16.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+//=========================================================================
+struct WeaponParams
+{
+	half ScratchIntensity;
+	half RustIntensity;
+	half BloodIntensity;
+	half BloodSpecularIntensity;
+};
+
+//=========================================================================
+void GetWeaponParams(out WeaponParams wpnParams, float2 tc)
+{
+	// fetch mask Id
+	half4 weaponMask = GetTexture2D(WeaponMaskTex, ssPointClamp, tc);
+	uint weaponMaskId = min(uint(weaponMask.a * 25.5), gs_WeaponScratchZoneCount - 1);
+
+	// output
+	wpnParams.ScratchIntensity = MaterialInstanceBuffer[CD_MaterialInstanceIdWH].scratchZone[weaponMaskId] * sqrt(weaponMask.b);
+	wpnParams.RustIntensity = GetLayerBlendingValueMap(weaponMask.r, MaterialInstanceBuffer[CD_MaterialInstanceIdWH].rustBlendFactor, WeaponRustBlendFalloff);
+	wpnParams.RustIntensity = wpnParams.RustIntensity * WeaponRustBlend;
+	wpnParams.BloodIntensity = GetLayerBlendingValueMap(weaponMask.g, MaterialInstanceBuffer[CD_MaterialInstanceIdWH].bloodBlendFactor, WeaponBloodBlendFalloff);
+	wpnParams.BloodSpecularIntensity = saturate(wpnParams.BloodIntensity / weaponMask.g);
+}
+
+//=========================================================================
+void ApplyWeaponToCommonParams(inout half3 albedo, inout half3 reflectance, inout half smoothness, WeaponParams wpnParams, float2 tc)
+{
+	// rust
+	half4 rustTexVal = GetDiffuseTex(WeaponBloodRustSpecAndIntTex, tc * WeaponRustTexScale);
+	albedo.rgb = lerp(albedo.rgb, rustTexVal.r, wpnParams.RustIntensity);
+	reflectance *= lerp(1, rustTexVal.g, wpnParams.RustIntensity);
+
+	// blood
+	half4 bloodTexVal = GetDiffuseTex(WeaponBloodRustSpecAndIntTex, tc * WeaponBloodTexScale);
+	albedo.rgb = lerp(albedo.rgb, bloodTexVal.b * WeaponBloodColor.rgb, wpnParams.BloodIntensity);
+	reflectance = lerp(reflectance, WeaponBloodSpecular, wpnParams.BloodSpecularIntensity);
+	smoothness = lerp(smoothness, WeaponBloodGloss / 255, wpnParams.BloodSpecularIntensity);
+}
+
+//=========================================================================
+void ApplyWeaponToDetail(inout half4 detail, WeaponParams wpnParams)
+{
+	// attenuate detail bump with zone scratches
+	detail *= wpnParams.ScratchIntensity;
+
+	// blood forces pixel normal to be flat
+	detail.xy = lerp(detail.xy, half2(0, 0), wpnParams.BloodIntensity);
+}
+
+#endif // WEAPON

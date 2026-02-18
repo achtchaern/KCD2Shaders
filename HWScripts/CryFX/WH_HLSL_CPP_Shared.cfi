@@ -1,0 +1,65 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// This file could be included both on HLSL the C++ side to ensure no mismatching structures.
+// But for convenience (some programmers are using shaders from pak) the file was duplicated:
+//   Code/CryEngine/CryCommon/WH/WH_HLSL_CPP_Shared.h
+//   Engine/Shaders/HWScripts/CryFX/WH_HLSL_CPP_Shared.cfi
+// Make sure to keep these files in sync!
+
+#ifdef __cplusplus
+	#define float2 Vec2
+	#define float3 Vec3
+	#define float4 Vec4
+#endif
+
+static const int gs_MaterialFeatureCount = 27;
+static const int gs_ClothingBloodSourceCount = 6;
+static const uint gs_WeaponScratchZoneCount = 8;
+
+struct S_MaterialFeature
+{
+	int    textureId;
+	float  hue;
+	float  saturation;
+	float  brightness;
+	float3 specular;
+	float  smoothness;
+	float3 uvTransformCol0;
+	float  scratchLevel;
+	float3 uvTransformCol1;
+	float  alphaTest;
+	float2 normalsFixCol0;
+	float2 normalsFixCol1;
+	float3 grimeDiffuse;
+	float  grimeLevel;
+	float3 grimeSpecular;
+	float  grimeGloss;
+	int    secondaryTextureId;
+	float  secondaryHue;
+	float  secondarySaturation;
+	float  secondaryBrightness;
+};
+
+struct S_ClothingMaterialInstance
+{
+	float4 bloodSource[gs_ClothingBloodSourceCount];
+	float3 skinDiffuse;
+	float  melanin;
+	float3 hairDiffuse;
+	float  grimeLevel;
+};
+
+struct S_WeaponMaterialInstance
+{
+	float scratchZone[gs_WeaponScratchZoneCount];
+	float bloodBlendFactor;
+	float rustBlendFactor;
+	float padding[22];
+};
+
+#ifdef __cplusplus
+	#undef float2
+	#undef float3
+	#undef float4
+#endif

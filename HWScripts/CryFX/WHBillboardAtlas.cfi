@@ -1,0 +1,93 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-07-17
+
+#if %BILLBOARD_ATLAS
+
+//==============================================================================
+Texture2DArray<float4> BillboardAtlasDiffuseTex					: register(t54) = TS_BillboardAtlasDiffuse;
+Texture2DArray<float4> BillboardAtlasNormalTex					: register(t55) = TS_BillboardAtlasNormal;
+Texture2DArray<float4> BillboardAtlasHeightTex					: register(t56) = TS_BillboardAtlasHeight;
+
+//==============================================================================
+float4 SampleBillboardAtlasTexture(Texture2DArray<float4> tex, float3 tc)
+{
+	float3 tc1 = float3(tc.xy, tc.z + 1.f);
+	if (tc1.z > 7.5f) // we have 8 textures, after 7.5 we are wrapping back to -0.5
+	{
+		tc1.z -= 8.f;
+	}
+	float blend = frac(tc.z + 0.5f);
+	float4 ret = lerp(tex.Sample(ssMaterialTrilinear, tc), tex.Sample(ssMaterialTrilinear, tc1), blend);
+	return ret;
+}
+
+//==============================================================================
+// must be called before streamPos is modified by the BB Quad modifier
+half3 GetBillboardAtlasNormal(inout streamPos vertPassPos)
+{
+	// get the inst matrix before its cleared by bb z quad modifier
+	Matrix_Inst_General(vertPassPos);
+	half3 bbInstNorm = mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2].xyz);
+	return bbInstNorm;
+}
+
+//==============================================================================
+half GetBillboardAtlasIndex(half3 vec, half offset, half2 HPos)
+{
+	// decide Z angle
+	half angle = (atan2(vec.x, vec.y) + offset) * ONE_OVER_PI + 1; // +0.25 for 45 deg rotation
+
+	// wrap around and keep 0...2 range
+	if(angle > 2.h)
+	{
+		angle -= 2.h;
+	}
+	if(angle < 0.h)
+	{
+		angle += 2.h;
+	}
+
+	// Decide index of the image in the array. Range -0.5...7.5 keeps every index for the same angle,
+	// moves the center of the sample so the 0th texture is sampled from -0.5 to 0.5, the 1st from 0.5 to 1.5 and so on
+	return angle * 4.h - 0.5h;
+}
+
+//==============================================================================
+half4 GetBillboardAtlasDiffuseTex(float2 tc, half atlasIndex)
+{
+	return SampleBillboardAtlasTexture(BillboardAtlasDiffuseTex, float3(tc, atlasIndex));
+}
+
+//==============================================================================
+void ApplyBillboardAtlasToNormal(inout half3 vNormalTS, float2 tc, half atlasIndex)
+{
+	vNormalTS.xy = SampleBillboardAtlasTexture(BillboardAtlasNormalTex, float3(tc, atlasIndex)).yx;
+	vNormalTS.z = sqrt(saturate(1.h + dot(vNormalTS.xy, -vNormalTS.xy)));
+}
+
+//==============================================================================
+#if WH_BILLBOARD_ATLAS_DEPTH_IN_PS
+float ApplyBillboardAtlasToDepth(float devDepth, float2 tc, half atlasIndex)
+{
+	// Sample height map
+	const float atlasHeight = SampleBillboardAtlasTexture(BillboardAtlasHeightTex, float3(tc, atlasIndex)).r;
+
+	// Linearize depth
+	float linearDepth = CV_ProjRatio.y / (devDepth - CV_ProjRatio.x);
+
+	// Height map was rendered with a 20m depth range, 10m in front and 10m behind the trunk.
+	// See Editor/Scripts/WH/render_veg_atlas.py for details.
+	const float depthRange = 20.f;
+
+	// We are using reverse depth (1=near,0=far), but after linearizing it gets reversed back (1=far,0=near).
+	// Because our depth test is GreaterEqual, for performance reasons we are writing to depth using SV_DepthLessEqual,
+	// This means that in NDC we need to decrease the depth, but in linear depth this means increasing it.
+	// As a result the tree is "pushed in" behind the billboard but this is not very noticeable visually.
+	linearDepth += depthRange * (1 - atlasHeight) * g_VS_NearFarClipDist.w;
+
+	// Convert back to normalized device coordinates
+	return CV_ProjRatio.y / linearDepth + CV_ProjRatio.x;
+}
+#endif
+
+#endif

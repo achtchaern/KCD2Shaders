@@ -1,0 +1,227 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script = "ShaderDrawType = Custom;";
+>;
+
+float2 ScreenSize : PB_ScreenSize;
+
+Texture2D StereoL              : register(t0);
+Texture2D StereoR              : register(t1);
+Texture2D QuadLayer0           : register(t2);
+Texture2D QuadLayerHeadLocked0 : register(t3);
+Texture2D QuadLayerHeadLocked1 : register(t4);
+
+SamplerState StereoClampSamplerState : register(s0) = SS_TrilinearClamp;
+
+struct a2v
+{
+	float4 Position : POSITION; 
+	IN_TBASE
+	IN_C0
+};
+
+struct v2f
+{
+	float4 Position  : SV_POSITION;
+	float4 baseTC    : TEXCOORDN;
+};
+
+struct psout
+{
+	float4 Primary   : SV_Target; // Primary panel
+};
+
+///////////////// vertex shader //////////////////
+
+v2f StereoVS(uint VertexID : SV_VertexID)
+{
+	v2f OUT = (v2f)0; 
+
+	OUT.Position = GetHPos_FromTriVertexID(VertexID);
+	OUT.baseTC.xy = GetBaseTC_FromTriVertexID(VertexID);
+	OUT.baseTC.zw = 2 * g_VS_ScreenSize.zw;
+	
+	return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+half4 AddLayers(half4 inColor, float2 uv)
+{
+	half4 qL0 = GetTexture2D(QuadLayer0, StereoClampSamplerState, uv);
+	half4 qLH0 = GetTexture2D(QuadLayerHeadLocked0, StereoClampSamplerState, uv);
+	half4 qLH1 = GetTexture2D(QuadLayerHeadLocked1, StereoClampSamplerState, uv);
+
+	inColor.rgb = lerp(inColor.rgb, qL0.rgb, qL0.a);
+	inColor.rgb = lerp(inColor.rgb, qLH0.rgb, qLH0.a);
+	inColor.rgb = lerp(inColor.rgb, qLH1.rgb, qLH1.a);
+
+	return inColor;
+}
+
+psout SideBySidePS(v2f IN)
+{
+	psout OUT = (psout ) 0;
+	
+	min16float2 left_texcoord = saturate(IN.baseTC.xy * float2(2.0, 1.0));
+	min16float2 right_texcoord = saturate((IN.baseTC.xy - float2(0.5, 0.0)) * float2(2.0, 1.0));
+	
+	min16float4 cL = GetTexture2D(StereoL, StereoClampSamplerState, left_texcoord);
+	min16float4 cR = GetTexture2D(StereoR, StereoClampSamplerState, right_texcoord);	
+	min16float4 qC = GetTexture2D(QuadLayer0, StereoClampSamplerState, IN.baseTC.x < 0.5 ? left_texcoord : right_texcoord);
+ 
+	OUT.Primary = AddLayers((IN.baseTC.x < 0.5) ? cL : cR, IN.baseTC.x < 0.5 ? left_texcoord : right_texcoord);
+	
+	return OUT;
+}
+
+psout LineByLinePS(v2f IN)
+{
+	psout OUT = (psout ) 0;
+
+	min16float4 cL = GetTexture2D(StereoL, StereoClampSamplerState, IN.baseTC.xy);
+	min16float4 cR = GetTexture2D(StereoR, StereoClampSamplerState, IN.baseTC.xy);
+	min16float4 qC = GetTexture2D(QuadLayer0, StereoClampSamplerState, IN.baseTC.xy);
+ 
+	int pixLine = IN.baseTC.y * ScreenSize.y;
+ 
+	OUT.Primary = AddLayers(pixLine % 2 == 0 ? cL : cR, IN.baseTC.xy);
+	
+	return OUT;
+}
+
+psout CheckerboardPS(v2f IN)
+{
+	psout OUT = (psout ) 0;
+	
+	min16float4 cL = GetTexture2D(StereoL, StereoClampSamplerState, IN.baseTC.xy);
+	min16float4 cR = GetTexture2D(StereoR, StereoClampSamplerState, IN.baseTC.xy);
+	min16float4 qC = GetTexture2D(QuadLayer0, StereoClampSamplerState, IN.baseTC.xy);
+ 
+	int pixLine = IN.baseTC.y * ScreenSize.y;
+	int pixColumn = IN.baseTC.x * ScreenSize.x;
+ 
+	OUT.Primary = AddLayers(((pixLine + pixColumn) % 2 == 0) ? cL : cR, IN.baseTC.xy);
+	
+	return OUT;
+}
+
+psout AnaglyphPS(v2f IN)
+{	
+	psout OUT = (psout ) 0;
+  
+	min16float4 cL = GetTexture2D(StereoL, StereoClampSamplerState, IN.baseTC.xy);
+	min16float4 cR = GetTexture2D(StereoR, StereoClampSamplerState, IN.baseTC.xy);
+	min16float4 qC = GetTexture2D(QuadLayer0, StereoClampSamplerState, IN.baseTC.xy);
+ 
+	OUT.Primary.r = cL.r;
+	OUT.Primary.gb = cR.gb;
+	OUT.Primary.a = 0.0;
+	
+	OUT.Primary.rgb = AddLayers(OUT.Primary, IN.baseTC.xy).rgb;
+	
+	return OUT;
+}
+
+psout NV3DVisionPS(v2f IN)
+{	
+	psout OUT = (psout ) 0;
+  
+	min16float4 cL = GetTexture2D(StereoL, StereoClampSamplerState, IN.baseTC.xy);
+
+	OUT.Primary = cL;
+	
+	return OUT;
+}
+
+psout EmulationPS(v2f IN)
+{	
+	psout OUT = (psout ) 0;
+  
+	min16float4 cL = GetTexture2D(StereoL, StereoClampSamplerState, IN.baseTC.xy);
+
+	OUT.Primary = cL;
+	
+	return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique SideBySide
+{
+  pass p0
+  {
+    VertexShader = StereoVS();
+    PixelShader = SideBySidePS();
+    
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+technique LineByLine
+{
+  pass p0
+  {
+    VertexShader = StereoVS();
+    PixelShader = LineByLinePS();
+    
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+technique Checkerboard
+{
+  pass p0
+  {
+    VertexShader = StereoVS();
+    PixelShader = CheckerboardPS();
+    
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+technique Anaglyph
+{
+  pass p0
+  {
+    VertexShader = StereoVS();
+    PixelShader = AnaglyphPS();
+    
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+technique NV3DVision
+{
+  pass p0
+  {
+    VertexShader = StereoVS();
+    PixelShader = NV3DVisionPS();
+    
+    ZWriteEnable = false;
+    CullMode = None;
+  }
+}
+
+technique Emulation
+{
+  pass p0
+  {
+		VertexShader = StereoVS();
+		PixelShader = EmulationPS();
+			
+		ZWriteEnable = false;
+		CullMode = None;
+	}
+}
+
+/////////////////////// eof ///

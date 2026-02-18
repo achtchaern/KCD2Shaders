@@ -1,0 +1,1761 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+////////////////////////////////////////////////////////////////////////////
+// Important Note:
+//
+// Wave occupancy is essential to get a performance benefit from tiled deferred shading.
+// Branch heavy code can increase the number of VGPRs that are required to execute
+// the shader which in turn will lower the wave occupancy.
+// When modifying the shader code, please check in PIX on Xbox One that the occupancy is
+// at least 3 for the tiled deferred shading pass.
+//
+////////////////////////////////////////////////////////////////////////////
+
+
+// The following constants and structs have to match the engine code!!
+// Take care changing the values, some values have been duplicated (as the shader-preprocessor doesn't support nested evaluation)
+
+#define TILED_SHADING_TILE_SIZE_X 8
+#define TILED_SHADING_TILE_SIZE_Y 8
+
+static const uint TILED_THREAD_GROUP_SIZE		= (TILED_SHADING_TILE_SIZE_X * TILED_SHADING_TILE_SIZE_Y);
+
+#if !%_RT_MOBILE_PIPELINE
+static const uint TILED_SHADING_MAX_NUM_LIGHTS  = 255;
+static const uint TILED_PROCESSING_RANGE        = TILED_THREAD_GROUP_SIZE * 4;
+#else
+static const uint TILED_SHADING_MAX_NUM_LIGHTS  = 31;
+static const uint TILED_PROCESSING_RANGE        = TILED_THREAD_GROUP_SIZE * 1;
+#endif
+
+static const int TILED_SHADING_INVALID_PROBE_INDEX = -1;
+
+static const uint TILED_SHADING_BITMASK_SIZE    = 32;
+static const uint TILED_SHADING_BITMASK_COUNT   = ((TILED_SHADING_MAX_NUM_LIGHTS + TILED_SHADING_BITMASK_SIZE - 1) / TILED_SHADING_BITMASK_SIZE);
+
+// WH[TBa]: per tile mask of present stencil values, must actually equal to 256 in order to cover the 1-byte ID, KCD2-88437
+static const uint TILED_SHADING_STENCIL_BITMASK_SIZE = 256;
+
+static const uint MAX_ITERATIONS = TILED_SHADING_MAX_NUM_LIGHTS / TILED_THREAD_GROUP_SIZE;
+
+// === Lights definitions ========================================================
+
+#define LT_DIRECTIONAL 0
+#define LT_OMNI        1
+#define LT_PROJECTED   2
+#define LT_TILED       4
+
+#define TILEDLIGHT_TYPE_PROBE              1
+#define TILEDLIGHT_TYPE_AMBIENT_POINT      2
+#define TILEDLIGHT_TYPE_AMBIENT_PROJECTOR  3
+#define TILEDLIGHT_TYPE_AMBIENT_AREA       4
+#define TILEDLIGHT_TYPE_REGULAR_POINT      5
+#define TILEDLIGHT_TYPE_REGULAR_PROJECTOR  6
+#define TILEDLIGHT_TYPE_REGULAR_POINTFACE  7
+// WH[Woody,TBa]: add support for spot-like shadows
+#define TILEDLIGHT_TYPE_REGULAR_POINT_WITH_SPOT_SHADOW 8
+#define TILEDLIGHT_TYPE_REGULAR_AREA       9
+#define TILEDLIGHT_TYPE_REGULAR_AREA_FACE  10
+#define TILEDLIGHT_TYPE_SUN                11
+
+struct STiledLightCullInfo
+{
+	uint      volumeType;
+	uint      stencilIDWH; // WH[TBa]: KCD2-88437
+	float2    depthBounds;
+	float4    posRad;
+	float4    volumeParams0;
+	float4    volumeParams1;
+	float4    volumeParams2;
+};
+
+struct STiledLightVolumeVertex
+{
+	float3 position;
+};
+
+struct STiledLightVolumeInfo
+{
+	float4x4  worldMat;
+	float4    volumeTypeInfo;
+	float4    volumeParams0;
+	float4    volumeParams1;
+	float4    volumeParams2;
+	float4    volumeParams3;
+};
+
+struct STiledClipVolumeInfo
+{
+	uint		data; // bits 0-15 reserved for flags, 16-23 blendID1, 24-31 blendID0
+};
+
+#define TILEDLIGHT_VOLUME_SPHERE   1
+#define TILEDLIGHT_VOLUME_CONE     2
+#define TILEDLIGHT_VOLUME_OBB      3
+#define TILEDLIGHT_VOLUME_SUN      4
+
+//==============================================================================
+// WH[Woody]: Used for three point lighting
+// mapped to a c++ struct defined in ThreePointLighting.h
+#define MAX_3PL_LIGHTS 3
+
+struct S3PLLight
+{
+	float4 color;
+	float4 dir;
+};
+
+struct S3PLData
+{
+	float falloffBegin;
+	float falloffEnd;
+	float gradientEnd;
+	float maxRelativeIlluminanceRatio;
+	float2 gradientDirection;
+	float averageIlluminanceMultiplier;
+	float averageIlluminanceAttenuationMin;
+
+	S3PLLight lights[MAX_3PL_LIGHTS];
+};
+
+//==============================================================================
+// WH[Woody]: Used for three point lighting
+StructuredBuffer<S3PLData> ThreePointLightingData : register(t70);
+Texture2D<float4> LuminanceTex : register(t71);
+
+// returns the attenuation in X and raw illuminance in Y
+float2 GetAvgLumAttenuation()
+{
+	float2 avgLum = LuminanceTex.Load(int3(0, 0, 0)).xy;
+	const float remapCurveExponent = 0.83f; // found okometricky by Filip Storch
+	const float averageIlluminanceAttenuation = pow(saturate(avgLum.y * ThreePointLightingData[0].averageIlluminanceMultiplier), remapCurveExponent);
+	return float2(max(averageIlluminanceAttenuation, ThreePointLightingData[0].averageIlluminanceAttenuationMin), avgLum.y);
+}
+
+//==============================================================================
+// calc ratio between average illuminance (of the last frame) and current pixel illuminance
+float Calc3PLRelativeIlluminanceTerm(float3 diffuseAcc, float lastFrameAvgIllumination)
+{
+	const float relativeIlluminanceTerm = clamp(
+		GetLuminance(diffuseAcc) * PI / lastFrameAvgIllumination,
+		1.f / ThreePointLightingData[0].maxRelativeIlluminanceRatio,
+		ThreePointLightingData[0].maxRelativeIlluminanceRatio
+	);
+
+	return relativeIlluminanceTerm;
+}
+//==============================================================================
+
+//==============================================================================
+// WH[TomK]: Select square side from position, returns integer in range [0, 3] (Top, Bottom, Right, Left).
+uint GetShadowSideMaskWH(float2 pos) {
+	float2 abs_coords = abs(pos);
+	
+	// Chose x/y side.
+	float side = step(abs_coords.x, abs_coords.y);
+
+	// Map the side to a number in the range 0 to 3
+	uint sideIndex = (1. - side) * step(0., pos.x) + side * (2. + step(0., pos.y));
+	
+	return sideIndex;
+}
+//==============================================================================
+
+////////////////////////////////////////////////////////////////////////////
+
+// WH[TBa]: add support for clip volumes in forward shaders, binding of Fwd_TiledClipVolumeInfo and Fwd_ClipVolumeIndexRT added, KCD2-291146
+Texture2D<float2>                      Fwd_ClipVolumeIndexRT : register(t14);
+Buffer<uint>                           Fwd_TileLightMask : register(t17);
+StructuredBuffer<STiledLightShadeInfo> Fwd_TiledLightsShadeInfo : register(t18);
+StructuredBuffer<STiledClipVolumeInfo> Fwd_TiledClipVolumeInfo : register(t16);
+TextureCubeArray<min16float4>          Fwd_SpecCubeArray : register(t20);
+TextureCubeArray<min16float4>          Fwd_DiffuseCubeArray : register(t21);
+Texture2DArray<min16float4>            Fwd_SpotTexArray : register(t22);
+Texture2D<min16float4>                 Fwd_ShadowPool : register(t23);
+Texture2D<min16float4>                 Fwd_SSDO : register(t24);
+Texture2D<min16float4>                 Fwd_RandomRotations : register(t31);
+Texture2D<min16float4>                 Fwd_EnvironmentBRDF : register(t40);
+
+#if FEATURE_SVO_GI
+Texture2D<float4>                      Fwd_GiDiffuseRT : register(t46);
+Texture2D<float4>                      Fwd_GiSpecularRT : register(t47);
+#endif
+
+SamplerComparisonState SampStateComp : register(s14);
+SamplerState SampStateTrilinearClamp : register(s15);
+
+#define SHADOW_SAMPLE_COUNT 16
+float4 irreg_kernel_2d[SHADOW_SAMPLE_COUNT/2] : PB_IrregKernel;
+
+#ifndef AFFECTS_EVERYTHING_STENCILREF 
+#define AFFECTS_EVERYTHING_STENCILREF	0xFF
+#endif
+
+uint4 GetResourceIndexAndMipClamps(uint resIndex)
+{
+	const uint resIndexID   = (resIndex & 0xFFFF);
+	const uint resMipClamp0 = (resIndex >> 16) & 0xFF;
+	const uint resMipClamp1 = (resIndex >> 24) & 0xFF;
+	
+	return uint4(resIndexID, resMipClamp0, resMipClamp1, 0.0f);
+}
+
+void GetShadowMaskIndexAndCubeSide(uint maskIndex, inout uint shadowMaskIndex, inout uint cubeSide)
+{
+	shadowMaskIndex = maskIndex & 0xFF;
+	cubeSide        = maskIndex >> 16;
+}
+
+void GetSpotShadowLightShadeMaskWH(uint mask, inout uint lightMask, inout uint shadeMask)
+{
+	lightMask	= mask & 0xFF;
+	shadeMask = mask >> 16;
+}
+
+float GetClipVolumeWeightBinary(uint nClipVolumeID, uint nLightStencilID)
+{
+	const uint nLightStencilID0 = nLightStencilID & 0xFF;
+	const uint nLightStencilID1 = nLightStencilID >> 16;
+	
+	return (nLightStencilID0 == AFFECTS_EVERYTHING_STENCILREF || nClipVolumeID == nLightStencilID0 || nClipVolumeID == nLightStencilID1) ? 1.0f : 0.0f;
+}
+
+#if FEATURE_SVO_GI
+void ApplyGI(inout float3 specularAcc, inout float3 diffuseAcc, float3 diffuseForwAcc, uint2 pixelCoord, float3 surfGloss, float3 surfSpecCol,
+             Texture2D<float4> TexGiDiffuse, Texture2D<float4> TexGiSpecular, SamplerState samplerTrilinearClamp, const int nIntegrMode, float4 fParms)
+{
+	if(nIntegrMode == 0) // AO only mode
+	{
+		float4 vSkyLightIrradiance = TexGiDiffuse[pixelCoord];
+		specularAcc *= lerp(vSkyLightIrradiance.xyz, 1.f, surfGloss * GetLuminance(surfSpecCol));
+		diffuseAcc *= vSkyLightIrradiance.xyz; // AO + sun bounces
+	}
+	else if(nIntegrMode == 1) // GI replaces diffuse of env probes and adjusts specular
+	{
+		float3 diffuseIrradiance = TexGiDiffuse[pixelCoord].rgb;
+		specularAcc *= lerp(min( 2.f, GetLuminance(diffuseIrradiance) / (GetLuminance(diffuseAcc + diffuseForwAcc) + 0.001)), 1.f, saturate(surfGloss * GetLuminance(surfSpecCol) * fParms.x)) * fParms.z;
+		diffuseAcc = diffuseIrradiance;
+	}
+	else if(nIntegrMode == 2) // Full GI mode
+	{
+		diffuseAcc = TexGiDiffuse[pixelCoord].rgb;
+		specularAcc = TexGiSpecular[pixelCoord].rgb;
+	}
+}
+#endif
+
+int GetNextTileLightIndex(uint lightMask, int startIndex)
+{
+	uint mask = startIndex < 31 ? ~((1U << (startIndex + 1)) - 1) : 0;
+	return firstbitlow(lightMask & mask);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#if !TILED_DEFERRED_SHADING_TECHNIQUE
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#define Mode_Disabled 0
+#define Mode_Deferred 1
+#define Mode_Forward  2
+
+struct TiledForwardShadingParams
+{
+	bool                   applyProbes;
+	bool                   applyNonProbes;
+	bool                   skipSpecularProbes;
+
+	bool                   applyThreePointLighting; // WH[Woody]
+	
+	int                    localLightShadowsMode;
+	bool                   highQualityShadowFiltering;
+	
+	int                    ssdoMode;  // Mode_Forward not supported currently
+	int                    svogiMode; // Mode_Forward not supported currently
+
+	SamplerState           ssTrilinearClamp;
+	SamplerComparisonState ssComparison;
+};
+
+void TiledForwardShading(in TiledForwardShadingParams shadingParams, in ForwardShadingAttribs attribs, inout float3 diffuseAcc, inout float3 specularAcc)
+{
+	uint2 numTiles = ceil( CV_ScreenSize.xy / float2(TILED_SHADING_TILE_SIZE_X, TILED_SHADING_TILE_SIZE_Y) );
+	
+	float2 tcProj = attribs.screenUV;
+	uint2 tileIdx = uint2( tcProj.x * numTiles.x, tcProj.y * numTiles.y );
+	uint bufferIdx = (tileIdx.y * numTiles.x + tileIdx.x) * TILED_SHADING_BITMASK_COUNT;
+	
+	float probeWeightSum = 0;
+	float3 viewVec = -normalize(attribs.worldPos);
+	float specCubeLod = TILED_SHADING_SPECPROBE_MAXMIP - attribs.smoothness * TILED_SHADING_SPECPROBE_MAXMIP;
+	float NdotV = saturate(dot(viewVec, attribs.normalSpecProbe));
+	float3 envFresnel = GetEnvmapFresnel(attribs.reflectance, attribs.smoothness, NdotV);
+	float2 envBRDF = Fwd_EnvironmentBRDF.SampleLevel(shadingParams.ssTrilinearClamp, float2(NdotV, attribs.smoothness), 0).xy;
+	envFresnel = lerp(envBRDF.xxx, envBRDF.yyy, attribs.reflectance);
+
+	float2 occlusion = float2(1, 1);
+    float occlSpec = 1;
+	if (shadingParams.ssdoMode == Mode_Deferred)
+	{
+		float aoAmount = Fwd_SSDO[attribs.screenUV * CV_ScreenSize.xy].w;
+		float occlDiff = saturate(1 - aoAmount * 1.0);
+		occlSpec = saturate(1 - aoAmount * 1.5);
+		occlusion.x = occlDiff * occlDiff;
+		occlusion.y = DeriveSpecularOcclusion(NdotV, max(occlSpec * occlSpec, 0.3), attribs.smoothness);
+	}
+
+	// WH[TBa]: add support for clip volumes in forward shaders, KCD2-291146
+	// The only exception is the eye shader, since the eye overlay reuses the Fwd_ClipVolumeIndexRT for eye AO.
+#if %TEMP_EYES
+	const float clipVolumeBlendWeight = 1;
+#else
+	const uint  clipVolumeStencilID   = Fwd_ClipVolumeIndexRT[attribs.screenUV * CV_ScreenSize.xy].x * 255.0f;
+	const float clipVolumeBlendFactor = Fwd_ClipVolumeIndexRT[attribs.screenUV * CV_ScreenSize.xy].y;
+	const uint  clipVolumeData        = Fwd_TiledClipVolumeInfo[clipVolumeStencilID & MAX_CLIPVOLUMES].data;
+#endif
+
+	int lightIndex = -1;
+	uint maskIndex = 0;
+	uint curMask = Fwd_TileLightMask[bufferIdx];
+	
+	// WH[MMatous]: Added max iteration count to attempt to fix GPU hang
+	[loop]
+	for (int debugMaxIter = 0; debugMaxIter < TILED_SHADING_MAX_NUM_LIGHTS; ++debugMaxIter)
+	{
+		while (maskIndex < TILED_SHADING_BITMASK_COUNT)
+		{
+			lightIndex = GetNextTileLightIndex(curMask, lightIndex);
+			if (lightIndex >= 0) break;
+			else curMask = Fwd_TileLightMask[++maskIndex + bufferIdx];
+		}
+
+		uint lightShadeInfoIdx = lightIndex + maskIndex * 32;
+		int lightType = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType;
+		
+		[branch]
+		if (lightIndex < 0 || lightType > LIGHT_TYPE_AMBIENT_AREA)
+			break;
+			
+		if (shadingParams.applyProbes)
+		{
+			// WH[TBa]: KCD2-291146
+#if !%TEMP_EYES
+			const float clipVolumeBlendWeight = CalcClipVolumeBlendWeight(clipVolumeStencilID, clipVolumeData, clipVolumeBlendFactor, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].stencilID);
+#endif
+			if (lightType == LIGHT_TYPE_PROBE && probeWeightSum < 1 && clipVolumeBlendWeight > 0)
+			{
+				float3 lightVec = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].posRad.xyz - (attribs.worldPos + GetWorldViewPos());
+				
+				// Compute attenuation for box
+				float3 tmpLightVec;
+				tmpLightVec.x = dot( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix[0].xyz, lightVec );
+				tmpLightVec.y = dot( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix[1].xyz, lightVec );
+				tmpLightVec.z = dot( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix[2].xyz, lightVec );
+				
+				[branch] if (abs(tmpLightVec.x) < 1 && abs(tmpLightVec.y) < 1 && abs(tmpLightVec.z) < 1)  // Required for correctness and performance
+				{
+					tmpLightVec = MapCubeToSphere( tmpLightVec );
+					float4 lightColor = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].color;
+
+					float attenuation = GetAttenuation( tmpLightVec, 1, true, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.y ) * Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].attenuationParams.x;
+                    uint4 resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex);
+                    float probeWeight = (1 - probeWeightSum) * attenuation * clipVolumeBlendWeight;
+
+					// WH [Woody]: support for env. probe blending
+					float probeBlend = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowParams.y;
+
+#ifndef TILED_SHADING_USER_DEFINED_PROBE_CALLBACK
+					// Diffuse
+					float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( shadingParams.ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
+					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe ).rgb;
+					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x * (1.f - probeBlend);
+			
+					if (!shadingParams.skipSpecularProbes)
+					{
+						// Specular
+						float tmpGloss = 0;
+						float3 tmpReflVec = reflect(-viewVec, attribs.normalSpecProbe);
+						CubemapBoxParallaxCorrection( tmpReflVec, lightVec, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix[0].xyz, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix[1].xyz, tmpGloss );
+						float4 specularProbe = Fwd_SpecCubeArray.SampleLevel( shadingParams.ssTrilinearClamp, float4( tmpReflVec, resIndexClamps.x ), max(resIndexClamps.z, specCubeLod) );
+						specularProbe.rgb = DecodeHDRCubemap( specularProbe ).rgb * envFresnel;
+						specularAcc += specularProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.y * lightColor.a * (1.f - probeBlend);
+					}
+
+					//=========================================================================
+					// WH [Woody]: support for env. probe blending
+					resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMaskIndex);
+					// the following code is a major copy-paste of the code above (except for the blend factor)
+
+					// Diffuse
+					diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel( shadingParams.ssTrilinearClamp, float4( attribs.normal, resIndexClamps.x ), resIndexClamps.y );
+					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe ).rgb;
+					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.x * probeBlend;
+			
+					if (!shadingParams.skipSpecularProbes)
+					{
+						// Specular
+						float tmpGloss = 0;
+						float3 tmpReflVec = reflect(-viewVec, attribs.normalSpecProbe);
+						CubemapBoxParallaxCorrection( tmpReflVec, lightVec, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix[0].xyz, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix[1].xyz, tmpGloss );
+						float4 specularProbe = Fwd_SpecCubeArray.SampleLevel( shadingParams.ssTrilinearClamp, float4( tmpReflVec, resIndexClamps.x ), max(resIndexClamps.z, specCubeLod) );
+						specularProbe.rgb = DecodeHDRCubemap( specularProbe ).rgb * envFresnel;
+						specularAcc += specularProbe.rgb * (lightColor.rgb * probeWeight) * occlusion.y * lightColor.a * probeBlend;
+					}
+					//=========================================================================
+#else
+                    Callback_ShadingProbe(attribs, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx], lightVec,
+                           probeWeight * (1.f - probeBlend), NdotV, occlusion, occlSpec, resIndexClamps, shadingParams.ssTrilinearClamp,
+                           diffuseAcc, specularAcc);
+
+					//=========================================================================
+					// WH [Woody]: support for env. probe blending
+					resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMaskIndex);
+
+					Callback_ShadingProbe(attribs, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx], lightVec,
+                           probeWeight * probeBlend, NdotV, occlusion, occlSpec, resIndexClamps, shadingParams.ssTrilinearClamp,
+                           diffuseAcc, specularAcc);
+					//=========================================================================
+#endif
+					
+					probeWeightSum += probeWeight;
+				}
+			}
+		}
+	}
+		
+#if FEATURE_SVO_GI && !%_RT_MOBILE_PIPELINE
+	if (shadingParams.svogiMode == Mode_Deferred)
+	{
+		ApplyGI(specularAcc, diffuseAcc, diffuseAcc, int2(attribs.screenUV * CV_ScreenSize.xy), attribs.smoothness, attribs.reflectance,
+			Fwd_GiDiffuseRT, Fwd_GiSpecularRT, shadingParams.ssTrilinearClamp, (int)(cbSVOGI.IntegrationMode.y), cbSVOGI.IntegrationMode);
+	}
+#endif
+	
+	// WH[MMatous]: Added max iteration count to attempt to fix GPU hang
+	[loop]
+	for (int debugMaxIter2 = 0; debugMaxIter2 < TILED_SHADING_MAX_NUM_LIGHTS; ++debugMaxIter2)
+	{
+		[branch]
+		if (lightIndex < 0)
+			break;
+
+		uint lightShadeInfoIdx = lightIndex + maskIndex * 32;
+		int lightType = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType;
+
+		const float3 position = attribs.worldPos;
+		const float4 posRad = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].posRad;
+		const float3 lightVec = posRad.xyz - (position + GetWorldViewPos());
+		
+		// WH[TBa]: skip sun since it is already processed in Fwd_StandardShading() (or other forward shaders),
+		// also the attenuation is not correctly implemented here for the sun, see TiledDeferredShadingCS, KCD2-210590
+		if (shadingParams.applyNonProbes && LIGHT_TYPE_SUN != lightType && lightType > LIGHT_TYPE_AMBIENT_AREA && length( lightVec ) < posRad.w)
+		{
+			bool skipShading = false;
+			bool shadowMap = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowParams.x > 0; // WH[TBa]: closer to the CS variant of this code
+			float shadowMapWeight = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowStrength; // WH[TBa]: KCD2-411675
+			// WH[TBa]: KCD2-291146
+#if !%TEMP_EYES
+			const float clipVolumeBlendWeight = CalcClipVolumeBlendWeight(clipVolumeStencilID, clipVolumeData, clipVolumeBlendFactor, Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].stencilID);
+#endif
+
+			ForwardLightParams lightParams = CreateForwardLightParamsWH(lightType);
+			lightParams.lightVec = normalize(lightVec);
+
+			lightParams.illuminanceWH.color = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].color.rgb;
+			lightParams.illuminanceWH.clipping = GetLightClippingWH(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx], length( lightVec )) * clipVolumeBlendWeight;
+			if (lightType == LIGHT_TYPE_REGULAR_AREA || lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+			{
+				lightParams.illuminanceWH.inverseSquareAttenuation = GetAreaLighAsAttenuatedPointWH(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx], position);
+			}
+			else
+			{
+				lightParams.illuminanceWH.inverseSquareAttenuation = GetPhysicalBulbLightAttenuationWH(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx], length( lightVec ));
+			}
+
+			uint shadowMaskIndex = 0;
+			uint shadowCubeSide = 0;
+			GetShadowMaskIndexAndCubeSide(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMaskIndex, shadowMaskIndex, shadowCubeSide);
+			
+			uint4 resIndexClamps = GetResourceIndexAndMipClamps(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].resIndex);		
+
+			if (lightType == LIGHT_TYPE_REGULAR_PROJECTOR)
+			{
+				if (lightParams.illuminanceWH.clipping > 0)
+				{
+					float4 projTC = mul( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix, float4( position + GetWorldViewPos(), 1.0f ) );  
+					projTC.xy /= projTC.w;		
+						
+					if (projTC.w < 0 || min( projTC.x, projTC.y ) < 0 || max( projTC.x, projTC.y ) > 1)  // Avoid back-projection
+						skipShading = true;
+					else
+					{
+						lightParams.illuminanceWH.color *= Fwd_SpotTexArray.SampleLevel( shadingParams.ssTrilinearClamp, float3(projTC.xy, resIndexClamps.x), resIndexClamps.y ).xxx;
+					}
+				}
+			}
+			else if (lightType == LIGHT_TYPE_REGULAR_POINTFACE || lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+			{
+				uint cubeFace = selectCubeFace(lightVec);			
+				skipShading = (shadowCubeSide != cubeFace);
+			}
+			else if (lightType == LIGHT_TYPE_REGULAR_AREA) // WH[TBa]: added support for area light shadows, KCD2-291146
+			{
+				// WH[TBa]: clipping and attenuation already contains the information about the point beeing behind the light and so on
+				if (lightParams.illuminanceWH.clipping * lightParams.illuminanceWH.inverseSquareAttenuation <= 0.f)
+				{
+					shadowMap = false;
+				}
+
+				// WH[TBa]: avoid reading shadowmaps (or shadowmasks) outside of the frustum, KCD2-409251
+				const float4 shadowCoords = mul(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix, float4(position + GetWorldViewPos(), 1));
+				if (shadowCoords.z <= 0)
+				{
+					shadowMap = false;
+				}
+			}
+			else if (lightType == LIGHT_TYPE_REGULAR_POINT_WITH_SPOT_SHADOW)
+			{
+				// WH[TomK]: Multiple spot shadows - don't apply light outside of masked sides.
+				float4 vSpotProj = mul(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix, float4(position + GetWorldViewPos(), 1));
+				uint cubeFace = selectCubeFace(vSpotProj.xyz);
+
+				uint lightSideMask;
+				uint shadeSideMask;
+				GetSpotShadowLightShadeMaskWH(Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].spotShadowLightShadeMask, lightSideMask, shadeSideMask);
+				
+				skipShading = (lightSideMask & (1u << cubeFace)) == 0;
+				shadowMap &= cubeFace == 5; // Apply shadow only on front face.
+
+				// Smooth shadows
+				float sideSmoothing = step(float((1u << GetShadowSideMaskWH(vSpotProj.xy)) & shadeSideMask), 0.5);
+				const float maxDistFromFrustum = max(abs(vSpotProj.x / vSpotProj.w), abs(vSpotProj.y / vSpotProj.w));
+				shadowMapWeight *= (1.f - sideSmoothing * smoothstep(0.9f, 1.f, maxDistFromFrustum)); // smooth transition outside frustum with shadow map
+			}
+				
+			if (!skipShading)
+			{
+				float shadowOccl = 1;
+				
+				if (shadingParams.localLightShadowsMode != Mode_Disabled && shadowMap)
+				{
+					float4 P0 = mul( Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowMatrix, float4( position + GetWorldViewPos(), 1 ) );
+					P0.xy /= P0.w;
+					P0.z -= Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowParams.y;
+					
+					bool bAllowHighQualityShadows = false; // TODO: fix me
+					
+					if (shadingParams.localLightShadowsMode == Mode_Deferred)
+					{
+						int3 sampleCoords = int3(attribs.screenUV * CV_ScreenSize.xy, shadowMaskIndex);
+						shadowOccl = 1 - Fwd_SunShadowMask[sampleCoords].r;
+					}
+					else if (shadingParams.highQualityShadowFiltering && bAllowHighQualityShadows)
+					{
+						float2 kernelRadius = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].shadowParams.x;
+						float2 rotScale = kernelRadius.y * 1000.0f;
+
+						const int nRotationTextureSize = 64;
+						int2 sampleCoords = int2(P0.xy * rotScale.xy * nRotationTextureSize) % nRotationTextureSize;
+						
+						min16float2 rotSample = Fwd_RandomRotations.Load(int3(sampleCoords, 0)).xy;
+						rotSample.xy *= kernelRadius.xy * 1/512.0f;
+						float4 rot = float4(rotSample.x, -rotSample.y, rotSample.y, rotSample.x);
+						
+						shadowOccl = 0;
+						for(int s = 0; s < SHADOW_SAMPLE_COUNT / 2; s += 2) // Loop over taps
+						{
+							min16float4 sampleDepth;
+							{
+								// Rotate tap for this pixel location
+								float4 rotatedOff0 = rot.xyzw * irreg_kernel_2d[s+0].xxww +	rot.zwxy * irreg_kernel_2d[s+0].yyzz;
+								float4 rotatedOff1 = rot.xyzw * irreg_kernel_2d[s+1].xxww +	rot.zwxy * irreg_kernel_2d[s+1].yyzz;
+
+								sampleDepth.x = Fwd_ShadowPool.SampleCmpLevelZero( shadingParams.ssComparison, P0.xy + rotatedOff0.xy, P0.z);
+								sampleDepth.y = Fwd_ShadowPool.SampleCmpLevelZero( shadingParams.ssComparison, P0.xy + rotatedOff0.zw, P0.z);
+								sampleDepth.z = Fwd_ShadowPool.SampleCmpLevelZero( shadingParams.ssComparison, P0.xy + rotatedOff1.xy, P0.z);
+								sampleDepth.w = Fwd_ShadowPool.SampleCmpLevelZero( shadingParams.ssComparison, P0.xy + rotatedOff1.zw, P0.z);
+							}
+
+							shadowOccl += dot(sampleDepth, 1.0 / SHADOW_SAMPLE_COUNT);
+						}
+					}
+					else
+					{
+						shadowOccl = Fwd_ShadowPool.SampleCmpLevelZero( shadingParams.ssComparison, P0.xy, P0.z );
+					}
+				}
+
+				shadowOccl = lerp(1.f, shadowOccl, shadowMapWeight);
+
+				lightParams.illuminanceWH.color *= shadowOccl;
+
+                float3 diffuseTerm = 0;
+                float3 specularTerm = 0;
+
+                attribs.areaAttribs.transform = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].projectorMatrix;
+                attribs.areaAttribs.lightPos = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].posRad.xyz - GetWorldViewPos();
+                attribs.areaAttribs.position = position;
+				attribs.areaAttribs.lightArrayIdx = resIndexClamps.x;
+				// WH[TBa]: KCD2-73606
+				attribs.areaAttribs.wallThickness = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].areaLightWallThickness;
+				attribs.areaAttribs.wallChamfer = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].areaLightWallChamfer;
+				attribs.areaAttribs.windowMargin = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].areaLightWindowMargin;
+
+                Callback_ShadingDirect(attribs, lightParams, diffuseTerm, specularTerm);
+
+				diffuseAcc += diffuseTerm;
+                specularAcc += specularTerm;
+            }
+		}
+		
+		while (maskIndex < TILED_SHADING_BITMASK_COUNT)
+		{
+			lightIndex = GetNextTileLightIndex(curMask, lightIndex);
+			if (lightIndex >= 0) break;
+			else curMask = Fwd_TileLightMask[++maskIndex + bufferIdx];
+		}
+	}
+
+	// ==============================================================================================
+	// WH[Woody]: Apply three point lighting
+	if (shadingParams.applyThreePointLighting)
+	{
+		const float2 attenAndIlluminance = GetAvgLumAttenuation();
+		const float avgLumAtten = attenAndIlluminance.x;
+
+		// calc ratio between average illuminance (of the last frame) and current pixel illuminance
+		const float relativeIlluminanceTerm = Calc3PLRelativeIlluminanceTerm(diffuseAcc, attenAndIlluminance.y);
+
+		// fade-out the effect towards bottom of the screen with quadratic slope to simulate light attenuation
+		const float gradientLerp = 1.f - dot(attribs.screenUV, ThreePointLightingData[0].gradientDirection);
+		float attenuation = lerp(ThreePointLightingData[0].gradientEnd, 1.f, gradientLerp * gradientLerp);
+
+		float3x3 mat;
+		mat[2] = float3(0, 0, 1); // up
+		mat[0] = normalize(cross(-CV_CameraFrontVector.xyz, mat[2])); // right
+		mat[1] = cross(mat[2], mat[0]); // front
+
+		[unroll]
+		for (uint i = 0; i < MAX_3PL_LIGHTS; ++i)
+		{
+			S3PLLight light = ThreePointLightingData[0].lights[i];
+
+			ForwardLightParams lightParams = CreateForwardLightParamsWH(LIGHT_TYPE_REGULAR_POINT);
+			lightParams.lightVec = normalize(mul(light.dir.xyz, mat));
+			lightParams.illuminanceWH.color = light.color.rgb;
+
+			float ssShadows = light.dir.w;
+
+			lightParams.illuminanceWH.color *= avgLumAtten * attenuation * relativeIlluminanceTerm;
+
+			float3 diffuse, specular;
+			Callback_ShadingDirect(attribs, lightParams, diffuse, specular);
+			[branch] if (ssShadows)
+			{
+				diffuse *= occlusion.x;
+				specular *= occlusion.y;
+			}
+
+			diffuseAcc += diffuse;
+			specularAcc += specular;
+		}
+	}
+	// ==============================================================================================
+}
+
+#endif
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#if TILED_DEFERRED_SHADING_TECHNIQUE
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// The benefit of using the depth mask is currently not enough to cover the cost of generating it
+//#define USE_DEPTH_MASK
+
+float4 ProjParams;
+float4 ScreenSize;
+float4 SunDir;
+float4 SunColor;
+float4 SSDOParams;
+float4 SSRParamsWH; // WH[TBa]: KCD2-113243
+#if FEATURE_SVO_GI
+float4 ForwGiIntegrationMode : PB_SvoParams4;
+#endif
+
+RWBuffer<uint> TileTranspLightMaskUAV : register(u0);
+RWTexture2D<float3> HDRSceneTargetUAV : register(u1);
+RWTexture2D<float3> DiffuseAccUAV : register(u2);
+
+Texture2D<float4> DepthRT: register(t0); // WH[TBa]: unify with rest of the code where everybody uses float4 for depth texture, KCD2-9831
+Texture2D<float4> NormalRT : register(t1);
+Texture2D<float4> SpecularRT : register(t2);
+Texture2D<float4> DiffuseRT : register(t3);
+Texture2DArray<float4> ShadowMaskRT : register(t4);
+Texture2D<float4> DirectionalOccRT : register(t5);
+Texture2D<float4> SSReflectionRT : register(t6);
+Texture2D<float4> EnvBRDF : register(t7);
+Texture2D<float2> ClipVolumeIndexRT : register(t8);
+Texture2D<float4> AOColorBleedRT : register(t9);
+Texture2D<float4> GiDiffuseRT : register(t10);
+Texture2D<float4> GiSpecularRT : register(t11);
+Texture2D<float3> CausticsRT : register(t12);
+
+Buffer<uint>                           TileLightMask : register(t16);
+StructuredBuffer<STiledLightCullInfo>  TiledLightsCullInfo : register(t16);
+StructuredBuffer<STiledLightShadeInfo> TiledLightsShadeInfo : register(t17);
+StructuredBuffer<STiledClipVolumeInfo> TiledClipVolumeInfo : register(t18);
+TextureCubeArray<float4>               SpecCubeArray : register(t19);
+TextureCubeArray<float4>               DiffuseCubeArray : register(t20);
+Texture2DArray<min16float4>            SpotTexArray : register(t21);
+
+
+groupshared uint sTileLightCount;
+groupshared uint sTileLightIndices[TILED_PROCESSING_RANGE];
+groupshared uint sTileMinZ;
+groupshared uint sTileMaxZ;
+groupshared uint sTileDepthMask;
+groupshared uint sTileWithinProjection;
+groupshared uint sTileLightMask[TILED_SHADING_BITMASK_COUNT];
+groupshared uint sTileLightMaskCounts[TILED_SHADING_BITMASK_COUNT];
+groupshared bool sTileStencilIDs[TILED_SHADING_STENCIL_BITMASK_SIZE]; // WH[TBa]: true for every stencil value present in this tile
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// WH[DH]: Use wave32 mode with area lights which increases occupancy
+CRY_WAVE_32
+[numthreads(TILED_SHADING_TILE_SIZE_X, TILED_SHADING_TILE_SIZE_Y, 1)]
+void TiledDeferredShadingCS( uint3 GroupID : SV_GroupID,
+                             uint3 GroupThreadID : SV_GroupThreadID )
+{
+	const uint groupThreadIdx = GroupThreadID.y * TILED_SHADING_TILE_SIZE_X + GroupThreadID.x;
+	const uint2 pixelCoord = GroupID.xy * uint2(TILED_SHADING_TILE_SIZE_X, TILED_SHADING_TILE_SIZE_Y) + GroupThreadID.xy;
+	
+	// Barycentric interpolation for reconstructing position
+	float2 pixelUV = float2( (pixelCoord.x + 0.5) * ScreenSize.z, (pixelCoord.y + 0.5) * ScreenSize.w );
+	float2 linearUV = MapRasterToViewport(pixelUV);
+	
+	// Initialize shared memory
+	if (groupThreadIdx == 0)
+	{
+		sTileLightCount = 0;
+		sTileWithinProjection = 0;
+	}
+
+	// WH[TBa]: clear stencilID usage bitmask
+	for (uint stencilIdx = groupThreadIdx; stencilIdx < TILED_SHADING_STENCIL_BITMASK_SIZE; stencilIdx += TILED_THREAD_GROUP_SIZE)
+	{
+		sTileStencilIDs[stencilIdx] = 0;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// WH[Woody]: mark all used stencilIDs in the thread group
+	const uint clipVolumeStencilID = ClipVolumeIndexRT[pixelCoord].x * 255.0f;
+	sTileStencilIDs[clipVolumeStencilID] = 1;
+	
+	// Find out if any threads in the tile are within the projection
+	{
+		uint bWithinProjection = all(linearUV.xy > 0) && all(linearUV.xy < 1);
+		
+		InterlockedMax( sTileWithinProjection, bWithinProjection );
+		
+		GroupMemoryBarrierWithGroupSync();
+	
+		if (sTileWithinProjection == 0)
+			return;
+	}
+	
+#if !%_RT_SAMPLE1	
+	// Initialize shared memory
+	if (groupThreadIdx == 0)
+	{
+		sTileMinZ = 0x7F7FFFFF;  // Max float
+		sTileMaxZ = 0;
+		sTileDepthMask = 0;
+	}
+	
+	sTileLightIndices[groupThreadIdx] = TILED_SHADING_MAX_NUM_LIGHTS;
+	
+	// Fudge maxZ to prevent division by 0 when minZ is equal maxZ
+	// it also assures the depth-mask bins of [0,32) instead of [0,32]
+	float linearZ = DepthRT[pixelCoord].x; // WH[TBa]: unify with rest of the code where everybody uses float4 for depth texture, KCD2-9831
+	float minZSample = linearZ;
+	float maxZSample = linearZ + 0.0001;
+
+	// Find tile z bounds
+	GroupMemoryBarrierWithGroupSync();
+	
+	InterlockedMin( sTileMinZ, asuint( minZSample ) );
+	InterlockedMax( sTileMaxZ, asuint( maxZSample ) );
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+	float tileMinZ = asfloat( sTileMinZ );
+	float tileMaxZ = asfloat( sTileMaxZ );
+	bool emptyTile = (tileMinZ == 1.0);
+	bool isSkyPixel = (linearZ == 1.0);
+	
+	// Scale and bias for frustum to fit grid cells
+	float2 numTiles = ceil( ScreenSize.xy / float2(TILED_SHADING_TILE_SIZE_X, TILED_SHADING_TILE_SIZE_Y) );
+	float2 tileScale = numTiles / 2.0;
+	float2 tileBias = tileScale - float2( GroupID.xy );
+	
+	// Extract projection matrix columns (including PostAA bias)
+	float4 col1 = float4( ProjParams.x * tileScale.x, 0.0f, ProjParams.z + tileBias.x, 0.0f );
+	float4 col2 = float4( 0.0f, -ProjParams.y * tileScale.y, ProjParams.w + tileBias.y, 0.0f );
+	float4 col4 = float4( 0.0f, 0.0f, 1.0f, 0.0f );
+
+	float4 frustumPlanes[4];
+	frustumPlanes[0] = normalize( col4 - col1 );
+	frustumPlanes[1] = normalize( col4 + col1 );
+	frustumPlanes[2] = normalize( col4 - col2 );
+	frustumPlanes[3] = normalize( col4 + col2 );
+	
+#ifdef USE_DEPTH_MASK
+	// Create depth coverage mask for tile
+	// Fudge guarantees (32  * z) / (z + 0.0001) < 32
+	float tileDepthExtent = rcp( tileMaxZ - tileMinZ );
+	uint cellIndex = ((linearZ - tileMinZ) * tileDepthExtent) * 32;
+	GroupMemoryBarrierWithGroupSync();
+	InterlockedOr( sTileDepthMask, 1UL << cellIndex );
+	GroupMemoryBarrierWithGroupSync();
+#endif
+	
+	// ==============================================================================================
+	// Light culling
+	// ==============================================================================================
+	
+	uint tileIdx = GroupID.y * numTiles.x + GroupID.x;
+	
+	// Cull against frustum planes
+	[unroll(MAX_ITERATIONS)]
+	for (uint lightIdx = groupThreadIdx; lightIdx < TILED_SHADING_MAX_NUM_LIGHTS; lightIdx += TILED_THREAD_GROUP_SIZE)
+	{
+		uint volumeType = TiledLightsCullInfo[lightIdx].volumeType;
+		
+		if (volumeType == 0)
+			break;
+		
+		const float lightMinZ = TiledLightsCullInfo[lightIdx].depthBounds.x;
+		const float lightMaxZ = TiledLightsCullInfo[lightIdx].depthBounds.y;
+
+		// Test far plane
+		// The tileMaxZ value is a bit larger than the real maximum Z because of the fudge: use < instead of <=
+		bool inFrustum = ( lightMinZ < tileMaxZ );
+		
+		if (inFrustum)
+		{
+			float4 lightPosRad = TiledLightsCullInfo[lightIdx].posRad;
+			float4 lightDists;
+			
+			[unroll]
+			for (uint j = 0; j < 4; ++j)
+			{
+				lightDists[j] = dot( frustumPlanes[j], float4( lightPosRad.xyz, 1 ) );
+			}
+			
+			if (volumeType == TILEDLIGHT_VOLUME_SPHERE)
+			{
+				[unroll]
+				for (uint j = 0; j < 4; ++j)
+				{
+					// Simple sphere culling
+					inFrustum = inFrustum && (lightDists[j] >= -lightPosRad.w);
+				}
+			}
+			else if (volumeType == TILEDLIGHT_VOLUME_CONE)
+			{
+				const float4 spotParams = TiledLightsCullInfo[lightIdx].volumeParams0;
+				
+				[unroll]
+				for (uint j = 0; j < 4; ++j)
+				{
+					// Cone culling
+					float3 v = spotParams.xyz;
+					float3 Q = lightPosRad.xyz - v * lightPosRad.w;
+					Q += spotParams.w * (frustumPlanes[j].xyz - v * dot( v, frustumPlanes[j].xyz ));
+					float dBase = dot( frustumPlanes[j], float4( Q, 1.0f ) );
+					inFrustum = inFrustum && (((lightDists[j] > 0) || (dBase > 0)) && (lightDists[j] >= -lightPosRad.w));  // Including sphere test for more accurate culling
+				}
+			}
+			else if (volumeType == TILEDLIGHT_VOLUME_OBB)
+			{
+				float4 u0 = TiledLightsCullInfo[lightIdx].volumeParams0;
+				float4 u1 = TiledLightsCullInfo[lightIdx].volumeParams1;
+				float4 u2 = TiledLightsCullInfo[lightIdx].volumeParams2;
+				
+				[unroll]
+				for (uint j = 0; j < 4; ++j)
+				{
+					// OBB culling
+					float r = dot( float3( u0.w, u1.w, u2.w ), float3( abs(dot( frustumPlanes[j].xyz, u0.xyz )), abs(dot( frustumPlanes[j].xyz, u1.xyz )), abs(dot( frustumPlanes[j].xyz, u2.xyz )) ) ) ;
+					inFrustum = inFrustum && (-lightDists[j] <= r);// detect OBB intersects or is inside the plane.
+				}
+			}
+		
+			if (inFrustum)
+			{
+				// Test near plane
+				[branch]
+				if ((lightMaxZ >= tileMinZ) && !emptyTile)
+				{
+
+				#ifdef USE_DEPTH_MASK
+					// saturate() allows [0,1], thus the shift can become 32 if lightMinZ equals exactly lightMaxZ
+					// The shift is masked (32 & 0x1F) and does nothing in case 32, except registering the light in all bits (worst case)
+					uint lightShiftMin = saturate( (lightMinZ - tileMinZ) * tileDepthExtent ) * 32;
+					uint lightShiftMax = saturate( (tileMaxZ - lightMaxZ) * tileDepthExtent ) * 32;
+					uint lightMask = (0xFFFFFFFFUL << lightShiftMin) & (0xFFFFFFFFUL >> lightShiftMax);
+
+					if ((lightMask & sTileDepthMask) != 0)
+				#endif
+					{
+
+						// WH[Woody]: clip by gathered stencilID usage markers, KCD2-88437
+						const uint nLightStencilID0 = TiledLightsCullInfo[lightIdx].stencilIDWH & 0xff;
+						const uint nLightStencilID1 = (TiledLightsCullInfo[lightIdx].stencilIDWH >> 16) & 0xff;
+						const bool visible
+							= (nLightStencilID0 == AFFECTS_EVERYTHING_STENCILREF)
+							|| sTileStencilIDs[nLightStencilID0]
+							|| sTileStencilIDs[nLightStencilID1]
+							|| (volumeType == TILEDLIGHT_VOLUME_SUN);
+						if (visible)
+						{
+							uint listIndex;
+							InterlockedAdd( sTileLightCount, 1, listIndex );
+							sTileLightIndices[listIndex] = lightIdx;
+						}
+					}
+				}
+
+				[branch]
+				if (volumeType != TILEDLIGHT_VOLUME_SUN)
+				{
+					uint bufferBaseIdx = tileIdx * TILED_SHADING_BITMASK_COUNT;
+					uint maskIndex = lightIdx / 32;
+					// WH[TBa]: ambiguous type for bit shift; use a type suffix on literal values, like 'L' or 'U', or a cast
+					InterlockedOr(TileTranspLightMaskUAV[bufferBaseIdx + maskIndex], 1u << (lightIdx & 31));
+				}
+			}
+		}
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+	
+#if !SCARLETT && !DURANGO && !ORBIS && !HERCULES
+	// Apply bitonic sort to the first TILED_THREAD_GROUP_SIZE lights; not required on AMD/Durango when no more than 64 threads are used
+	[unroll]
+	for (uint k = 2; k <= TILED_THREAD_GROUP_SIZE; k = 2 * k)
+	{
+		[unroll]
+		for (uint j = k / 2; j > 0 ; j /= 2)
+		{
+				uint i = groupThreadIdx;
+				uint result1 = ((sTileLightIndices[i & ~j] <= sTileLightIndices[i | j]) == (bool)(k & i)) ? sTileLightIndices[i ^ j] : sTileLightIndices[i];
+				GroupMemoryBarrierWithGroupSync();
+				sTileLightIndices[i] = result1;
+				GroupMemoryBarrierWithGroupSync();
+		}
+	}
+#endif
+	
+#else
+	float2 numTiles = ceil( ScreenSize.xy / float2(TILED_SHADING_TILE_SIZE_X, TILED_SHADING_TILE_SIZE_Y) );
+	uint tileIdx = GroupID.y * numTiles.x + GroupID.x;
+	uint bufferBaseIdx = tileIdx * TILED_SHADING_BITMASK_COUNT;
+	
+	if (groupThreadIdx < TILED_SHADING_BITMASK_COUNT)
+	{
+		uint lightMask = TileLightMask[bufferBaseIdx + groupThreadIdx];
+		sTileLightMask[groupThreadIdx] = lightMask;
+		sTileLightMaskCounts[groupThreadIdx] = countbits(lightMask);
+		InterlockedAdd(sTileLightCount, sTileLightMaskCounts[groupThreadIdx]);
+	}
+
+	// Sync for wave(front)s smaller than 8 (e.g. WARP, which is 4 wide with SSE)
+	GroupMemoryBarrierWithGroupSync();
+	
+	if (groupThreadIdx < TILED_SHADING_BITMASK_COUNT)
+	{
+		uint offset = 0;
+		for (uint i = 0; i < groupThreadIdx; i++)
+			offset += sTileLightMaskCounts[i];
+		
+		uint lightCount = 0;
+		int lightIndex = GetNextTileLightIndex(sTileLightMask[groupThreadIdx], -1);
+		while (lightIndex >= 0)
+		{
+			sTileLightIndices[offset + lightCount++] = groupThreadIdx * 32 + lightIndex;
+			lightIndex = GetNextTileLightIndex(sTileLightMask[groupThreadIdx], lightIndex);
+		}
+	}
+	
+	GroupMemoryBarrierWithGroupSync();
+
+	bool emptyTile = sTileLightCount == 0;
+	float linearZ = DepthRT[pixelCoord].x; // WH[TBa]: unify with rest of the code where everybody uses float4 for depth texture, KCD2-9831
+#endif
+	
+	// ==============================================================================================
+	// Overdraw visualization
+	// ==============================================================================================
+	
+#if %_RT_SAMPLE2
+	{
+		float x = (float)sTileLightCount / 16.0;
+		float w0 = x * 2;
+		float w1 = x * 2 - 1;
+		float3 finalCol = x < 0.5 ? lerp(float3(0, 0, 0.25), float3(1, 0, 0), float3(w0*w0, 0, w0))
+		                          : lerp(float3(1, 0, 0.00), float3(1, 1, 0), float3(w1*w1, w1*w1, 0));
+		
+		if (x == 0) finalCol = float3(0, 0, 0);
+		else if (x > 1) finalCol = float3(1, 1, 1);
+		
+		// WH[DH]: Implicit truncation of vector type
+		HDRSceneTargetUAV[pixelCoord] = finalCol;
+		return;
+	}
+#endif
+	
+	// ==============================================================================================
+	// Shading for tiles
+	// ==============================================================================================
+	
+#if %_RT_SAMPLE0
+	MaterialAttribsCommon attribs = DecodeGBuffer( NormalRT[pixelCoord], DiffuseRT[pixelCoord], SpecularRT[pixelCoord] );
+	float3 surfNormal = attribs.NormalWorld;
+	bool surfIsTranslucent = attribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE;
+	float3 surfTransmittanceColor = attribs.Transmittance;
+	float3 surfSpecCol = attribs.Reflectance;
+	float surfGloss = attribs.Smoothness;
+
+	float3 position = ReconstructWorldPos(pixelCoord, linearZ, true);
+	
+	float3 diffuseAcc = 0;
+	float3 specularAcc = 0;
+	
+	int curLight = 0;
+	int lightIndex = sTileLightCount > 0 ? sTileLightIndices[0] : 0;
+
+	const uint  clipVolumeData = TiledClipVolumeInfo[clipVolumeStencilID & MAX_CLIPVOLUMES].data;
+	const float clipVolumeBlendFactor = ClipVolumeIndexRT[pixelCoord].y;
+
+	// ==============================================================================================
+	// Environment probes
+	// ==============================================================================================
+	{
+		float probeWeightSum = 0;
+		float3 reflVec = reflect( normalize( position ), surfNormal );
+		float specCubeLod = TILED_SHADING_SPECPROBE_MAXMIP - surfGloss * TILED_SHADING_SPECPROBE_MAXMIP;
+		
+		while (curLight < sTileLightCount)
+		{
+			int lightType = TiledLightsShadeInfo[lightIndex].lightType;
+			if (lightType != LIGHT_TYPE_PROBE)
+				break;
+
+			const float clipVolumeBlendWeight = CalcClipVolumeBlendWeight(clipVolumeStencilID, clipVolumeData, clipVolumeBlendFactor, TiledLightsShadeInfo[lightIndex].stencilID);
+			[branch] if (probeWeightSum < 1.0 && clipVolumeBlendWeight > 0)
+			{
+				float3 lightVec = TiledLightsShadeInfo[lightIndex].posRad.xyz - (position + GetWorldViewPos());
+				
+				// Compute attenuation for box
+				float3 tmpLightVec;
+				tmpLightVec.x = dot( TiledLightsShadeInfo[lightIndex].projectorMatrix[0].xyz, lightVec );
+				tmpLightVec.y = dot( TiledLightsShadeInfo[lightIndex].projectorMatrix[1].xyz, lightVec );
+				tmpLightVec.z = dot( TiledLightsShadeInfo[lightIndex].projectorMatrix[2].xyz, lightVec );
+				
+				[branch] if (max( max( abs(tmpLightVec.x), abs(tmpLightVec.y) ), abs(tmpLightVec.z) ) < 1)  // Required for correctness and performance
+				{
+					tmpLightVec = MapCubeToSphere( tmpLightVec );
+					float4 lightColor = TiledLightsShadeInfo[lightIndex].color;
+
+					float attenuation = GetAttenuation( tmpLightVec, 1, true, TiledLightsShadeInfo[lightIndex].attenuationParams.y ) * TiledLightsShadeInfo[lightIndex].attenuationParams.x;
+					uint4 resIndexClamps = GetResourceIndexAndMipClamps(TiledLightsShadeInfo[lightIndex].resIndex);
+
+					// WH [Woody]: support for env. probe blending
+					float probeBlend = TiledLightsShadeInfo[lightIndex].shadowParams.y;
+
+					// Diffuse
+					float4 diffuseProbe = DiffuseCubeArray.SampleLevel( SampStateTrilinearClamp, float4( surfNormal, resIndexClamps.x ), resIndexClamps.y );
+					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe ).rgb;
+					[branch] if (surfIsTranslucent)
+					{
+						float4 diffuseProbe2 = DiffuseCubeArray.SampleLevel( SampStateTrilinearClamp, float4( -surfNormal, resIndexClamps.x ), resIndexClamps.y );
+						diffuseProbe.rgb += DecodeHDRCubemap( diffuseProbe2 ).rgb * surfTransmittanceColor;
+					}
+					float probeWeight = (1 - probeWeightSum) * attenuation * clipVolumeBlendWeight;
+					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * (1.f - probeBlend);
+
+					// Specular
+					float tmpGloss = 0;
+					float3 tmpReflVec = reflVec;
+					CubemapBoxParallaxCorrection( tmpReflVec, lightVec, TiledLightsShadeInfo[lightIndex].shadowMatrix[0].xyz, TiledLightsShadeInfo[lightIndex].shadowMatrix[1].xyz, tmpGloss );
+					float4 specularProbe = SpecCubeArray.SampleLevel( SampStateTrilinearClamp, float4( tmpReflVec, resIndexClamps.x ), max(specCubeLod, resIndexClamps.z) );
+					specularProbe.rgb = DecodeHDRCubemap( specularProbe ).rgb;
+					specularAcc += specularProbe.rgb * (lightColor.rgb * probeWeight) * lightColor.a * (1.f - probeBlend);
+
+					//=========================================================================
+					// WH [Woody]: support for env. probe blending
+					resIndexClamps = GetResourceIndexAndMipClamps(TiledLightsShadeInfo[lightIndex].shadowMaskIndex);
+					// the following code is a major copy-paste of the code above (except for the blend factor)
+
+					// Diffuse
+					diffuseProbe = DiffuseCubeArray.SampleLevel( SampStateTrilinearClamp, float4( surfNormal, resIndexClamps.x ), resIndexClamps.y );
+					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe ).rgb;
+					[branch] if (surfIsTranslucent)
+					{
+						float4 diffuseProbe2 = DiffuseCubeArray.SampleLevel( SampStateTrilinearClamp, float4( -surfNormal, resIndexClamps.x ), resIndexClamps.y );
+						diffuseProbe.rgb += DecodeHDRCubemap( diffuseProbe2 ).rgb * surfTransmittanceColor;
+					}
+					diffuseAcc += diffuseProbe.rgb * (lightColor.rgb * probeWeight) * probeBlend;
+
+					// Specular
+					specularProbe = SpecCubeArray.SampleLevel( SampStateTrilinearClamp, float4( tmpReflVec, resIndexClamps.x ), max(specCubeLod, resIndexClamps.z) );
+					// WH[TBa]: implicit truncation of vector type, KCD2-448804
+					specularProbe.rgb = DecodeHDRCubemap( specularProbe ).rgb;
+					specularAcc += specularProbe.rgb * (lightColor.rgb * probeWeight) * lightColor.a * probeBlend;
+					//=========================================================================
+
+					probeWeightSum += probeWeight;
+				}
+			}
+			
+			++curLight;
+			lightIndex = sTileLightIndices[min( curLight, (int)TILED_SHADING_MAX_NUM_LIGHTS - 1 )];
+		}
+	}
+
+#if FEATURE_SVO_GI
+	// ==============================================================================================
+	// Global Illumination
+	// ==============================================================================================
+	{
+		int nIntegrMode = -1;
+		#if %_RT_CUBEMAP0 && !%_RT_DECAL_TEXGEN_2D  // AO only mode
+		nIntegrMode = 0;
+		#elif !%_RT_CUBEMAP0 && %_RT_DECAL_TEXGEN_2D  // GI replaces diffuse of env probes and adjusts specular
+		nIntegrMode = 1;
+		#elif %_RT_CUBEMAP0 && %_RT_DECAL_TEXGEN_2D  // Full GI mode
+		nIntegrMode = 2;
+		#endif
+
+		ApplyGI(specularAcc, diffuseAcc, 0, pixelCoord, surfGloss, surfSpecCol,
+		        GiDiffuseRT, GiSpecularRT, SampStateTrilinearClamp, nIntegrMode, ForwGiIntegrationMode);
+	}
+#endif
+
+	// ==============================================================================================
+	// SSDO
+	// ==============================================================================================
+	float4 occlusionData = DirectionalOccRT[pixelCoord];
+	occlusionData.xyz = occlusionData.xyz * 2 - 1;
+		
+	{	
+		// Ambient occlusion
+		float occlDiff = saturate( 1 - occlusionData.a * SSDOParams.y );
+		occlDiff *= occlDiff;
+
+		// Apply simple color bleeding approximation to AO (1/8 resolution)
+		// WH[TBa]: add color bleeding strength to SSDOParams.w, KCD2-376117
+		float3 bleedColor = AOColorBleedRT.SampleLevel( SampStateTrilinearClamp, pixelUV, 0 ).rgb * SSDOParams.w;
+		
+		// WH[DH]: Clamp the diffuse occlusion to prevent the creation of invalid pixels
+		diffuseAcc *= pow(float3(occlDiff, occlDiff, occlDiff), max(float3(0.01, 0.01, 0.01), float3(1.0, 1.0, 1.0) - min(bleedColor * bleedColor * bleedColor * 3.0, float3(0.7, 0.7, 0.7))));
+		
+		// Specular occlusion
+		float NdotV = dot( -normalize( position ), surfNormal );
+		float ao = saturate( 1 - occlusionData.a * SSDOParams.z );
+		float occlSpec = DeriveSpecularOcclusion( NdotV, max(ao * ao, 0.3), surfGloss );
+		specularAcc *= occlSpec;
+	}
+		
+	// ==============================================================================================
+	// Ambient lights
+	// ==============================================================================================
+	{
+		while (curLight < sTileLightCount)
+		{
+			int lightType = TiledLightsShadeInfo[lightIndex].lightType;
+			if (lightType > LIGHT_TYPE_AMBIENT_AREA)
+				break;
+
+			const float clipVolumeBlendWeight = CalcClipVolumeBlendWeight(clipVolumeStencilID, clipVolumeData, clipVolumeBlendFactor, TiledLightsShadeInfo[lightIndex].stencilID);
+			bool skipShading = clipVolumeBlendWeight == 0.0;
+		
+			[branch] if (!skipShading)
+			{
+				float3 lightVec = TiledLightsShadeInfo[lightIndex].posRad.xyz - (position + GetWorldViewPos());
+				float  lightAtt = TiledLightsShadeInfo[lightIndex].posRad.w;
+			
+				float filter = 1;
+				float attenuation;
+				float clipping = GetLightClippingWH(TiledLightsShadeInfo[lightIndex], length( lightVec )) * clipVolumeBlendWeight;
+				float NdotL;
+				float PdotL = 1;
+			
+				[branch] if (lightType == LIGHT_TYPE_AMBIENT_AREA)
+				{
+					lightVec = ComputeNearestLightOnRectangle(lightVec, TiledLightsShadeInfo[lightIndex].projectorMatrix);
+
+					attenuation = GetAttenuation( lightVec, rcp(lightAtt) );
+				
+					lightVec = normalize( lightVec );
+					PdotL = dot( -lightVec, TiledLightsShadeInfo[lightIndex].projectorMatrix[0].xyz );
+
+					attenuation *= GetSpotAttenuation(PdotL, TiledLightsShadeInfo[lightIndex].projectorMatrix[3].w, lightAtt); // spot falloff for area light
+					attenuation *= attenuation;
+				
+					NdotL = saturate( dot( surfNormal, lightVec ) ) * saturate( PdotL );
+				}
+				else
+				{
+					[branch] if (TiledLightsShadeInfo[lightIndex].attenuationParams.x > 0)
+						attenuation = GetPhysicalBulbLightAttenuationWH(TiledLightsShadeInfo[lightIndex], length( lightVec ));
+					else
+						attenuation = GetAttenuation( lightVec, rcp(lightAtt) );
+				
+					lightVec = normalize( lightVec );
+					NdotL = saturate( dot( surfNormal, lightVec ) );
+				
+					if (lightType == LIGHT_TYPE_AMBIENT_PROJECTOR)
+					{
+						filter = 0;
+						[branch] if (attenuation > 0)
+						{
+							float4 vProjTC = mul( TiledLightsShadeInfo[lightIndex].projectorMatrix, float4( position + GetWorldViewPos(), 1 ) );
+							vProjTC.xy /= vProjTC.w;
+						
+							if (vProjTC.w > 0 && max( abs(vProjTC.x * 2 - 1), abs(vProjTC.y * 2 - 1) ) < 1)  // Avoid back-projection
+							{
+								uint4 resIndexClamps = GetResourceIndexAndMipClamps(TiledLightsShadeInfo[lightIndex].resIndex);
+								filter = SpotTexArray.SampleLevel( SampStateTrilinearClamp, float3( vProjTC.xy, resIndexClamps.x ), resIndexClamps.y ).x;
+							}
+						}
+					}
+					else
+					{
+						attenuation *= attenuation;
+					}
+				}
+			
+				float3 lightColor = TiledLightsShadeInfo[lightIndex].color.rgb;
+
+				// Darkening ambient lights don't use any directionality
+				float lightOccl = 0.3 + 0.7 * (1.0 - saturate( dot( lightVec, occlusionData.xyz ) * SSDOParams.x ));
+				float3 dirFactor = lightColor > 1 ? float3( NdotL, NdotL, NdotL ) * lightOccl : saturate( float3( PdotL, PdotL, PdotL ) );
+			
+				float3 lightTerm = lerp( float3( 1, 1, 1 ), lightColor, attenuation * clipping * filter * dirFactor );
+				diffuseAcc *= lightTerm;
+				specularAcc *= lightTerm;
+			}
+		
+			++curLight;
+			lightIndex = sTileLightIndices[min( curLight, (int)TILED_SHADING_MAX_NUM_LIGHTS - 1 )];
+		}
+	}
+	
+	// ==============================================================================================
+	// SSR, Fresnel and Caustics
+	// ==============================================================================================
+	{
+		// WH[TBa]: shuffle the code so we can apply a different BRDF to SSR, KCD2-113243
+
+		// Apply Fresnel
+		float2 envBRDF = EnvBRDF.SampleLevel( SampStateTrilinearClamp, float2( dot( -normalize( position ), surfNormal ), surfGloss ), 0 ).xy;
+		float3 envFresnel = lerp( envBRDF.xxx, envBRDF.yyy, surfSpecCol );
+		specularAcc *= envFresnel;
+
+		// Apply Screenspace Reflections (1/2 resolution)
+#if %_RT_SAMPLE3
+		float4 ssRefl =  SSReflectionRT.SampleLevel( SampStateTrilinearClamp, pixelUV, 0 );
+		// WH[TBa]: compensation for to bright SS reflections after merge of CL 876499, KCD2-113243
+		// This is technically a form of empiric modification of the BRDF.
+		ssRefl.xyz *= saturate(SSRParamsWH.x * pow(envFresnel, SSRParamsWH.y));
+		specularAcc = lerp( specularAcc, ssRefl.xyz, ssRefl.w );
+#endif
+
+		// Apply water caustics (full resolution)
+		float3 caustics = CausticsRT[pixelCoord];
+		diffuseAcc += caustics;
+	}
+		
+	// ==============================================================================================
+	// Regular lights
+	// ==============================================================================================
+	{
+		while (curLight < sTileLightCount)
+		{
+			int    lightType = TiledLightsShadeInfo[lightIndex].lightType;
+			float3 lightVec  = TiledLightsShadeInfo[lightIndex].posRad.xyz - (position + GetWorldViewPos());
+			float  lightAtt  = TiledLightsShadeInfo[lightIndex].posRad.w;
+
+			float attenuation;
+			float clipping;
+			float PdotL = 1;
+		
+			[branch] if (lightType == LIGHT_TYPE_SUN)
+			{
+				lightVec = SunDir.xyz;
+				clipping = (TiledClipVolumeInfo[clipVolumeStencilID].data & CLIPVOLUME_AFFECTED_BY_SUN) ? 1.0 : 0.0;
+				attenuation = 1;
+			}
+			else
+			{
+				const float clipVolumeBlendWeight = CalcClipVolumeBlendWeight(clipVolumeStencilID, clipVolumeData, clipVolumeBlendFactor, TiledLightsShadeInfo[lightIndex].stencilID);
+				clipping = GetLightClippingWH(TiledLightsShadeInfo[lightIndex], length( lightVec )) * clipVolumeBlendWeight;
+
+#if %_RT_AREA_LIGHT
+				if (lightType == LIGHT_TYPE_REGULAR_AREA || lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+				{
+					attenuation = 1; // WH[TBa]: attenuation handled inside the LTC model
+				}
+				else
+#endif
+				{
+					attenuation = GetPhysicalBulbLightAttenuationWH(TiledLightsShadeInfo[lightIndex], length( lightVec ));
+				}
+
+				lightVec = normalize( lightVec );
+			}
+		
+			float NdotL = saturate( dot( surfNormal, lightVec ) ) * saturate( PdotL );
+
+#if %_RT_AREA_LIGHT
+			[branch] if (clipping > 0 && (NdotL > 0 || surfIsTranslucent || lightType == LIGHT_TYPE_REGULAR_AREA || lightType == LIGHT_TYPE_REGULAR_AREAFACE)) 
+#else
+      [branch] if (clipping > 0 && (NdotL > 0 || surfIsTranslucent)) 
+#endif
+			{
+				float lightTerm = 1;
+				bool shadowMap = TiledLightsShadeInfo[lightIndex].shadowParams.x > 0;
+				bool skipShading = false;
+				float shadowMapWeight = TiledLightsShadeInfo[lightIndex].shadowStrength; // WH[TBa]: KCD2-411675
+
+				uint shadowMaskIndex = 0;
+				uint shadowCubeSide = 0;
+				GetShadowMaskIndexAndCubeSide(TiledLightsShadeInfo[lightIndex].shadowMaskIndex, shadowMaskIndex, shadowCubeSide);
+
+				uint4 resIndexClamps = GetResourceIndexAndMipClamps(TiledLightsShadeInfo[lightIndex].resIndex);
+			
+				[branch] if (lightType != LIGHT_TYPE_SUN)
+				{
+					[branch] if (lightType == LIGHT_TYPE_REGULAR_PROJECTOR)
+					{
+						// WH[Woody,TBa]: do not sample shadow map outside the frustum
+						float4 vProjTC = mul(TiledLightsShadeInfo[lightIndex].projectorMatrix, float4(position + GetWorldViewPos(), 1));
+						vProjTC.xy /= vProjTC.w;
+
+						[branch] if (vProjTC.w < 0 || max( abs(vProjTC.x * 2 - 1), abs(vProjTC.y * 2 - 1) ) > 1)  // Avoid back-projection
+							skipShading = true;
+						else
+						{
+							lightTerm = SpotTexArray.SampleLevel( SampStateTrilinearClamp, float3( vProjTC.xy, resIndexClamps.x ), resIndexClamps.y ).r;
+						}
+					}
+#if %_RT_AREA_LIGHT
+					else if (lightType == LIGHT_TYPE_REGULAR_POINTFACE || lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+					{
+						skipShading = (shadowCubeSide != selectCubeFace(lightVec));
+					}
+					else if (lightType == LIGHT_TYPE_REGULAR_AREA)
+					{
+						// WH[TBa]: avoid reading shadowmaps (or shadowmasks) outside of the frustum, KCD2-409251
+						const float4 shadowCoords = mul(TiledLightsShadeInfo[lightIndex].shadowMatrix, float4(position + GetWorldViewPos(), 1));
+						if (shadowCoords.z <= 0)
+						{
+							shadowMap = false;
+						}
+					}
+#else
+					else if (lightType == LIGHT_TYPE_REGULAR_POINTFACE)
+					{
+						skipShading = (shadowCubeSide != selectCubeFace(lightVec));
+					}
+#endif
+					else if (lightType == TILEDLIGHT_TYPE_REGULAR_POINT_WITH_SPOT_SHADOW)
+					{
+						// WH[TomK]: Multiple spot shadows - don't apply light outside of masked sides.
+						float4 vSpotProj = mul(TiledLightsShadeInfo[lightIndex].projectorMatrix, float4(position + GetWorldViewPos(), 1));
+						uint cubeFace = selectCubeFace(vSpotProj.xyz);
+
+						uint lightSideMask;
+						uint shadeSideMask;
+						GetSpotShadowLightShadeMaskWH(TiledLightsShadeInfo[lightIndex].spotShadowLightShadeMask, lightSideMask, shadeSideMask);
+
+						skipShading = (lightSideMask & (1u << cubeFace)) == 0;
+						shadowMap &= cubeFace == 5; // Apply shadow only on front face.
+
+						// Smooth shadows
+						float sideSmoothing = step(float((1u << GetShadowSideMaskWH(vSpotProj.xy)) & shadeSideMask), 0.5);
+						const float maxDistFromFrustum = max(abs(vSpotProj.x / vSpotProj.w), abs(vSpotProj.y / vSpotProj.w));
+						shadowMapWeight *= (1.f - sideSmoothing * smoothstep(0.9f, 1.f, maxDistFromFrustum)); // smooth transition outside frustum with shadow map
+					}
+				}
+			
+				[branch] if (!skipShading)
+				{
+					float4 lightColor = TiledLightsShadeInfo[lightIndex].color;
+					float shadowTerm = 1.0;
+				
+					[branch] if (shadowMap)
+					{
+						int3 sampleCoords = int3(pixelCoord, shadowMaskIndex);
+						shadowTerm = 1 - ShadowMaskRT[sampleCoords].r * shadowMapWeight;
+					}
+					else if (TiledLightsShadeInfo[lightIndex].flagsWH & LIGHT_FLAG_SS_SHADOWS_FALLBACK_MASK_WH)
+					{
+						float3 posWorld = position + GetWorldViewPos();
+						CalculateDetailSSShadow(DepthRT, linearZ, posWorld, posWorld + lightVec, CV_ViewProjMatr, shadowTerm);
+					}
+				
+					[branch] if (shadowTerm > 0)
+					{
+						float lightOccl = 1.0 - saturate( dot( lightVec, occlusionData.xyz ) * SSDOParams.x );
+						lightOccl *= lightOccl;
+						lightTerm *= attenuation * clipping * shadowTerm * lightOccl;
+
+						float3 diffuseTerm = 0;
+						float3 specTerm = 0;
+						float3 diffuseTranslucency = 0;
+
+#if %_RT_AREA_LIGHT
+						if (lightType == LIGHT_TYPE_REGULAR_AREA || lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+						{
+							float3 lightPos = TiledLightsShadeInfo[lightIndex].posRad.xyz - GetWorldViewPos();
+							// WH[TBa]: pass directly areaAttribs, add thick wall params, KCD2-73606
+							AreaLightShadingAttribs areaAttribs;
+							areaAttribs.position = position;
+							areaAttribs.lightPos = lightPos;
+							areaAttribs.lightArrayIdx = resIndexClamps.x;
+							areaAttribs.transform = TiledLightsShadeInfo[lightIndex].projectorMatrix;
+							areaAttribs.wallThickness = TiledLightsShadeInfo[lightIndex].areaLightWallThickness;
+							areaAttribs.wallChamfer = TiledLightsShadeInfo[lightIndex].areaLightWallChamfer;
+							areaAttribs.windowMargin = TiledLightsShadeInfo[lightIndex].areaLightWindowMargin;
+							AreaLightLTC_GGX( surfNormal, -normalize( position ), surfGloss, surfSpecCol, areaAttribs, SpotTexArray, diffuseTerm, specTerm );
+
+							diffuseAcc += ( lightTerm * lightColor.rgb ) * diffuseTerm;
+							specularAcc += ( lightTerm * lightColor.rgb ) * lightColor.a * specTerm;
+						}
+						else
+#endif
+						{
+#if MACROMAP_BAKING						
+							diffuseTerm = 1;
+#else
+							diffuseTerm = DiffuseBRDF( surfNormal, -normalize( position ), lightVec, surfGloss, NdotL );
+#endif							
+							// WH[TBa]: approximate The Sun using closest point on a disc, KCD2-128852
+							if (lightType == LIGHT_TYPE_SUN)
+							{
+								const float3 discLightVec = ComputeNearestLightOnSunWH(surfNormal, -normalize(position), lightVec);
+								specTerm = SpecularBRDF( surfNormal, -normalize( position ), discLightVec, surfGloss, surfSpecCol );
+							}
+							else
+							{
+								specTerm = SpecularBRDF( surfNormal, -normalize( position ), lightVec, surfGloss, surfSpecCol );
+							}
+
+							diffuseTranslucency = ThinTranslucencyBRDF( surfNormal, lightVec, surfTransmittanceColor );
+
+							diffuseAcc += ( lightTerm * lightColor.rgb ) * ( surfIsTranslucent ? diffuseTranslucency : diffuseTerm.xxx );
+							specularAcc += ( lightTerm * lightColor.rgb ) * lightColor.a * specTerm * NdotL;
+						}
+					}
+				}
+			}		
+			++curLight;
+			lightIndex = sTileLightIndices[min( curLight, (int)TILED_SHADING_MAX_NUM_LIGHTS - 1 )];
+		}
+	}
+
+	// ==============================================================================================
+	// WH[Woody]: Apply three point lighting
+	// ==============================================================================================
+	[branch] if (attribs.ThreePointLighting)
+	{
+		float attenuation = 1.f - smoothstep(
+			ThreePointLightingData[0].falloffBegin,
+			ThreePointLightingData[0].falloffEnd,
+			linearZ);
+
+		// fade-out the effect towards bottom of the screen with quadratic slope to simulate light attenuation
+		const float gradientLerp = 1.f - dot(pixelUV, ThreePointLightingData[0].gradientDirection);
+		attenuation *= lerp(ThreePointLightingData[0].gradientEnd, 1.f, gradientLerp * gradientLerp);
+
+		const float2 attenAndIlluminance = GetAvgLumAttenuation();
+		const float avgLumAtten = attenAndIlluminance.x;
+
+		// calc ratio between average illuminance (of the last frame) and current pixel illuminance
+		const float relativeIlluminanceTerm = Calc3PLRelativeIlluminanceTerm(diffuseAcc, attenAndIlluminance.y);
+
+		float3x3 mat;
+		mat[2] = float3(0, 0, 1); // up
+		mat[0] = normalize(cross(-CV_CameraFrontVector.xyz, mat[2])); // right
+		mat[1] = cross(mat[2], mat[0]); // front
+
+		[unroll]
+		for (uint i = 0; i < MAX_3PL_LIGHTS; ++i)
+		{
+			S3PLLight light = ThreePointLightingData[0].lights[i];
+
+			float3 lightVecWorld = light.dir.xyz;
+			float3 lightVec = normalize(mul(lightVecWorld, mat));
+
+			float ssdo = light.dir.w > 1.f;
+			float ssShadows = light.dir.w > 2.f;
+			float NdotL = saturate(dot(surfNormal, lightVec));
+
+			float shadowTerm = 1.f;
+			[branch] if (ssdo)
+			{
+				float lightOccl = 1.f - saturate( dot( lightVec, occlusionData.xyz ) * SSDOParams.x );
+				shadowTerm *= lightOccl * lightOccl;
+			}
+
+			[branch] if (ssShadows)
+			{
+				float3 posWorld = position + GetWorldViewPos();
+				CalculateDetailSSShadow(DepthRT, linearZ, posWorld, posWorld + lightVec, CV_ViewProjMatr, shadowTerm);
+			}
+
+			float lightTerm = attenuation * shadowTerm * avgLumAtten * relativeIlluminanceTerm;
+
+			// diffuse and specular acc copy-pasted from the regular light code above
+			float diffuseTerm = DiffuseBRDF(surfNormal, -normalize(position), lightVec, surfGloss, NdotL);
+			float3 diffuseTranslucency = ThinTranslucencyBRDF(surfNormal, lightVec, surfTransmittanceColor);
+			diffuseAcc += lightTerm * light.color.rgb * (surfIsTranslucent ? diffuseTranslucency : diffuseTerm.xxx);
+
+			float3 specTerm = SpecularBRDF(surfNormal, -normalize(position), lightVec, surfGloss, surfSpecCol);
+			specularAcc += lightTerm * light.color.a * specTerm * NdotL * light.color.rgb;
+		}
+	}
+
+	// ==============================================================================================
+	// Subsurface Scattering and final composition
+	// ==============================================================================================
+	{
+		// Apply albedo - WH[Woody]: Use already decoded infor from attribs, where we made some changes
+		float scatteringIndex = attribs.ScatteringIndex;
+		float3 surfAlbedo = attribs.Albedo;
+		surfAlbedo *= saturate( 1 - GetLuminance( surfSpecCol ) );  // Simple energy conservation between specular and diffuse
+	
+		float3 finalCol = diffuseAcc * surfAlbedo + specularAcc;
+	
+		// Subsurface Scattering
+#if %_RT_SAMPLE4	
+		[branch] if (scatteringIndex > 0)
+		{
+			finalCol = specularAcc;
+			diffuseAcc *= floor( scatteringIndex ) != SSS_PROFILE_SKIN ? sqrt( surfAlbedo ) : 1;
+		}
+		else
+		{
+			diffuseAcc = 0;
+		}
+	
+		DiffuseAccUAV[pixelCoord] = float3( diffuseAcc );
+#endif
+
+		HDRSceneTargetUAV[pixelCoord] = float3( finalCol );
+	}
+#endif
+}
+
+
+technique TiledDeferredShading
+{
+  pass p0
+  {
+    ComputeShader = TiledDeferredShadingCS() TiledShadingCS;
+  }
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+RWBuffer<uint> VolumeOpaqueLightMaskUAV : register(u0);
+RWBuffer<uint> VolumeTranspLightMaskUAV : register(u1);
+Buffer<float4> VolumeVertexData         : register(t0);
+StructuredBuffer<STiledLightVolumeInfo>   TiledLightsVolumeInfo : register(t1);
+
+cbuffer CBVolumeLightListGen : register(b0)
+{
+	struct
+	{
+		float4x4 matViewProj;
+		uint     lightIndexOffset;
+		uint     numVertices;
+		uint     padding0; // WH[TBa]: add explicit padding
+		uint     padding1;
+		float4   screenScale;
+		float4   viewerPos;
+		float4   worldBasisX;
+		float4   worldBasisY;
+		float4   worldBasisZ;
+	} cbVolumeLightListGen;
+};
+
+struct vtxOutVolumeLightListGen
+{
+	float4                WPos        : SV_POSITION;
+	nointerpolation uint  lightIndex  : TEXCOORD0;
+};
+
+vtxOutVolumeLightListGen VolumeLightListGenVS(uint VertexID : SV_VertexID)
+{
+	vtxOutVolumeLightListGen OUT = (vtxOutVolumeLightListGen)0; 
+	
+	const uint numVertices = cbVolumeLightListGen.numVertices;
+	const uint vertexIndex = VertexID % numVertices;
+	const uint lightIndex = VertexID / numVertices + cbVolumeLightListGen.lightIndexOffset;
+	
+	float4 pos = VolumeVertexData[vertexIndex];
+	pos = mul(pos, TiledLightsVolumeInfo[lightIndex].worldMat);
+	pos = mul(pos, cbVolumeLightListGen.matViewProj);
+	
+	OUT.WPos = pos;
+	OUT.lightIndex = lightIndex;
+
+	return OUT;
+}
+
+// WH[DH]: Use the correct early-z flag based on the platform
+CRY_EARLY_DEPTH
+void VolumeLightListGenPS(vtxOutVolumeLightListGen IN, bool bIsFrontFace : SV_IsFrontFace)
+{
+	const uint lightIndex = IN.lightIndex;
+	const uint2 pixelPos = IN.WPos.xy;
+	
+	float2 depthMaxMin = DepthTex.Load(int3(pixelPos.xy, 0)).xy;
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	float3 positionMax = CalcHomogeneousPos(1, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+	float3 positionMin = CalcHomogeneousPos(0, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+		
+	STiledLightVolumeInfo volume = TiledLightsVolumeInfo[lightIndex];
+	uint volumeType = volume.volumeTypeInfo.x;
+	uint lightId = volume.volumeTypeInfo.w;
+	
+	uint2 numTiles = (uint2)cbVolumeLightListGen.screenScale.xy;
+	uint tileIdx = pixelPos.y * numTiles.x + pixelPos.x;
+	uint bufferBaseIdx = tileIdx * TILED_SHADING_BITMASK_COUNT;
+	
+	bool bInVolume = (volumeType == TILEDLIGHT_VOLUME_SUN) ? true : false;
+	bool bInTranspVolume = bInVolume;
+	
+	if (volumeType == TILEDLIGHT_VOLUME_OBB)
+	{
+		// Transform into OBB space
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		float3 volumePos = float3(volume.volumeParams0.w, volume.volumeParams1.w, volume.volumeParams2.w) - cbVolumeLightListGen.viewerPos.xyz;
+		float3 posMinLS = mul(float3x3(volume.volumeParams0.xyz, volume.volumeParams1.xyz, volume.volumeParams2.xyz), volumePos - positionMin.xyz);
+		float3 posMaxLS = mul(float3x3(volume.volumeParams0.xyz, volume.volumeParams1.xyz, volume.volumeParams2.xyz), volumePos - positionMax.xyz);
+		
+		float3 rayOrig = posMinLS;
+		float3 rayDir = normalize(posMaxLS - posMinLS);
+			
+		// Intersect ray with AABB
+		float3 rcpDir = rcp(rayDir);
+		float3 tneg = (-volume.volumeParams3.xyz - rayOrig) * rcpDir;
+		float3 tpos = ( volume.volumeParams3.xyz - rayOrig) * rcpDir;
+		float3 tmin = min(tneg, tpos);
+		float3 tmax = max(tneg, tpos);
+		float t0 = max(max(tmin.x, tmin.y), tmin.z);
+		float t1 = min(min(tmax.x, tmax.y), tmax.z);
+		if (t0 <= t1)
+		{
+			// WH[TBa]: implicit truncation of vector type, KCD2-448804
+			positionMin = CalcHomogeneousPos(depthMaxMin.y, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+			positionMax = CalcHomogeneousPos(depthMaxMin.x, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+			posMinLS = mul(float3x3(volume.volumeParams0.xyz, volume.volumeParams1.xyz, volume.volumeParams2.xyz), volumePos - positionMin.xyz);
+			posMaxLS = mul(float3x3(volume.volumeParams0.xyz, volume.volumeParams1.xyz, volume.volumeParams2.xyz), volumePos - positionMax.xyz);
+			
+			if (t0 <= length(posMaxLS - rayOrig))
+			{
+				bInTranspVolume = true;
+				if (t1 >= length(posMinLS - rayOrig))
+					bInVolume = true;
+			}
+		}
+	}
+	else if (volumeType == TILEDLIGHT_VOLUME_CONE)
+	{
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		positionMin = CalcHomogeneousPos(depthMaxMin.y, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+		positionMax = CalcHomogeneousPos(depthMaxMin.x, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+		
+		float3 forwardVec = volume.volumeParams1.xyz;
+		float3 upVector = abs(forwardVec.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+		float3 tangentX = normalize(cross(upVector, forwardVec));
+		float3 tangentY = cross(forwardVec, tangentX);
+		
+		// Compute projector frustum's left, right, top and bottom planes
+		float cosFOV = volume.volumeTypeInfo.z;
+		float sinFOV = volume.volumeTypeInfo.y;
+		float3 N0 =  tangentX * cosFOV - forwardVec * sinFOV;
+		float3 N1 = -tangentX * cosFOV - forwardVec * sinFOV;
+		float3 N2 =  tangentY * cosFOV - forwardVec * sinFOV;
+		float3 N3 = -tangentY * cosFOV - forwardVec * sinFOV;
+		
+		// Check near plane
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		const float3 P0 = volume.volumeParams0.xyz - cbVolumeLightListGen.viewerPos.xyz;
+		bInVolume = dot(-volume.volumeParams1.xyz, positionMin - P0) >= 0 || dot(-volume.volumeParams1.xyz, positionMax - P0) >= 0;
+		
+		// Check if min and max position are both on same side of planes
+		if (dot(N0, positionMin - P0) < 0 && dot(N0, positionMax - P0) < 0) bInVolume = false;
+		if (dot(N1, positionMin - P0) < 0 && dot(N1, positionMax - P0) < 0) bInVolume = false;
+		if (dot(N2, positionMin - P0) < 0 && dot(N2, positionMax - P0) < 0) bInVolume = false;
+		if (dot(N3, positionMin - P0) < 0 && dot(N3, positionMax - P0) < 0) bInVolume = false;
+		
+		// Far plane
+		float3 P1 = P0 - volume.volumeParams1.xyz * volume.volumeParams0.w;
+		if (dot(volume.volumeParams1.xyz, positionMin - P1) < 0 && dot(volume.volumeParams1.xyz, positionMax - P1) < 0) bInVolume = false;
+		
+		// TODO: Implement culling for transparent case - this is very inefficient now
+		bInTranspVolume = true;
+	}
+	else if (volumeType == TILEDLIGHT_VOLUME_SPHERE)
+	{
+		float3 rayOrig = positionMin;
+		float3 rayDir = normalize(positionMax - positionMin);
+		
+		// Intersect ray with sphere
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		float3 volumePos = volume.volumeParams0.xyz - cbVolumeLightListGen.viewerPos.xyz;
+		float3 v = volumePos - rayOrig;
+		float b = dot(v, rayDir);
+		float radius2 = volume.volumeParams0.w * volume.volumeParams0.w;
+		float d2 = radius2 - (dot(v, v) - b * b);
+		if (d2 >= 0)
+		{
+			float t0 = b - sqrt(d2);
+			float t1 = b + sqrt(d2);
+
+			// WH[TBa]: implicit truncation of vector type, KCD2-448804
+			positionMin = CalcHomogeneousPos(depthMaxMin.y, pixelPos.xy, cbVolumeLightListGen.worldBasisX, cbVolumeLightListGen.worldBasisY, cbVolumeLightListGen.worldBasisZ).xyz;
+			
+			bInTranspVolume = true;
+			if (t1 >= length(positionMin - rayOrig))
+				bInVolume = true;
+		}
+	}
+	// WH[TBa]: ambiguous type for bit shift; use a type suffix on literal values, like 'L' or 'U', or a cast
+	uint maskIndex = lightId / 32;
+	[branch] if (bInTranspVolume)
+		InterlockedOr(VolumeTranspLightMaskUAV[bufferBaseIdx + maskIndex], 1u << (lightId & 31));
+	[branch] if (bInVolume)
+		InterlockedOr(VolumeOpaqueLightMaskUAV[bufferBaseIdx + maskIndex], 1u << (lightId & 31));
+}
+
+technique VolumeLightListGen
+{
+  pass p0
+  {
+    VertexShader = VolumeLightListGenVS();
+    PixelShader  = VolumeLightListGenPS() VolumeLightListGenPS; 
+  }
+}
+
+#endif

@@ -1,0 +1,106 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6900
+
+#if DECAL_ATLAS
+
+//==============================================================================
+Texture2DArray<float4> DecalAtlasDiffuseTex    : register(t66) = TS_DecalAtlasDiffuse;
+Texture2DArray<float4> DecalAtlasNormalTex     : register(t67) = TS_DecalAtlasNormal;
+Texture2DArray<float4> DecalAtlasSmoothnessTex : register(t68) = TS_DecalAtlasSmoothness;
+Texture2DArray<float4> DecalAtlasSpecularTex   : register(t69) = TS_DecalAtlasSpecular;
+
+//==============================================================================
+half3 DecalAtlasIndexToColor(int decalIndex)
+{
+	half3 decalColor;
+	decalColor.r = decalIndex % 2;
+	decalColor.g = (decalIndex / 2) % 2;
+	decalColor.b = (decalIndex / 4) % 2;
+	return decalColor;
+}
+
+//==============================================================================
+void ComputeDecalAtlasUVs(inout float2 decalUV, inout int decalIndex, float2 baseTC)
+{
+	const float3 baseUV = float3(baseTC, 1.f);
+
+	for (decalIndex = 0; decalIndex < DECAL_ATLAS_SIZE; ++decalIndex)
+	{
+		decalUV.x = dot(baseUV, UVDecalBuffer[decalIndex].uvTransformRow0);
+		decalUV.y = dot(baseUV, UVDecalBuffer[decalIndex].uvTransformRow1);
+
+		if ((CD_UVDecalMaskWH & 1u<<decalIndex) && decalUV.x > 0 && decalUV.x < 1 && decalUV.y > 0 && decalUV.y < 1)
+		{
+			break;
+		}
+	}
+}
+
+//==============================================================================
+void GetDecalAtlasTC(inout float3 decalTC, inout half decalMask, inout int decalIndex, float2 baseTC, int macroIndex)
+{
+	float2 decalUV;
+	ComputeDecalAtlasUVs(decalUV, decalIndex, baseTC.xy);
+
+	if (decalIndex < DECAL_ATLAS_SIZE)
+	{
+		decalMask =
+			decalUV.x > 0 && decalUV.x < 1 &&
+			decalUV.y > 0 && decalUV.y < 1 &&
+			macroIndex == MACRO_ATLAS_SIZE; // apply decal only on base macro texture
+
+		decalTC = float3(decalUV, UVDecalBuffer[decalIndex].textureId);
+	}
+	else
+	{
+		decalMask = 0;
+		decalTC = float3(0, 0, 0);
+	}
+}
+
+//==============================================================================
+void ApplyDecalAtlasNormal(inout half3 vNormalTS, float3 decalTC, half decalMask, int decalIndex)
+{
+	if (decalIndex < DECAL_ATLAS_SIZE)
+	{
+		half3 decalNormal = GetNormalMapAtlas(DecalAtlasNormalTex, decalTC);
+
+		half2 decalNormalFixed;
+		decalNormalFixed.x = dot(decalNormal.xy, UVDecalBuffer[decalIndex].normalsFixRow0);
+		decalNormalFixed.y = dot(decalNormal.xy, UVDecalBuffer[decalIndex].normalsFixRow1);
+
+		vNormalTS.xy += decalNormalFixed * decalMask;
+	}
+}
+
+//==============================================================================
+void ApplyDecalAtlasSmoothness(inout half fSmoothness, float3 decalTC, half decalMask)
+{
+	half decalSmoothness = DecalAtlasSmoothnessTex.Sample(ssMaterialTrilinearClamp, decalTC).r;
+	fSmoothness = fSmoothness + fSmoothness * (decalSmoothness * 2.0h - 1.0h) * decalMask;
+}
+
+//==============================================================================
+void ApplyDecalAtlasAlbedo(inout half3 cAlbedo, inout half decalAlpha, float3 decalTC, half decalMask)
+{
+	half4 decalAlbedo = DecalAtlasDiffuseTex.Sample(ssMaterialTrilinearClamp, decalTC);
+#if !MATERIAL_ATLAS
+	decalAlbedo.rgb = pow(decalAlbedo.rgb, 2.2); //WH GM TODO: remove gamma properly during sampling
+#endif
+	decalAlpha = decalAlbedo.a * decalMask;
+	cAlbedo = lerp(cAlbedo, decalAlbedo.rgb, decalAlpha);
+}
+
+//==============================================================================
+void ApplyDecalAtlasReflectance(inout half3 cReflectance, float3 decalTC, half decalAlpha)
+{
+	half3 decalReflectance = DecalAtlasSpecularTex.Sample(ssMaterialTrilinearClamp, decalTC).rgb;
+#if !MATERIAL_ATLAS
+	decalReflectance = pow(decalReflectance, 2.2); //WH GM TODO: remove gamma properly during sampling
+#endif
+	cReflectance = lerp(cReflectance, decalReflectance, decalAlpha);
+}
+
+#endif //DECAL_ATLAS

@@ -1,0 +1,406 @@
+struct SsrTraceParams
+{
+	float2 pixelCoordinates;
+
+	float  maxDistance;
+	float  maxSamples;
+	
+	float3 viewVec;
+	float  linearDepth;
+	
+	float3 positionWS;
+	float  maxLum;
+	
+	float3 normalWorld;
+	float  smoothness;
+	
+	float2 borderSize;
+	bool usingMirrorXSampler;
+
+	float4x4 reprojectToPrev;
+	// WH[TBa]: removed viewID, added background reflection mult, KCD2-113243
+	float backgroundReflectionMultiplierWH;
+	float noiseAnimationOffset;
+};
+
+struct SsrTraceResult
+{
+	float4 color;
+	float hitDepth;
+};
+
+float2 GetMinBorderDistance(SsrTraceParams params, in float2 reflPos)
+{
+	reflPos = saturate(reflPos);
+
+	float2 borderDist = 1.0;
+
+	// right
+	if (!params.usingMirrorXSampler)
+		borderDist.x = min(borderDist.x, abs(1.0 - reflPos.x));
+	
+	// left
+	if (!params.usingMirrorXSampler)
+		borderDist.x = min(borderDist.x, abs(0.0 - reflPos.x));
+
+	// top
+	borderDist.y = min(borderDist.y, reflPos.y);
+
+	// bottom
+	borderDist.y = min(borderDist.y, abs(1.0 - reflPos.y));
+
+	return borderDist;
+}
+
+int ComputeMaxTracingSamples(SsrTraceParams params)
+{
+	const float smoothnessFactor = saturate(params.smoothness * params.smoothness);
+	return 4 + smoothnessFactor * params.maxSamples;
+}
+
+float ComputeNoise(SsrTraceParams params)
+{
+	// Interleaved gradient noise, see "Next Generation Post Processing in Call of Duty: Advanced Warfare", Jimenez 2014.
+	// Animation offset is precomputed on CPU according to https://blog.demofox.org/2022/01/01/interleaved-gradient-noise-a-different-kind-of-low-discrepancy-sequence/
+	const float x = params.pixelCoordinates.x + params.noiseAnimationOffset;
+	const float y = params.pixelCoordinates.y + params.noiseAnimationOffset;
+	return frac(52.9829189 * frac(0.06711056 * x + 0.00583715 * y));
+}
+
+float SampleReflectionDepth(float2 uv, SamplerState  SSRRay_Linear_Sampler)
+{
+	// Use gather to get as much info per sample as possible.
+	// Using min depth to avoid foreground leaking, as that is a common issue.
+	const float4 depthGather = SSRRay_LinDepthScMinMax.GatherGreen(SSRRay_Linear_Sampler, uv);
+	float linearDepthTap = min(depthGather.x, min(depthGather.y, min(depthGather.z, depthGather.w)));
+
+	return linearDepthTap;
+}
+
+// References:
+// [0] "Efficient GPU Screen-Space Ray Tracing", McGuire 2014
+// [1] "Perspective-Correct Interpolation", Low 2002
+// [2] "Taking Killzone Shadow Fall Image Quality Into The Next Generation", Valient 2014
+// [3] "The Rendering of Inside High Fidelity, Low Complexity", Gjol 2016
+//
+// We sample uniformly in screen space for consistent sample distribution as in [0] and [2].
+// This is important for quality as it ensures that no samples are wasted.
+// This necessates being careful when interpolating properties in screen space, e.g. depth does not interpolate linearly.
+// See [1] for details.
+SsrTraceResult SSRRaytrace
+(
+	Texture2D<float2> SSRRay_LinDepthScMinMax,
+
+	Texture2D     SSRRay_Norms,
+	Texture2D     SSRRay_Spec,
+	SamplerState  SSRRay_Linear_Sampler,
+
+	Texture2D     SSRRay_HDRTarg,
+	SamplerState  SSRRay_HDRT_Sampler,
+
+	SsrTraceParams params
+)
+{
+	// WS   - World Space
+	// Norm - Normalized
+	const float3 reflectionVectorWSNorm = normalize(reflect(params.viewVec, params.normalWorld));
+	const float directionalFade = saturate( dot( params.viewVec, reflectionVectorWSNorm) + 0.5);
+	if (directionalFade < 0.01)
+	{
+		return (SsrTraceResult)0;
+	}
+
+	const float reflectionLengthWS = params.maxDistance * CV_NearFarClipDist.y; // WH[TBa]: removed viewID
+	const float3 reflectionVectorWS = reflectionVectorWSNorm * reflectionLengthWS;
+	
+	// WH[TBa]: removed viewID
+	float4 rayStartProjected = mul(CV_ViewProjMatr, float4( params.positionWS,                      1));
+	float4 rayEndProjected   = mul(CV_ViewProjMatr, float4( params.positionWS + reflectionVectorWS, 1));
+
+	// Reflections that end up behind the near plane have a negative w component so the projection is flipped which messes up everything.
+	// Simply fade out before this happens. Could handle this properly, but doesn't matter since it only happens in edge cases when looking at the ground or similar anyways.
+	const float wFadeStart = 0.05 * CV_NearFarClipDist.y; // WH[TBa]: removed viewID
+	const float reflectionBehindCameraFade = saturate(rayEndProjected.w * rcp(wFadeStart));
+	if (reflectionBehindCameraFade <= 0)
+	{
+		return (SsrTraceResult)0;
+	}
+
+	// Perpsective division to convert to NDC (normalized device coordinates)
+	const float2 rayStartNDC = rayStartProjected.xy / max(G_EPSILON, rayStartProjected.w);
+	const float2 rayEndNDC   = rayEndProjected.xy   / max(G_EPSILON, rayEndProjected.w);
+
+	// Map from NDC [-1:1] to SS (screen space) [0:1].
+	const float2 rayStartSS = GetScaledScreenTC(rayStartNDC * float2(0.5, -0.5) + 0.5); // WH[TBa]: removed viewID
+	float2 rayEndSS         = GetScaledScreenTC(rayEndNDC   * float2(0.5, -0.5) + 0.5);
+
+	// Linear normalized depth [0:1]
+	const float rayStartDepth = params.linearDepth;
+	const float rayEndDepth   = g_PS_ProjRatio.y / (rayEndProjected.z / rayEndProjected.w - g_PS_ProjRatio.x); // WH[TBa]: removed viewID
+
+	const float rayEndDepthUnclipped = rayEndDepth;
+
+	// The reciprocal of depth interpolates linearly in screen space, see [1]
+	const float rayStartDepthRcp = rcp(rayStartDepth);
+	float rayEndDepthRcp         = rcp(rayEndDepth);
+
+	// We compute this as it simplifies some calculations
+	float reflectionLengthClippedOverDepth;
+
+	// Clip ray end to screen
+	{
+		float tClipped = 1;
+
+		if (rayEndSS.y < 0)
+		{
+			tClipped = min(tClipped, (-rayStartSS.y) / (rayEndSS.y - rayStartSS.y));
+		}
+		if (rayEndSS.y > 1)
+		{
+			tClipped = min(tClipped, (1 - rayStartSS.y) / (rayEndSS.y - rayStartSS.y));
+		}
+
+		// Only clip in X-direction if not already using mirror to hide seams
+		if (!params.usingMirrorXSampler)
+		{
+			if (rayEndSS.x < 0)
+			{
+				tClipped = min(tClipped, (-rayStartSS.x) / (rayEndSS.x - rayStartSS.x));
+			}
+			if (rayEndSS.x > 1)
+			{
+				tClipped = min(tClipped, (1 - rayStartSS.x) / (rayEndSS.x - rayStartSS.x));
+			}
+		}
+
+		const float rayEndDepthRcpUnclipped = rayEndDepthRcp;
+
+		rayEndSS       = lerp(rayStartSS,       rayEndSS,       tClipped);
+		rayEndDepthRcp = lerp(rayStartDepthRcp, rayEndDepthRcp, tClipped);
+
+		// Scaled to match normalized depth range as it is used for depth threshold
+		const float reflectionRayLength = reflectionLengthWS / CV_NearFarClipDist.y; // WH[TBa]: removed viewID
+
+		// Perspective correct interpolation, see equation (16) in [1].
+		// We omit the 1/(1/Z_t) = *Z_t at the end.
+		// We use this value as input for another interpolation, so we'd have to divide by Z_t anyways.
+		reflectionLengthClippedOverDepth = lerp(0, reflectionRayLength * rayEndDepthRcpUnclipped, tClipped);
+	}
+
+	const int numSamples = ComputeMaxTracingSamples(params);
+	const float noise = ComputeNoise(params);
+
+	float hitT = 1.0;
+	bool validHit = false;
+
+	// Find reflection ray intersection with depth buffer
+	{
+		// Ensure that last sample ends up exactly at 1 for seamless transition to background check
+		const float stepSize = rcp(numSamples - 1);
+
+		// Variables needed inside loop from previous iteration
+		float closeMissSum = 0;
+		float reflectionRayLengthPrevious = 0;
+
+		// Variables needed after loop exit for exact intersection calculation
+		float depthSample = 0;
+		float reflectionDepth = 0;
+		float previousReflectionDepth = 0;
+		float depthDistanceThreshold = 0;
+		float rayT = 0;
+
+		[loop]
+		for (int i = 0; i < numSamples; ++i)
+		{
+			// Applying the noise this way ensures that the noise scales with the step size.
+			// This effectively fills the gaps between samples which ensures that undersampling results in noise instead of sawtooth artifacts.
+			// Noise can be filtered out later (spatially and/or temporally).
+			// 
+			// Have to clamp due to adding noise and scaling with sampleCount - 1.
+			// Last two steps are not evenly spaced but that's fine.
+			rayT = saturate((i + noise) * stepSize);
+
+			const float2 raySS      = lerp(rayStartSS,       rayEndSS,       rayT);
+			const float rayDepthRcp = lerp(rayStartDepthRcp, rayEndDepthRcp, rayT);
+
+			depthSample = SampleReflectionDepth(raySS, SSRRay_Linear_Sampler);
+			reflectionDepth = rcp(rayDepthRcp);
+
+			const float depthDistance = depthSample - reflectionDepth;
+
+			// Perspective correct interpolation, see equation (16) in [1]
+			const float reflectionRayLength = lerp(0, reflectionLengthClippedOverDepth, rayT) / rayDepthRcp;
+
+			// Main heuristic from [3], pages 130-132.
+			// The initial idea is to choose threshold to fill up the gaps between samples.
+			// This works well but fails when the reflection ray does not moves in Z-direction.
+			// This may happen for example when hitting a 45 degree angle and moving sideways, perpendicular to the view direction.
+			// To avoid this issue we ignore the ray direction and only take the traversed length into account.
+			depthDistanceThreshold = abs(reflectionRayLength - reflectionRayLengthPrevious);
+
+			// Additional heuristic: successively increase threshold on near misses.
+			// When we narrowly miss a lot there is a decent chance we want to accept a hit.
+			depthDistanceThreshold += closeMissSum;
+
+			const bool crossedDepth = depthDistance < 0;
+			const bool inRange = abs(depthDistance) <= depthDistanceThreshold;
+
+			// Keep loop exit as small as possible to reduce unnecessary divergence.
+			// Exact hit point computation happens after loop.
+			if (crossedDepth && inRange)
+			{
+				hitT = rayT;
+				validHit = true;
+				break;
+			}
+
+			// Close miss threshold relative to computed threshold with empirically tweaked factor
+			const float closeMissThreshold = 3 * depthDistanceThreshold;
+			const bool isCloseMiss = crossedDepth && (abs(depthDistance) <= closeMissThreshold);
+			if (isCloseMiss)
+			{
+				// Add difference to threshold range to increase change of hitting next sample.
+				// Reduce threshold for this calculation by small fixed amount to work around issues with reflections of objects close to surface that slope towards camera.
+				const float thresholdBias = 0.5 / CV_NearFarClipDist.y; // WH[TBa]: removed viewID
+				closeMissSum += abs(abs(depthDistance) - max(0, depthDistanceThreshold - thresholdBias));
+			}
+			else
+			{
+				// We are either not behind the depth buffer or entirely out of range -> reset
+				closeMissSum = 0;
+			}
+
+			previousReflectionDepth = reflectionDepth;
+			reflectionRayLengthPrevious = reflectionRayLength;
+		}
+
+		// Compute exact hit point
+		{
+			// Interpolate exact hit point from previous/current reflection depths and sampled depth as in [2]
+			float depthPercent = abs(rcp(depthSample) - rcp(previousReflectionDepth)) / max(G_EPSILON, abs(rcp(reflectionDepth) - rcp(previousReflectionDepth)));
+			depthPercent = saturate(depthPercent);
+
+			const float previousT = rayT - stepSize;
+
+			hitT = lerp(previousT, rayT, depthPercent);
+
+			// Interpolation can cause foreground/background leaking.
+			// Double check depth at hit position and fall back to original interpolation if range test fails.
+			{
+				const float2 hitPosSS = lerp(rayStartSS, rayEndSS, hitT);
+				const float depthSample = SampleReflectionDepth(hitPosSS, SSRRay_Linear_Sampler);
+				const float depthDistance = abs(depthSample - reflectionDepth);
+
+				if (depthDistance >= depthDistanceThreshold)
+				{
+					hitT = rayT;
+				}
+			}
+		}
+	}
+
+	bool validBackgroundHit = false;
+
+	float2 hitPosSS = lerp(rayStartSS, rayEndSS, hitT);
+	float hitDepth;
+	if (validHit)
+	{
+		// Compute hit depth from interpolated ray intersection
+		hitDepth = rcp(lerp(rayStartDepthRcp, rayEndDepthRcp, hitT));
+	}
+	else
+	{
+		// Read background depth
+		float4 depthGather = SSRRay_LinDepthScMinMax.GatherGreen(SSRRay_Linear_Sampler, rayEndSS);
+		hitDepth = min(depthGather.x, min(depthGather.y, min(depthGather.z, depthGather.w)));
+
+		// Accept background hit if it is beyond our max trace distance.
+		// Use unclipped distance to avoid accepting everything as background when ray is clipped to viewport very early.
+		validBackgroundHit = hitDepth >= rayEndDepthUnclipped;
+
+		hitDepth = validBackgroundHit ? hitDepth : 1;
+	}
+
+	// WH[TBa]: find max depth so we can modulate background/sky intensity later
+	const float4 depthGatherMaxWH = SSRRay_LinDepthScMinMax.GatherRed(SSRRay_Linear_Sampler, rayEndSS);
+	const float hitDepthMaxWH = max(depthGatherMaxWH.x, max(depthGatherMaxWH.y, max(depthGatherMaxWH.z, depthGatherMaxWH.w)));
+	const bool conservativeBackgroundHit = hitDepthMaxWH >= rayEndDepthUnclipped;
+
+#if 0
+	// Debug-mode: red failed, green hit, blue background hit
+	{
+		SsrTraceResult result;
+		result.hitDepth = hitDepth;
+		if (validHit)
+		{
+			result.color = float4(0, 1, 0, 1);
+		}
+		else if (validBackgroundHit)
+		{
+			result.color = float4(0, 0, 1, 1);
+		}
+		else
+		{
+			result.color = float4(1, 0, 0, 1);
+		}
+		return result;
+	}
+#endif
+
+	// Reprojection
+	const float2 hitPosUnprojected = hitPosSS;
+	{
+		const float deviceDepth = g_PS_ProjRatio.y / hitDepth + g_PS_ProjRatio.x; // WH[TBa]: removed viewID
+
+		const float4 projectedHit = float4(hitPosSS, deviceDepth, 1);
+		const float4 reprojectedHit = mul(projectedHit, params.reprojectToPrev);
+
+		hitPosSS = reprojectedHit.xy / reprojectedHit.w;
+		hitPosSS *= CV_HPosScale.zw; // WH[TBa]: removed viewID
+		hitPosSS = MapViewportToRaster(hitPosSS.xy);
+
+		// Clamp reprojection. Rarely happens and less obvious in motion than missing information entirely.
+		hitPosSS.y = saturate(hitPosSS.y);
+
+		// Clamp on X-axis only needed if not using mirror sampler to hide edges in x direction
+		if (!params.usingMirrorXSampler)
+		{
+			hitPosSS.x = saturate(hitPosSS.x);
+		}
+	}
+
+	float4 color = 0;
+
+	if(validHit || validBackgroundHit)
+	{
+		// Read color at hit position.
+		// If we have no hit but a valid background rayT = 1, so we read from rayEnd (reprojected).
+		color.rgb = GetTexture2D(SSRRay_HDRTarg, SSRRay_HDRT_Sampler, hitPosSS).rgb;
+
+		// Filter out NANs and clamp
+		color.rgb = min(isfinite(color.rgb) ? color.rgb : 0, params.maxLum.xxx);
+
+		// Calculate blend weight for hit
+		//
+		// Projected position can cause judder on camera movement due to different parallax.
+		// This can result in visible streaks due to blending out SSR when moving camera to look down.
+		// Use unprojected position instead. Accurate enough and stable.
+		const float2 borderDist = GetMinBorderDistance(params, hitPosUnprojected.xy);
+		const float2 edgeWeights = borderDist < params.borderSize ? borderDist / params.borderSize : 1.0;
+		const float edgeWeight = min(edgeWeights.x, edgeWeights.y);
+
+		color.a = edgeWeight * directionalFade * reflectionBehindCameraFade;
+	}
+
+	// WH[TBa]: KCD2-113243
+	if (conservativeBackgroundHit)
+	{
+		color.rgb *= params.backgroundReflectionMultiplierWH;
+	}
+
+	SsrTraceResult result;
+	result.color = color;
+	result.hitDepth = hitDepth;
+
+	return result;
+}

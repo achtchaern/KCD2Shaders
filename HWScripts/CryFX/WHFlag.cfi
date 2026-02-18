@@ -1,0 +1,77 @@
+// For VTM_FLAG_WH
+
+// from KCD2-312634
+
+// We implement the animation by combinding two orthogonal motions. Both are made of two bands of sine waves.
+// The phase of the wave is given by the X coordinate of the vertex in the model space.
+// Front/Back motion:
+//   * output: Z axis in the model space
+//   * amplitude: blue vtx color
+// Up/down motion:
+//   * output: Y axis in the model space
+//   * amplitude: red vtx color
+
+float3 GetAmplitudeFlagWH(streamPos IN, float4 deformWave, float windStrength, float maxWindMod)
+{
+	return IN.Color.yxz * deformWave.y * (windStrength * (maxWindMod - 1.f) + 1.f);
+}
+
+float GetPhaseFlagWH(streamPos IN, float4 deformWave, float windStrength, float maxWindMod)
+{
+	return IN.Position.x * deformWave.x * (windStrength * (maxWindMod - 1.f) + 1.f);
+}
+
+float GetAnimSpeedFlagWH(streamPos IN, float4 deformWave)
+{
+	return deformWave.z;
+}
+
+// remaps real wind values to [0,1]
+float GetWindStrengthRelativeFlagWH(float4x4 InstMatrix)
+{
+	// values we typically see in the texture
+	const float windMin = 0.2f;
+	const float windMax = 0.8f;
+
+	const float3 worldPos = float3(InstMatrix[0].w, InstMatrix[1].w, InstMatrix[2].w);
+	const float2 tc = (worldPos.xy - g_VS_WindGridOffs.xy) * g_VS_WindGridOffs.zw;
+	const float2 windTex = GetTexture2DLod(windGridTex, ssMaterialBilinearClamp, float4(tc.xy, 0, 0)).xy;
+	const float rawLength = length(windTex);
+	const float ret = saturate((rawLength - windMin) / (windMax - windMin));
+	return ret;
+}
+
+void VTModifyFlagWH(inout float4 inPos, streamPos IN, float3 vNorm, half fTime, float4 deformWave)
+{
+	// front-back motion band configuration, relative to global settings
+	const float2 frontBackAmplitudes = {0.1f, 0.05f};
+	const float2 frontBackFrequencies = {11.f, -5.0f};
+	const float2 frontBackPhaseCoefs = {-5.0f, 3.f};
+
+	// up-down motion band configuration, relative to global settings
+	const float2 upDownAmplitudes = {0.15f, 0.08f};
+	const float2 upDownFrequencies = {-7.f, 2.0f};
+	const float2 upDownPhaseCoefs = {3.0f, -2.f};
+
+	// world position to animation offsets
+	const float2 seedScale = {5.f, -3.f};
+
+	// wind modifiers
+	const float maxWindAmplitudeMod = 1.7f;
+	const float maxWindPhaseMod = 1.8f;
+
+	const float4x4 InstMatrix = GetInstanceMatrix();
+	const float2 seed2 = InstMatrix[0].w + InstMatrix[1].w + InstMatrix[2].w;
+	const float windStrength = GetWindStrengthRelativeFlagWH(InstMatrix);
+	const float3 amplitude = GetAmplitudeFlagWH(IN, deformWave, windStrength, maxWindAmplitudeMod);
+	const float2 phase2 = GetPhaseFlagWH(IN, deformWave, windStrength, maxWindPhaseMod);
+	const float2 time2 = fTime * GetAnimSpeedFlagWH(IN, deformWave);
+
+	const float2 frontBackBands = sin(frontBackFrequencies * time2 + frontBackPhaseCoefs * phase2 + seedScale * seed2);
+	const float frontBackMotion = dot(frontBackAmplitudes, frontBackBands);
+
+	const float2 upDownBands = sin(upDownFrequencies * time2 + upDownPhaseCoefs * phase2 + seedScale * seed2);
+	const float upDownMotion = dot(upDownAmplitudes, upDownBands);
+
+	inPos.xyz += float3(0, upDownMotion, frontBackMotion) * amplitude;
+}

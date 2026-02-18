@@ -1,0 +1,72 @@
+// WH[TomK]: FSR custom reactive mask, KCD2-502564
+// This compute shader is a slightly modifed ffx_fsr2_autogen_reactive_pass.cfi shader which also uses content of rw_output_reactive_mask input
+// that has been generated during rendering. Changes from original shaders are commented inplace.
+#include "ffx_fsr2_typedefs.cfi"
+
+FfxFloat32 ffxMax(FfxFloat32 x, FfxFloat32 y)
+{
+    return max(x, y);
+}
+
+FfxFloat32x3 Tonemap(FfxFloat32x3 fRgb)
+{
+    return fRgb / (ffxMax(ffxMax(0.f, fRgb.r), ffxMax(fRgb.g, fRgb.b)) + 1.f).xxx;
+}
+
+FfxFloat32x3 InverseTonemap(FfxFloat32x3 fRgb)
+{
+    return fRgb / ffxMax(FSR2_TONEMAP_EPSILON, 1.f - ffxMax(fRgb.r, ffxMax(fRgb.g, fRgb.b))).xxx;
+}
+
+FfxInt32x2 ClampLoad(FfxInt32x2 iPxSample, FfxInt32x2 iPxOffset, FfxInt32x2 iTextureSize)
+{
+    return clamp(iPxSample + iPxOffset, FfxInt32x2(0, 0), iTextureSize - FfxInt32x2(1, 1));
+}
+
+Texture2D<float4> r_input_color_pre_alpha : register(t0);
+Texture2D<float4> r_input_color_post_alpha : register(t1);
+RWTexture2D<float> rw_output_reactive_mask : register(u0);
+
+cbuffer cbGenerateReactive : register(b0)
+{
+    float scale;
+    float threshold;
+    float binaryValue;
+    float customReactiveMaskScale; // WH[TomK]: This parameter scale original value from rw_output_reactive_mask
+    uint flags;
+};
+
+[numthreads(8, 8, 1)]
+void CustomReactiveMaskCS(uint2 uGroupId : SV_GroupID, uint2 uGroupThreadId : SV_GroupThreadID)
+{
+    uint2 uDispatchThreadId = uGroupId * uint2(8, 8) + uGroupThreadId;
+
+    float3 ColorPreAlpha = r_input_color_pre_alpha[uDispatchThreadId].rgb;
+    float3 ColorPostAlpha = r_input_color_post_alpha[uDispatchThreadId].rgb;
+    float CustomValue = rw_output_reactive_mask[uDispatchThreadId]; // WH[TomK]: Read previous value
+
+    if (flags & 1)
+    {
+        ColorPreAlpha = Tonemap(ColorPreAlpha);
+        ColorPostAlpha = Tonemap(ColorPostAlpha);
+    }
+
+    if (flags & 2)
+    {
+        ColorPreAlpha = InverseTonemap(ColorPreAlpha);
+        ColorPostAlpha = InverseTonemap(ColorPostAlpha);
+    }
+
+    float out_reactive_value = 0.f;
+    float3 delta = abs(ColorPostAlpha - ColorPreAlpha);
+
+    out_reactive_value = (flags & 8) ? max(delta.x, max(delta.y, delta.z)) : length(delta);
+    out_reactive_value *= scale;
+
+    out_reactive_value = (flags & 4) ? (out_reactive_value < threshold ? 0 : binaryValue) : out_reactive_value;
+
+    // WH[TomK]: Scale previous reactive mask value and add it to calculated one.
+    out_reactive_value = saturate(out_reactive_value + customReactiveMaskScale * CustomValue);
+
+    rw_output_reactive_mask[uDispatchThreadId] = out_reactive_value;
+}

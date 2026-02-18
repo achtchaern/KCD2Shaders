@@ -1,0 +1,108 @@
+// For VTM_ANIM
+
+float DecodeDelay(float4 vertexColor)
+{
+	const float delayChannel = vertexColor.r;
+	// Delay is stored in high 4 bits
+	int scaled = delayChannel * 255;		// 0 - 255
+	int delay = scaled >> 4;						// 0 - 15
+	return delay / 15.0;								// 0.0 - 1.0
+}
+
+float DecodeMovementStrength(float4 vertexColor)
+{
+	const float movementChannel = vertexColor.r;
+	// Strength is stored in low 4 bits
+	int scaled = movementChannel * 255;		// 0 - 255
+	int strength = scaled & 0xf;					// 0 - 15
+	return strength / 15.0;								// 0.0 - 1.0
+}
+
+float3 RotateAboutAxis(float4 normalizedRotationAxisAndAngle, float3 positionOnAxis)
+{
+	// Project Position onto the rotation axis and find the closest point on the axis to Position
+	const float3 closestPointOnAxis = positionOnAxis + normalizedRotationAxisAndAngle.xyz * dot(normalizedRotationAxisAndAngle.xyz, -positionOnAxis);
+	// Construct orthogonal axes in the plane of the rotation
+	const float3 uAxis = -closestPointOnAxis;
+	const float3 vAxis = cross(normalizedRotationAxisAndAngle.xyz, uAxis);
+	float cosAngle;
+	float sinAngle;
+	sincos(normalizedRotationAxisAndAngle.w, sinAngle, cosAngle);
+	// Rotate using the orthogonal axes
+	const float3 r = uAxis * cosAngle + vAxis * sinAngle;
+	// Reconstruct the rotated world space position
+	return closestPointOnAxis + r;
+}
+
+// Adapted from DecodeBending
+float GetWindValue(float3 vPos, float2 windVec, float windSpeedMult, float delay, float fTime)
+{
+	windVec *= windSpeedMult;
+
+	const min16float2 vPhase = vPos.xy * 0.825h * delay;
+
+	float fWaveFreq = 0.4f / (1.5f) + 0.45f;
+	const float2 vFreq = float2(fWaveFreq, fWaveFreq * 1.7f);
+	const float fWAVE_PARALLEL = 0.008f;
+	const float fWAVE_TRANSVERSE = 0.002f;
+	const float2 vAmp = float2(windVec.x * fWAVE_PARALLEL + windVec.y * fWAVE_TRANSVERSE, windVec.y * fWAVE_PARALLEL - windVec.x * fWAVE_TRANSVERSE);
+
+	min16float2 vAddBending = sin((fTime * vFreq + vPhase) * 3.1415926) * vAmp;
+	const float result = (length(vAddBending.xy * 50.f + windVec.xy) + (length(windVec.xy) * 2.f) + (length(vAddBending + windVec.xy) * 0.3f)) * -2.5f;
+	return result;
+}
+
+float3 GetWind(float4 inPos, float3 worldPos, float4x4 InstMatrix, float delay, float fTime, float windSpeedMult, float rotationMult)
+{
+	const float2 tc = (worldPos.xy - g_VS_WindGridOffs.xy) * g_VS_WindGridOffs.zw;
+	const float4 windTex = float4(GetTexture2DLod(windGridTex, ssMaterialBilinearClamp, float4(tc.xy, 0, 0)).xy, 0, 0);
+	const float3 windVec = mul(windTex, InstMatrix).xyz;
+	const float3 windVecNormalized = normalize(windVec);
+
+	float windValue = GetWindValue(inPos.xyz, windVec.xy, windSpeedMult, delay, fTime);
+	const float3 rotationAxis = normalize(cross(windVecNormalized, float3(0, 0, 1)));
+	const float3 rotated = RotateAboutAxis(float4(rotationAxis, windValue * PI_X2), float3(0, 0, -10));
+
+	return rotated * rotationMult;
+}
+
+void VTModifyAnim(inout float4 inPos, streamPos IN, float3 vNorm, half fTime, float4 deformWave)
+{
+	const float normalMovementMult = deformWave.x;		// Freq + Phase
+	const float delayMult = deformWave.y;					// Amp
+	const float velocityMult = deformWave.z; 			// Level
+	const float windSpeedMult = 1 / deformWave.w;			// Wave Length
+	const float windRotationMult = 0.0015;
+	const float4x4 InstMatrix = GetInstanceMatrix();
+
+	float3 worldPos = inPos.xyz + float3(InstMatrix[0].w, InstMatrix[1].w, InstMatrix[2].w);
+
+	const float delay = DecodeDelay(IN.Color) * delayMult;
+
+	// Wind
+	const float3 wind = GetWind(IN.Position, worldPos, InstMatrix, delay, fTime, windSpeedMult, windRotationMult);
+
+	// Velocity
+	const float waveDelayMult = 1.3;
+	const float delayedTime = delay + fTime;
+	const float wave = abs(-1.0 - sin(((delayedTime * waveDelayMult) + 0.5) * PI_X2)) * 0.5;
+
+// _RT_ENVIRONMENT_CUBEMAP should be called _RT_GEOM_INSTANCING
+#if !%_RT_ENVIRONMENT_CUBEMAP
+	const float3 instWorldPos = float3(CD_WorldMatrix[0].w, CD_WorldMatrix[1].w, CD_WorldMatrix[2].w);
+	const float3 instWorldPosPrev = float3(CD_PrevWorldMatrix[0].w, CD_PrevWorldMatrix[1].w, CD_PrevWorldMatrix[2].w);
+
+	const float3 invertedVelocity = (instWorldPosPrev - instWorldPos) * velocityMult;
+	const float3 invertedVelocityWave = wave * invertedVelocity;
+
+	float3 offset = lerp(wind, invertedVelocityWave, saturate(abs(invertedVelocity)));
+#else
+	float3 offset = wind;
+#endif
+
+	const float normalMovement = clamp(dot(offset, vNorm), normalMovementMult, 1);
+	offset *= normalMovement;
+
+	const float movementStrength = DecodeMovementStrength(IN.Color);
+	inPos.xyz += offset * movementStrength;
+}

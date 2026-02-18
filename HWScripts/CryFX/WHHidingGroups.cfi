@@ -1,0 +1,24 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6902
+
+#if HIDING_GROUPS
+
+//==============================================================================
+void DiscardVertexIfHidden(inout float4 hPosition, float4 vertexColor, bool ignoreFirstPersonGroup = false)
+{
+	uint vertexAlpha = vertexColor.a * 255.f + 0.5f;
+	vertexAlpha = ~vertexAlpha;
+	if (ignoreFirstPersonGroup)
+	{
+		vertexAlpha &= ~1u; // must match BIT(gs_FirstPersonViewHidingGroupId) in code
+	}
+
+	if (vertexAlpha & CD_HideMaskWH)
+	{
+		hPosition.zw = sqrt(-1); // No NaN literal in HLSL
+	}
+}
+
+#endif //HIDING_GROUPS

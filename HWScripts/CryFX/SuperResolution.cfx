@@ -1,0 +1,105 @@
+// Copyright 2001-2021 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "PostEffectsLib.cfi"
+#include "ShadeLib.cfi"
+#include "imageLib.cfi"
+
+// NVIDIA IMAGE SCALING SDK
+#include "NVSharpen.cfi"
+
+// WH[TomK]: FSR Custom Reactive mask, KCD2-502564
+#include "ReactiveMask.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = PostProcess;"
+>; 
+
+float4x4 currMatReprojection;
+float4x4 prevMatReprojection;
+float4 hdrParam;
+float4 exposureCompensation;
+
+Texture2D<float4> MotionVectorsTex : register(t0);
+Texture2D<float4> LinearDepthTex   : register(t1);
+Texture2D<float2> luminanceTex     : register(t2); // 1x1
+
+RWTexture2D<float> ExposureOutput  : register(u1);
+
+float2 PrePassPS(vtxOutWPOS IN) : SV_TARGET0
+{
+#if %_RT_MULTIVIEW && FEATURE_VR_MULTIVIEW
+	const uint viewId = ViewID;
+#else
+	const uint viewId = 0;
+#endif
+
+#if %_RT_SAMPLE0
+	ExposureOutput[IN.WPos.xy] = ComputeExposureFromLuminance(luminanceTex.Load(int3(0, 0, 0)).y, min16float4(hdrParam)) * exposureCompensation.x;
+#endif
+	
+	float depth = LinearDepthTex.Load(int3(IN.WPos.xy, 0)).x;
+	float linearDepth = CV_ProjRatio.y / (depth - CV_ProjRatio.x);
+	const float3 vPosWS = WorldViewPos.xyz + IN.CamVec.xyz * linearDepth;
+
+	const float2 velocityObj = MotionVectorsTex.Load(int3(IN.WPos.xy, 0)).xy;
+	const float2 velocityCam = GetCameraVelocity(vPosWS, currMatReprojection, prevMatReprojection);
+
+	// WH[DH]: Removed motion blur fast path, it does not work well with dynamic objects that do not support motion vectors
+	const float2 vVelocity = CombineObjectAndCameraVelocity(velocityObj, velocityCam);
+
+	return vVelocity;
+}
+
+SamplerState PointClampSampler : register(s0);
+Texture2D<float4> SceneHDRTex : register(t0);
+float4 ScaleOutputPS(vtxOut IN) : SV_TARGET0
+{
+    return SceneHDRTex.Sample(PointClampSampler, IN.baseTC.xy);
+}
+
+////////////////// technique /////////////////////
+
+technique SuperResolution_PrePass
+{
+    pass p0
+    {
+		VertexShader = BaseWPOSVS();
+		PixelShader = PrePassPS() SuperResolution_PrePass_PS;
+		CullMode = None;
+	}
+}
+
+technique ScaleOutput
+{
+    pass p0
+    {
+        VertexShader = FullscreenTriVS();
+        PixelShader = ScaleOutputPS();
+        CullMode = None;
+    }
+}
+
+technique NVIDIASharpen
+{
+    pass p0
+    {
+        ComputeShader = NVSharpenCS() NV_Sharpen_CS;
+    }
+}
+
+// WH[TomK]: Custom reactive mask, KCD2-502564
+technique CustomReactiveMask
+{
+    pass p0
+    {
+        ComputeShader = CustomReactiveMaskCS() CustomReactiveMask_CS;
+    }
+}
+
+/////////////////////// eof ///

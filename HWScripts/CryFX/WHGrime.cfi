@@ -1,0 +1,91 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6895
+
+#if CLS_GRIME
+
+half GrimeMaskHardness // mutually exclusive with WeaponQualityZone0 in %WEAPON
+<
+	register = REG_PM_PARAM_3.x;
+	string UIHelp = "GrimeMaskHardness";
+	string UIName = "DS Grime Mask Hardness";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.9;
+
+#if !MATERIAL_ATLAS // If MaterialAtlas is enabled, these properties are in FeatureBuffer
+
+float GrimeOpacity
+<
+	register = REG_PM_PARAM_3.y;
+	string UIHelp = "GrimeOpacity";
+	string UIName = "DS Grime Opacity";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+float GrimeGloss
+<
+	register = REG_PM_PARAM_3.z;
+	string UIHelp = "GrimeGloss";
+	string UIName = "DS Grime Gloss";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.0;
+
+float4 GrimeDiffuse
+<
+	register = REG_PM_PARAM_4;
+	string UIHelp = "GrimeDiffuse";
+	string UIName = "DS Grime Diffuse";
+	string UIWidget = "color";
+> = { 0.0, 0.0, 0.0, 0.0 };
+
+float4 GrimeSpecular
+<
+	register = REG_PM_PARAM_5;
+	string UIHelp = "GrimeSpecular";
+	string UIName = "DS Grime Specular";
+	string UIWidget = "color";
+> = { 0.0, 0.0, 0.0, 0.0 };
+
+#endif // !MATERIAL_ATLAS
+
+//==============================================================================
+half ComputeGrimeIntensity(half macroMask, half microMask, half grimeLevel)
+{
+	// min and max cannot be the same number, causes singularity on some vendors, KCD2-359282
+	const half ageing = smoothstep(0.h, max((1.h - GrimeMaskHardness) * grimeLevel, 0.01h), grimeLevel + macroMask - 1.h);
+	// linear alternative:
+	//const half ageing = saturate((grimeLevel + macroMask - 1.h) / ((1.h - GrimeMaskHardness) * grimeLevel));
+	half grimeIntensity = microMask * ageing;
+
+	return grimeIntensity;
+}
+
+//==============================================================================
+void ApplyGrimeSmoothness(inout half fSmoothness, float grimeGloss, half grimeIntensity)
+{
+	fSmoothness = lerp(fSmoothness, grimeGloss, grimeIntensity);
+}
+
+//==============================================================================
+void ApplyGrimeAlbedo(inout half3 cAlbedo, float3 grimeDiffuse, half grimeIntensity)
+{
+	cAlbedo.xyz = lerp(cAlbedo.xyz, grimeDiffuse, grimeIntensity);
+}
+
+//==============================================================================
+void ApplyGrimeReflectance(inout half3 cReflectance, float3 grimeSpecular, half grimeIntensity)
+{
+	cReflectance = lerp(cReflectance, grimeSpecular, grimeIntensity);
+}
+
+#endif // CLS_GRIME

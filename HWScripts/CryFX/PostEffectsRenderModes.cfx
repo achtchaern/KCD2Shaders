@@ -1,0 +1,674 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "PostEffectsLib.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = FX;"
+>; 
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// Nightvision technique (depreceated - kept for backwards compatibility/tbr) /////////////////////
+float4 nightVisionParamsPS;
+
+Texture2D texNightVision_Screen       : register(t0);
+Texture2D texNightVision_ScreenScaled : register(t1);
+Texture2D texNightVision_Noise        : register(t2);
+Texture2D texNightVision_Gradient     : register(t3);
+
+SamplerState ssNightVision_Screen       : register(s0);
+SamplerState ssNightVision_ScreenScaled : register(s1);
+SamplerState ssNightVision_Noise        : register(s2);
+SamplerState ssNightVision_Gradient     : register(s3);
+
+
+///////////////// vertex shader //////////////////
+
+struct vtxOutNightVision
+{
+  float4 HPosition  : SV_POSITION;
+  float2 baseTC    : TEXCOORDN;
+  float4 noiseTC    : TEXCOORDN;  
+  
+};
+
+float4 GetNightVisionNoise(float2 noiseTC)
+{
+	return GetTexture2D(texNightVision_Noise, ssNightVision_Noise, noiseTC.xy);
+}
+
+vtxOutNightVision NightVisionVS(uint VertexID : SV_VertexID)
+{
+  vtxOutNightVision OUT = (vtxOutNightVision)0; 
+  OUT.HPosition = GetHPos_FromTriVertexID(VertexID);
+  float2 baseTC = GetBaseTC_FromTriVertexID(VertexID);
+  OUT.baseTC.xy = baseTC;
+  
+  
+  float2 scale = g_VS_ScreenSize.xy / 128.0;      
+  float2 pixScale = 128.0 / g_VS_ScreenSize.xy;      
+          
+  // make sure noise is correctly texel to pixel mapped 
+  baseTC.xy *= scale;          
+  OUT.noiseTC.xy = baseTC + (vsParams[0].xy ) * pixScale;              
+  OUT.noiseTC.wz = baseTC + (vsParams[0].zw + 0.333) * pixScale ;              
+  
+  return OUT;
+}
+
+///////////////// pixel shader //////////////////
+pixout NightVisionPS(vtxOutNightVision IN)
+{
+  pixout OUT;
+
+  int nQuality = GetShaderQuality();
+  
+  const int flareCount = 4;
+  
+  min16float4 cScreen = GetTexture2D(texNightVision_Screen, ssNightVision_Screen, IN.baseTC.xy);
+  min16float4 cScreenOrig = cScreen;
+  
+  min16float4 cScreenBlurred = GetTexture2D(texNightVision_ScreenScaled, ssNightVision_ScreenScaled, IN.baseTC.xy);
+  
+  // sharpen screen
+  cScreen =  saturate(lerp(cScreenBlurred,cScreen,  2));
+
+  // add noisy glow
+  min16float fNoise  = dot(GetNightVisionNoise(IN.noiseTC.xy).xy, 0.5);
+  fNoise += dot(GetNightVisionNoise(IN.noiseTC.wz).xy, 0.5);
+  fNoise *= 0.25;
+
+  min16float fInterlation = abs(frac((IN.baseTC.y)*PS_ScreenSize.y*0.25)*2-1)*0.75+0.25;
+  fNoise = (fInterlation + fInterlation*fNoise);
+
+  // Darken edges (and lerp between 1.0 and darken term). Overbright white areas also
+  min16float fDistToCenter = length(IN.baseTC.xy * 2 - 1);
+  min16float fDarken = saturate( 1 - fDistToCenter*0.7);  
+  
+  min16float4 cScreenEdges = 0;//
+  if( flareCount )
+  {
+    cScreenEdges  = GetTexture2D(texNightVision_ScreenScaled, ssNightVision_ScreenScaled, IN.baseTC.xy - normalize((IN.baseTC.xy+0.005*(GetNightVisionNoise(IN.noiseTC.xy).xy*2-1)) * 2 - 1)*0.15);
+    cScreenEdges += GetTexture2D(texNightVision_ScreenScaled, ssNightVision_ScreenScaled, IN.baseTC.xy - normalize((IN.baseTC.xy+0.005*(GetNightVisionNoise(IN.noiseTC.xy).xy*2-1)) * 2 - 1)*0.2);
+    cScreenEdges += GetTexture2D(texNightVision_ScreenScaled, ssNightVision_ScreenScaled, IN.baseTC.xy - normalize((IN.baseTC.xy+0.005*(GetNightVisionNoise(IN.noiseTC.xy).xy*2-1)) * 2 - 1)*0.25);
+    cScreenEdges *= 0.333;
+    cScreenEdges = cScreenEdges*0.75  + 0.25 * GetTexture2D(texNightVision_ScreenScaled, ssNightVision_ScreenScaled, IN.baseTC.xy - normalize((IN.baseTC.xy+0.005*(GetNightVisionNoise(IN.noiseTC.xy).xy*2-1)) * 2 - 1)*0.4);
+  }
+  else
+    cScreenEdges = GetTexture2D(texNightVision_ScreenScaled, ssNightVision_ScreenScaled, IN.baseTC.xy);
+
+  min16float fBlurEdges = fDistToCenter;
+  fBlurEdges *= fBlurEdges;
+  fBlurEdges *= fBlurEdges;
+
+  cScreen = lerp(cScreen, cScreenEdges, saturate(fBlurEdges*0.5));
+  cScreen = (cScreen  + cScreenBlurred * saturate(fNoise));
+  
+  float fSceneLum = GetLuminance(cScreen.xyz);
+
+  // Output final color and add grainy noise on top
+  OUT.Color = cScreen * fDarken;
+  
+  //if %_RT_HDR_MODE  
+    OUT.Color.xyz =   (1 - exp( -  4*( OUT.Color.xyz+ saturate(cScreenBlurred*1.25  -fNoise))));
+  //else
+    //OUT.Color.xyz = fSceneLum *(fSceneLum * 0.25 + saturate(cScreenBlurred * 2 -(fNoise)   )) + (1 - exp( -4*(OUT.Color.xyz  )));
+  //endif
+  
+  // get absolute value, stuff totaly black will get whitish
+  
+  half fLum = GetLuminance(OUT.Color.xyz);
+  OUT.Color.xyz = GetTexture2D(texNightVision_Gradient, ssNightVision_Gradient, fLum.xx);
+  
+  OUT.Color.xyz =   (1 - exp( -(OUT.Color.xyz * OUT.Color.xyz) ) );
+  OUT.Color.xyz= max( lerp(0.5, OUT.Color.xyz, 1.25), 0);
+  OUT.Color.xyz = lerp(fLum, OUT.Color.xyz,0.65);
+  
+  OUT.Color.xyz = lerp(cScreenOrig.xyz, OUT.Color.xyz, psParams[0].w * psParams[0].w);
+  
+  // overbright sligthly
+  OUT.Color.xyz *= 1.25;
+
+  return OUT;
+}
+
+////////////////// technique /////////////////////
+
+technique NightVision
+{
+  pass p0
+  {
+    VertexShader = NightVisionVS() PostRenderModesVS;
+    PixelShader = NightVisionPS() PostRenderModesPS;
+    CullMode = None;    
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// "Night vision" ghosthing technique /////////////////////////////////////////////////////////////
+
+float4 NightVisionParamsPS;
+
+Texture2D texNightVisionGhosting   : register(t0);
+SamplerState ssNightVisionGhosting : register(s0);
+
+///////////////// vertex shader //////////////////
+struct vtxOutNightVisionGhosting
+{
+  float4 HPosition  : SV_POSITION;
+  float2 baseTC		: TEXCOORDN;
+};
+
+vtxOutNightVisionGhosting NightVisionGhostingVS(vtxInWPOS IN)
+{
+  vtxOutNightVisionGhosting OUT = (vtxOutNightVisionGhosting)0; 
+  float4 vPos = IN.Position;
+  vPos.y = 1 -vPos.y;
+
+  OUT.HPosition = float4(vPos.xy*2-1, vPos.z, 1.0);
+  OUT.baseTC =  HPosToScreenTC(OUT.HPosition);
+  
+  return OUT;
+}
+
+pixout NightVisionGhostingPS(vtxOutNightVisionGhosting IN)
+{
+  pixout OUT = (pixout) 0;
+  OUT.Color = min16float4( GetTexture2D(texNightVisionGhosting, ssNightVisionGhosting, IN.baseTC.xy).xyz, 0.2h);
+  return OUT;
+}
+
+//technique NightVisionGhosting
+//{
+//  pass p0
+//  {
+//    VertexShader = NightVisionGhostingVS();
+//    PixelShader = NightVisionGhostingPS();
+//    CullMode = None;    
+//  }
+//}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// "Sonar vision" technique /////////////////////////////////////////////////////////////////////////
+
+// Visual styling references:
+//	http://www.youtube.com/watch?v=EpOcO08dHvo&feature=related
+//	http://www.youtube.com/watch?v=tUjN36akJz0&feature=related
+//	http://www.youtube.com/watch?v=j5eJxH0gv1A&feature=related
+//	http://www.youtube.com/watch?v=Vgkneyfe31A&feature=related
+
+Texture2D texSonarVisionDepth    : register(t0);
+Texture2D texSonarVisionGBuffer  : register(t1);
+
+SamplerState ssSonarVisionPointClamp : register(s0);
+
+///////////////// vertex shader //////////////////
+
+struct vtxOutSonarVision
+{
+	float4 HPosition : SV_POSITION;
+	float2 baseTC	 : TEXCOORDN;
+	float4 noiseTC	 : TEXCOORDN;  
+	float3 CamVec	 : TEXCOORDN;  
+};
+
+vtxOutSonarVision SonarVisionVSWPOS(vtxInWPOS IN)
+{
+  vtxOutSonarVision OUT = (vtxOutSonarVision)0; 
+
+  float4 vPos = IN.Position;
+
+  vPos.y = 1 -vPos.y;
+  OUT.HPosition = float4(vPos.xy*2-1, vPos.z, 1.0);
+
+  OUT.baseTC =  HPosToScreenTC(OUT.HPosition);
+  OUT.CamVec.xyz = IN.CamVec;
+  
+  float2 scale = g_VS_ScreenSize.xy / 128.0;      
+  float2 pixScale = 128.0 / g_VS_ScreenSize.xy;      
+
+  // make sure noise is correctly texel to pixel mapped 
+  IN.baseTC.xy *= scale;          
+  OUT.noiseTC.xy = IN.baseTC.xy + (vsParams[0].xy ) * pixScale;              
+  OUT.noiseTC.wz = IN.baseTC.xy + (vsParams[0].zw + 0.333) * pixScale ;              
+
+  return OUT;
+}
+
+vtxOutSonarVision SonarVisionVS(uint VertexID : SV_VertexID)
+{
+  vtxOutSonarVision OUT = (vtxOutSonarVision)0; 
+  OUT.HPosition = GetHPos_FromTriVertexID(VertexID);
+  float2 baseTC = GetBaseTC_FromTriVertexID(VertexID);
+  OUT.baseTC.xy = baseTC;
+  
+  
+  float2 scale = g_VS_ScreenSize.xy / 128.0;      
+  float2 pixScale = 128.0 / g_VS_ScreenSize.xy;      
+          
+  // make sure noise is correctly texel to pixel mapped 
+  baseTC.xy *= scale;          
+  OUT.noiseTC.xy = baseTC + (vsParams[0].xy ) * pixScale;              
+  OUT.noiseTC.wz = baseTC + (vsParams[0].zw + 0.333) * pixScale ;              
+  
+  return OUT;
+}
+
+///////////////// pixel shader //////////////////
+pixout SonarVisionAmbientPS(vtxOutSonarVision IN)
+{
+	pixout OUT = (pixout) 0;
+
+	float fDepth = GetLinearDepth(GetTexture2D(texSonarVisionDepth, ssSonarVisionPointClamp, IN.baseTC.xy).r);
+
+	float3 vPosWS = IN.CamVec.xyz * fDepth ;
+	min16float3 vNormal = DecodeGBufferNormal(GetTexture2D(texSonarVisionGBuffer, ssSonarVisionPointClamp, IN.baseTC.xy));
+
+	min16float3 vView = normalize(-vPosWS);
+	min16float fNdotE = ( dot(vView.xyz, vNormal.xyz) );
+	min16float fFarMask = fDepth <= 0.99;
+
+	// Ambient is composed of 3 sonar hits (based on radial dist)
+	min16float fSonarNearRange =0.5h; // 20 cm
+	min16float fSonarRange = 40.0h;
+	min16float fSonarSpeedMul = 0.075h;
+
+	min16float3 vRadius = frac( 5*AnimGenParams * fSonarSpeedMul + min16float3(0.0h, -0.6h, -0.2h)   ) * fSonarRange;
+	min16float3 vDist =   1 - saturate( abs( (vRadius  - length( vPosWS ) ) / fSonarNearRange ) );	
+	min16float fFallOffs = dot(vDist.xz, 1);
+
+	OUT.Color = fFallOffs;
+
+	min16float fSonarImpulses = OUT.Color.x + 0.005h;
+	OUT.Color = saturate(pow(saturate(1-fNdotE),8)*0.1) + fSonarImpulses * pow(fNdotE,8) + fSonarImpulses * pow(1-fNdotE,4)*4;
+	OUT.Color.xyz *= fFarMask;
+
+	return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+pixout SonarVisionSoundHintPS(vtxOutSonarVision IN)
+{
+  pixout OUT = (pixout) 0;
+
+	min16float3 vNoise = (tex2D(_tex2, IN.noiseTC.xy).xyz*2-1);//dot(tex2D(_tex4, IN.noiseTC.xy).xyz, min16float3(0.33, 0.59, 0.1));
+
+	float fDepth = GetLinearDepth(_tex0, IN.baseTC.xy /*+ vNoise * 0.01h*/);
+	
+	// Compute audio sonar hints
+	float3 vPosWS = IN.CamVec.xyz * fDepth;
+	float3 vPosSonarWS = psParams[0];
+	psParams[0].w *=2;
+
+	min16float3 vNormal = DecodeGBufferNormal( tex2D(_tex1, IN.baseTC.xy+vNoise*0.01h) );
+	min16float3 vView = normalize(-vPosWS);
+	min16float fNdotE = ( dot(vView.xyz, vNormal.xyz) );
+
+	min16float fInvRadius = 1.0 / (2 * psParams[0].w);
+	min16float3 vDist = (vPosSonarWS - ( WorldViewPos.xyz +  vPosWS) ) * fInvRadius;
+	min16float fFallOff =pow( 1 - abs( saturate(1-dot(vDist, vDist))*2-1 ), 0.5) * 0.5h;
+
+	fFallOff +=pow( 1 - abs( saturate(1-dot(vDist, vDist))*2-1 ), 2);
+
+	min16float fSonarImpulses = (1-psParams[0].w) * fFallOff;
+
+	OUT.Color = fSonarImpulses * (pow(fNdotE,8) + pow(1-fNdotE,4)*4);
+
+	return OUT;
+}
+
+Texture2D texSonarVisionScreenScaledBlured : register(t0);
+Texture2D texSonarVisionGhosting           : register(t1);
+Texture2D texSonarVisionNoise              : register(t2);
+Texture2D texSonarVisionGradient           : register(t3);
+
+SamplerState ssSonarVisionLinearClamp : register(s1);
+SamplerState ssSonarVisionPointWrap : register(s2);
+
+///////////////// pixel shader //////////////////
+pixout SonarVisionFinalCompositionPS(vtxOutSonarVision IN)
+{
+  pixout OUT = (pixout) 0;
+
+	// add noisy glow
+	min16float3 vNoise = dot(GetTexture2D(texSonarVisionNoise, ssSonarVisionPointWrap, IN.noiseTC.xy).xyz, min16float3(0.33, 0.59, 0.1));
+
+	float fDepth = GetLinearDepth(GetTexture2D(texSonarVisionDepth, ssSonarVisionPointClamp, IN.baseTC.xy).r);
+
+	min16float3 vVectorNoise = GetTexture2D(texSonarVisionNoise, ssSonarVisionPointWrap, IN.noiseTC.xy).xyz * 2 - 1;
+	vVectorNoise *= 0.75h;
+
+	min16float4 cColor = half4(0,0,0,0);
+	cColor += GetTexture2D(texSonarVisionScreenScaledBlured, ssSonarVisionLinearClamp, IN.baseTC.xy + vVectorNoise * 0.0015f);
+	cColor += GetTexture2D(texSonarVisionGhosting, ssSonarVisionLinearClamp, IN.baseTC.xy + vVectorNoise * 0.0015f);
+
+	min16float fInterlation = frac(IN.baseTC.y * PS_ScreenSize.y * 0.25) > 0.5 ? 1.1 : 0.9;
+
+	// Apply vignetting
+	min16float fCenterDist = dot((IN.baseTC.xy * 2 - 1), (IN.baseTC.xy * 2 - 1));
+	min16float fVignetting = saturate(1 - (fCenterDist - 0.6) * 0.85);
+
+	OUT.Color.xyz = (vNoise.x * 0.2 + 0.8) * fVignetting * fInterlation;
+	
+	// set color
+	OUT.Color.xyz *= GetTexture2D(texSonarVisionGradient, ssSonarVisionLinearClamp, cColor.x ) * 1.25 * pow(cColor.x, 0.25);
+
+	return OUT;
+}
+
+Texture2D texSonarVisionScaledBackBuffer : register(t0);
+
+pixout SonarVisionGhostingPS(vtxOutSonarVision IN)
+{
+	pixout OUT = (pixout) 0;
+	OUT.Color = half4(GetTexture2D(texSonarVisionScaledBackBuffer, ssSonarVisionPointClamp, IN.baseTC.xy).xyz, 1 - psParams[0].w * (1.0 / 4.0) * 33.0h);
+	return OUT;
+}
+
+////////////////// technique /////////////////////
+
+technique SonarVisionAmbient
+{
+  pass p0
+  {
+    VertexShader = SonarVisionVSWPOS();
+    PixelShader = SonarVisionAmbientPS();
+    CullMode = None;    
+  }
+}
+
+technique SonarVisionSoundHint
+{
+  pass p0
+  {
+    VertexShader = SonarVisionVSWPOS();
+    PixelShader = SonarVisionSoundHintPS();
+    CullMode = None;    
+  }
+}
+
+technique SonarVisionFinalComposition
+{
+  pass p0
+  {
+    VertexShader = SonarVisionVS();
+    PixelShader = SonarVisionFinalCompositionPS();
+    CullMode = None;    
+  }
+}
+
+technique SonarVisionGhosting
+{
+  pass p0
+  {
+    VertexShader = SonarVisionVS();
+    PixelShader = SonarVisionGhostingPS();
+    CullMode = None;    
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+/// "Thermal vision" technique /////////////////////////////////////////////////////////////////////
+
+// Visual styling references:
+//	http://www.youtube.com/watch?v=SnQcyyDJLCo&feature=related
+//	http://www.youtube.com/watch?v=CqW10oFUbGQ&feature=related
+//	http://www.youtube.com/watch?v=sCW9bnk03o4&feature=related
+//	http://www.youtube.com/watch?v=PO_kDqwDZ3A&feature=related
+//	http://www.youtube.com/watch?v=6fASzACILH4&feature=related
+//	http://www.youtube.com/watch?v=Z6-CiSyI9oE&feature=channel
+
+///////////////// vertex shader //////////////////
+
+struct vtxOutThermalVision
+{
+	float4 HPosition : SV_POSITION;
+	float4 baseTC	 : TEXCOORDN;
+	float4 noiseTC	 : TEXCOORDN;  
+	float3 CamVec	 : TEXCOORDN;  
+};
+
+vtxOutThermalVision ThermalVisionVS(vtxInWPOS IN)
+{
+  vtxOutThermalVision OUT = (vtxOutThermalVision)0; 
+
+  float4 vPos = IN.Position;
+
+  vPos.y = 1 - vPos.y;
+  OUT.HPosition = float4(vPos.xy * 2 - 1, vPos.z, 1.0);
+
+  OUT.baseTC =  HPosToScreenTC(OUT.HPosition);
+  OUT.baseTC.zw = OUT.baseTC.xy * vsParams[1].xy;
+  OUT.CamVec.xyz = IN.CamVec;
+ 
+ 
+  float2 scale = g_VS_ScreenSize.xy / 128.0;      
+  float2 pixScale = 128.0 / g_VS_ScreenSize.xy;      
+
+  // make sure noise is correctly texel to pixel mapped 
+  IN.baseTC.xy *= scale;          
+  OUT.noiseTC.xy = IN.baseTC.xy + (vsParams[0].xy ) * pixScale;              
+  OUT.noiseTC.wz = IN.baseTC.xy + (vsParams[0].zw + 0.333) * pixScale ;              
+
+  return OUT;
+}
+
+vtxOutThermalVision ThermalVisionVS(uint VertexID : SV_VertexID)
+{
+  vtxOutThermalVision OUT = (vtxOutThermalVision)0; 
+
+  OUT.HPosition = GetHPos_FromTriVertexID(VertexID);
+  float2 baseTC = GetBaseTC_FromTriVertexID(VertexID);
+  OUT.baseTC.xy = baseTC;
+  
+  
+  float2 scale = g_VS_ScreenSize.xy / 128.0;      
+  float2 pixScale = 128.0 / g_VS_ScreenSize.xy;      
+          
+  // make sure noise is correctly texel to pixel mapped 
+  baseTC.xy *= scale;          
+  OUT.noiseTC.xy = baseTC + (vsParams[0].xy ) * pixScale;              
+  OUT.noiseTC.wz = baseTC + (vsParams[0].zw + 0.333) * pixScale ;              
+  
+  return OUT;
+}
+
+Texture2D texThermalVisionDepth : register(t0);
+SamplerState ssThermalVisionPointClamp : register(s0);
+
+///////////////// pixel shader //////////////////
+pixout ThermalVisionAmbientPS(vtxOutThermalVision IN)
+{
+  pixout OUT = (pixout) 0;
+
+	// uncomment out for regular thermal vision
+
+	//min16float3 vNoise = tex2D(_tex4, IN.noiseTC.xy).xyz*2-1;
+	//IN.baseTC.xy += vNoise *0.001;
+
+	//float fDepth = GetLinearDepth(_tex0, IN.baseTC.xy);
+	//float3 vPosWS = IN.CamVec.xyz * fDepth;
+
+	//min16float3 vNormal = DecodeGBufferNormal( tex2D(_tex1, IN.baseTC.xy) );
+	//min16float3 vView = normalize(-vPosWS);
+	//min16float fNdotE = ( dot(vView.xyz, vNormal.xyz) );
+	//fNdotE *= fDepth <= 0.99;
+
+	//OUT.Color.xyz = fNdotE*fNdotE*fNdotE*fNdotE * 0.3h * (0.8 + 0.2 * ( abs( frac(AnimGenParams*10)*2-1 ) + abs(frac(0.2 + 0.6* AnimGenParams)*2-1)) );
+
+	//OUT.Color.xyz *= 1-saturate( dot(vPosWS.xyz, vPosWS.xyz) * psParams[0].w );
+
+
+	// Nightvision mixed with thermal vision
+
+	min16float3 vNoise = 0;//tex2D(_tex4, IN.noiseTC.xy).xyz*2-1;
+	IN.baseTC.xy += vNoise *0.001;
+
+	float fDepth = GetLinearDepth(GetTexture2D(texThermalVisionDepth, ssThermalVisionPointClamp, IN.baseTC.xy).r);
+	float3 vPosWS = IN.CamVec.xyz * fDepth;
+
+	fDepth *= PS_NearFarClipDist.y;
+	//float3 vPosWS = IN.CamVec.xyz * fDepth ;
+
+	// Ambient is composed of 3 sonar hits (based on radial dist)
+	min16float fSonarNearRange = 2.0h; // 20 cm
+	min16float fSonarRange = 40.0h;
+	min16float fSonarSpeedMul = 0.1h;
+
+	//AnimGenParams *= 2.0;
+	min16float3 vRadius = frac( AnimGenParams * fSonarSpeedMul + min16float3(0.0h, -0.6h, -0.5h)   ) * fSonarRange;
+	min16float3 vDist =   1 - saturate( abs( (vRadius  - fDepth ) ) / fSonarNearRange );	
+  //min16float3 vDist =   1 - saturate( abs( (vRadius  - length( vPosWS ) ) / fSonarNearRange ) );	
+  min16float fFallOffs = dot(vDist.xz, 1);
+	//fFallOffs *= fFallOffs;
+//	fFallOffs *= fFallOffs;
+
+
+
+	min16float fDistAtten = 1-saturate(fDepth *0.01); // expose cvar
+	fDistAtten *=fDistAtten;
+
+	OUT.Color.xyz = 0.5*fFallOffs * saturate(4*fDistAtten) ;
+	//min16float3( 2.0h, 0.2h, 0.01h)*
+
+	//OUT.Diffuse.xyz += min16float3( 2.0h, 0.2h, 0.01h)*fFallOffs*5;
+	//OUT.Specular.xyz += min16float3( 2.0h, 0.2h, 0.01h)*fFallOffs*5;
+
+//	min16float3 vNormal = DecodeGBufferNormal( tex2D(_tex1, IN.baseTC.xy) );
+	//min16float3 vView = normalize(-vPosWS);
+	//min16float fNdotE = ( dot(vView.xyz, vNormal.xyz) );
+	//fNdotE *= fDepth <= 0.99;
+
+	//OUT.Color.xyz = fNdotE*fNdotE*fNdotE*fNdotE * 0.3h * (0.8 + 0.2 * ( abs( frac(AnimGenParams*10)*2-1 ) + abs(frac(0.2 + 0.6* AnimGenParams)*2-1)) );
+
+	//OUT.Color.xyz *= 1-saturate( dot(vPosWS.xyz, vPosWS.xyz) * psParams[0].w );
+
+  return OUT;
+}
+
+Texture2D texThermalVisionScreen       : register(t0);
+Texture2D texThermalVisionScreenBlur0  : register(t1);
+Texture2D texThermalVisionScreenBlur1  : register(t2);
+Texture2D texThermalVisionNoise        : register(t3);
+Texture2D texThermalVisionGradient     : register(t4);
+Texture2D texThermalVisionHeatMap      : register(t5);
+Texture2D texThermalVisionGhosting     : register(t6);
+Texture2D texClearAreaMask             : register(t7);
+
+SamplerState ssThermalVisionPointClamp    : register(s0);
+SamplerState ssThermalVisionBilinearClamp : register(s1);
+SamplerState ssThermalVisionPointWrap     : register(s2);
+
+bool IsFarPlane(float2 TC)
+{
+    half mask = GetTexture2D(texClearAreaMask, ssThermalVisionPointClamp, TC).x;
+    return mask >= 1.f - G_EPSILON;
+}
+
+pixout ThermalVisionCompositionPS(vtxOutThermalVision IN)
+{
+	pixout OUT = (pixout)0;
+
+	// per-pixel noise
+	min16float3 vNoise = GetTexture2D(texThermalVisionNoise, ssThermalVisionPointWrap, IN.noiseTC.xy).xyz *2-1;
+
+	min16float3 cOrigScene = GetTexture2D(texThermalVisionScreen, ssThermalVisionBilinearClamp, IN.baseTC.xy + vNoise * 0.0001 * max(1, 32*psParams[0].x)).xyz;
+	[branch]if(IsFarPlane(IN.baseTC.xy))
+	{
+		OUT.Color.xyz = float3(0.f, 0.f, 0.f);
+		return OUT;
+	}
+	vNoise *= max(1, psParams[0].x*4);
+
+	min16float3 cScene = GetTexture2D(texThermalVisionHeatMap, ssThermalVisionBilinearClamp, IN.baseTC.zw + vNoise * 0.001).xyz;
+	min16float3 cBlurredScene = GetTexture2D(texThermalVisionScreenBlur0, ssThermalVisionBilinearClamp, IN.baseTC.xy + vNoise * 0.001).xyz;
+	min16float3 cBlurredScene02 = GetTexture2D(texThermalVisionScreenBlur1, ssThermalVisionBilinearClamp, IN.baseTC.xy + vNoise * 0.001).xyz;
+	min16float3 cImageNoise = 0.02 * ( dot(GetTexture2D(texThermalVisionNoise, ssThermalVisionPointWrap, IN.noiseTC.xy).xyz, 0.33) - 0.5);
+#if %_RT_SAMPLE0
+	min16float3 cBlurredScenePrevFrame = 0;
+#else
+	min16float3 cBlurredScenePrevFrame = GetTexture2D(texThermalVisionGhosting, ssThermalVisionBilinearClamp, IN.baseTC.xy + vNoise * 0.001).xyz;
+#endif
+
+	min16float2 fInterlation = frac(IN.baseTC.y * PS_ScreenSize.y * 0.25) > 0.5? min16float2(1.1,1.3): min16float2(0.9,0.7);
+
+	// transition from brights to darks - use also heat values fading in
+	min16float fTransitionFunc = abs(frac((-0.5*cScene.x+cOrigScene.x)*0.5 -0.5 + psParams[0].w)*2-1);
+	fTransitionFunc *= fTransitionFunc;	
+	cScene.x  += fTransitionFunc * psParams[0].z;
+
+	cScene.x *= cScene.x;
+	cScene.x *= cScene.x;
+	min16float fHeatSource = cImageNoise +0.2* (cScene.x+ cBlurredScene.x*2+ cBlurredScene02.x*2 + cBlurredScenePrevFrame.x*2);	
+
+	OUT.Color.xyz = GetTexture2D(texThermalVisionGradient, ssThermalVisionBilinearClamp, fInterlation.x*fHeatSource);
+	OUT.Color.xyz = pow(OUT.Color.xyz, 2.0);
+
+	min16float fBlendMask = saturate(cScene.x + cBlurredScene.x +cBlurredScene02*4 +  cBlurredScenePrevFrame.x*2);
+
+#if %_RT_SAMPLE0
+	// Night-vision digital modifiers
+	min16float fCenterDist = dot(IN.baseTC.xy*2-1, IN.baseTC.xy*2-1);
+	min16float fInvCenterDist = 0.8h - 0.8h * fCenterDist;
+	min16float fOrigSceneGray = dot(cOrigScene.xyz, fInvCenterDist - fBlendMask);
+	
+	fOrigSceneGray *= fOrigSceneGray * fInterlation.y;
+	cOrigScene = max(0, fOrigSceneGray - vNoise.x * 0.1h);
+#else
+	min16float fOrigSceneGray = dot(cOrigScene.xyz, 0.1h);
+#endif
+
+	cOrigScene = lerp(cOrigScene, fOrigSceneGray, fBlendMask);
+	OUT.Color.xyz = cOrigScene + OUT.Color.xyz * fBlendMask*(1-cOrigScene);
+
+	return OUT;
+}
+
+pixout ThermalVisionGhostingPS(vtxOutThermalVision IN)
+{
+  pixout OUT = (pixout) 0;
+  OUT.Color = min16float4(GetTexture2D(texThermalVisionScreen, ssThermalVisionBilinearClamp, IN.baseTC.xy).xyz, 0.25);
+  return OUT;
+}
+
+////////////////// technique /////////////////////
+
+technique ThermalVisionAmbient
+{
+  pass p0
+  {
+		VertexShader = ThermalVisionVS();
+    PixelShader = ThermalVisionAmbientPS();
+    CullMode = None;    
+  }
+}
+
+technique ThermalVisionComposition
+{
+  pass p0
+  {
+    VertexShader = ThermalVisionVS();
+    PixelShader = ThermalVisionCompositionPS() ThermalVisionPS;
+    CullMode = None;    
+  }
+}
+
+technique ThermalVisionGhosting
+{
+  pass p0
+  {
+    VertexShader = ThermalVisionVS();
+    PixelShader = ThermalVisionGhostingPS();
+    CullMode = None;    
+  }
+}
+
+/////////////////////// eof ///
+

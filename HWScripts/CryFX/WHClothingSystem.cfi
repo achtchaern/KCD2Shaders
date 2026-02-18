@@ -1,0 +1,74 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6923
+
+#if MATERIAL_ATLAS || CLS_BLOOD || CLS_GRIME || CLS_SCRATCH
+
+void DrawClothingSystemDebug(inout half3 cAlbedo, int featureIndex, int macroIndex, half scratchIntensity, half grimeIntensity, half bloodIntensity, half sphereMask, float3 materialAtlasTC[2], int decalAtlasIndex, half decalAtlasMask)
+{
+	// Enable this debug using wh_e_clothingsystem_debug
+
+	// Values are in interval to work well with slider UI.
+	if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 1.h)
+	{
+		// 0: Disabled
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 2.h)
+	{
+#if	MATERIAL_ATLAS
+		// 1: Feature color in albedo
+		cAlbedo = FeatureIndexToColor(featureIndex);
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 3.h)
+	{
+#if CLS_SCRATCH
+		// 2: Scratch intensity in albedo
+		cAlbedo = scratchIntensity;
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 4.h)
+	{
+#if CLS_GRIME
+		// 3: Grime intensity in albedo
+		cAlbedo = grimeIntensity;
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 5.h)
+	{
+#if CLS_BLOOD
+		// 4: Blood intensity in albedo
+		cAlbedo = bloodIntensity;
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 6.h)
+	{
+#if CLS_BLOOD
+		// 5: Sphere mask in albedo
+		cAlbedo = sphereMask;
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 7.h)
+	{
+#if	MATERIAL_ATLAS
+		// 6: Material atlas mip level debug in albedo
+		//cAlbedo = GetTexture2D(mipTestSampler, materialAtlasTC[0].xy).rgb;
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 8.h)
+	{
+#if MACRO_ATLAS
+		// 7: MacroID in albedo
+		cAlbedo = MacroAtlasIndexToColor(macroIndex);
+#endif
+	}
+	else if (CV_HDRMultiplier_CloudShadow_CLSDebugWH.z < 9.h)
+	{
+#if DECAL_ATLAS
+		cAlbedo = lerp(cAlbedo, DecalAtlasIndexToColor(decalAtlasIndex), decalAtlasMask);
+#endif
+	}
+}
+
+#endif //MATERIAL_ATLAS || CLS_BLOOD || CLS_GRIME || CLS_SCRATCH

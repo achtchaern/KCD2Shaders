@@ -1,0 +1,116 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6903
+
+#if MACRO_ATLAS
+
+//==============================================================================
+Texture2DArray<float4> MacroAtlasDiffuseTex    : register(t62) = TS_MacroAtlasDiffuse;
+Texture2DArray<float4> MacroAtlasNormalTex     : register(t63) = TS_MacroAtlasNormal;
+Texture2DArray<float4> MacroAtlasSmoothnessTex : register(t64) = TS_MacroAtlasSmoothness;
+Texture2DArray<float4> MacroAtlasBGSTex        : register(t65) = TS_MacroAtlasBGS;
+
+//==============================================================================
+int DecodeMacroAtlasIndex(float4 vertexColor)
+{
+	int encodedIndexes = vertexColor.b * 255.f;
+	return (encodedIndexes & ~0x1f) >> 5;  // high 3 bits
+}
+
+//==============================================================================
+half3 MacroAtlasIndexToColor(int macroIndex)
+{
+	half3 macroColor;
+	macroColor.r = macroIndex % 2;
+	macroColor.g = (macroIndex / 2) % 2;
+	macroColor.b = (macroIndex / 4) % 2;
+	return macroColor;
+}
+
+//==============================================================================
+half GetMacroAtlasAlpha(float4 baseTC, int macroIndex)
+{
+	if (macroIndex < MACRO_ATLAS_SIZE)
+	{
+		return 1.h; // macro atlas textures don't support alpha
+	}
+	else
+	{
+		return GetAlphaTex(diffuseTex, baseTC.xy);
+	}
+}
+
+//==============================================================================
+#if CLS_BLOOD || CLS_GRIME || CLS_SCRATCH
+half3 GetMacroAtlasBloodGrimeScratch(float2 baseTC, int macroIndex)
+{
+	if (macroIndex < MACRO_ATLAS_SIZE)
+	{
+		return MacroAtlasBGSTex.Sample(ssMaterialTrilinear, float3(baseTC, macroIndex)).rgb;
+	}
+	else
+	{
+		return BloodGrimeScratchTexture.Sample(ssMaterialTrilinear, baseTC).rgb;
+	}
+}
+#endif // CLS_BLOOD || CLS_GRIME || CLS_SCRATCH
+
+//==============================================================================
+half3 GetMacroAtlasNormal(float2 baseTC, int macroIndex)
+{
+	if (macroIndex < MACRO_ATLAS_SIZE)
+	{
+		return GetNormalMapAtlas(MacroAtlasNormalTex, float3(baseTC, macroIndex));
+	}
+	else
+	{
+		return GetNormalMap(normalsTex, baseTC);
+	}
+}
+
+//==============================================================================
+half GetMacroAtlasSmoothness(float2 baseTC, int macroIndex)
+{
+	if (macroIndex < MACRO_ATLAS_SIZE)
+	{
+		return  MacroAtlasSmoothnessTex.Sample(ssMaterialTrilinear, float3(baseTC, macroIndex)).r;
+	}
+	else
+	{
+		return GetSmoothnessTex(smoothnessTex, baseTC).r;
+	}
+}
+
+//==============================================================================
+half4 GetMacroAtlasDiffuse(float2 baseTC, int macroIndex)
+{
+	if (macroIndex < MACRO_ATLAS_SIZE)
+	{
+		return MacroAtlasDiffuseTex.Sample(ssMaterialTrilinear, float3(baseTC, macroIndex));
+	}
+	else
+	{
+		const half4 srgbDiffuse = GetDiffuseTex(diffuseTex, baseTC);
+		const half4 linearMacroDiffuse = pow(srgbDiffuse, 1.0 / 2.2); //WH GM TODO: remove gamma properly during sampling
+		return linearMacroDiffuse;
+	}
+}
+
+//==============================================================================
+half3 GetMacroAtlasSpecular(float2 baseTC, int macroIndex)
+{
+	if (macroIndex < MACRO_ATLAS_SIZE)
+	{
+		// Macro specular uses overlay blending so middle gray is neutral
+		return half3(0.5h, 0.5h, 0.5h);
+	}
+	else
+	{
+		const half3 srgbSpecular = GetSpecularTex(specularTex, baseTC).rgb;
+		const half3 linearMacroSpecular = pow(srgbSpecular, 1.0 / 2.2); //WH GM TODO: remove gamma properly during sampling
+		return linearMacroSpecular;
+	}
+}
+
+#endif //MACRO_ATLAS

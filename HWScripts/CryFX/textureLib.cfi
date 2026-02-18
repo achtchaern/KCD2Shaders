@@ -1,0 +1,342 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float4 GetTexture2DGrad(Texture2D<float4> tex, SamplerState samplerState, float2 uv, float2 ddxUV, float2 ddyUV) { return tex.SampleGrad(samplerState, uv.xy, ddxUV, ddyUV ); }
+float4 GetTexture2DLod(Texture2D<float4> tex, SamplerState samplerState, float4 uv)                              { return tex.SampleLevel(samplerState, uv.xy, uv.w); }
+float2 GetTexture2DLod(Texture2D<float2> tex, SamplerState samplerState, float4 uv)                              { return tex.SampleLevel(samplerState, uv.xy, uv.w); }
+float4 GetTexture2DLod(Texture2D<float4> tex, SamplerState samplerState, float2 uv, float Lod)                   { return tex.SampleLevel(samplerState, uv.xy, Lod); }
+float4 GetTexture2DProj(Texture2D<float4> tex, SamplerState samplerState, float4 uv)                             { return tex.Sample(samplerState, uv.xy * rcp(uv.w)); }
+float2 GetTexture2DProj(Texture2D<float2> tex, SamplerState samplerState, float4 uv)                             { return tex.Sample(samplerState, uv.xy * rcp(uv.w)); }
+float4 GetTexture2DBias(Texture2D<float4> tex, SamplerState samplerState, float4 uv)                             { return tex.SampleBias(samplerState, uv.xy, uv.w); }
+float4 GetTexture2D(Texture2D<float4> tex, SamplerState samplerState, float2 uv)                                 { return tex.Sample(samplerState, uv); }
+float4 GetTextureCube(TextureCube<float4> tex, SamplerState samplerState, float3 uv)                             { return tex.Sample(samplerState, uv); }
+float4 GetTextureCubeLod(TextureCube<float4> tex, SamplerState samplerState, float4 uv)                          { return tex.SampleLevel(samplerState, uv.xyz, uv.w); }
+
+#if FEATURE_RELAXED_PRECISION
+min16float4 GetTexture2DGrad(Texture2D<min16float4> tex, SamplerState samplerState, float2 uv, float2 ddxUV, float2 ddyUV) { return tex.SampleGrad(samplerState, uv.xy, ddxUV, ddyUV ); }
+min16float4 GetTexture2DLod(Texture2D<min16float4> tex, SamplerState samplerState, float4 uv)                              { return tex.SampleLevel(samplerState, uv.xy, uv.w); }
+min16float2 GetTexture2DLod(Texture2D<min16float2> tex, SamplerState samplerState, float4 uv)                              { return tex.SampleLevel(samplerState, uv.xy, uv.w); }
+min16float4 GetTexture2DLod(Texture2D<min16float4> tex, SamplerState samplerState, float2 uv, float Lod)                   { return tex.SampleLevel(samplerState, uv.xy, Lod); }
+min16float4 GetTexture2DProj(Texture2D<min16float4> tex, SamplerState samplerState, float4 uv)                             { return tex.Sample(samplerState, uv.xy * rcp(uv.w)); }
+min16float2 GetTexture2DProj(Texture2D<min16float2> tex, SamplerState samplerState, float4 uv)                             { return tex.Sample(samplerState, uv.xy * rcp(uv.w)); }
+min16float4 GetTexture2DBias(Texture2D<min16float4> tex, SamplerState samplerState, float4 uv)                             { return tex.SampleBias(samplerState, uv.xy, uv.w); }
+min16float4 GetTexture2D(Texture2D<min16float4> tex, SamplerState samplerState, float2 uv)                                 { return tex.Sample(samplerState, uv); }
+min16float4 GetTextureCube(TextureCube<min16float4> tex, SamplerState samplerState, float3 uv)                             { return tex.Sample(samplerState, uv); }
+min16float4 GetTextureCubeLod(TextureCube<min16float4> tex, SamplerState samplerState, float4 uv)                          { return tex.SampleLevel(samplerState, uv.xyz, uv.w); }
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float2 GetXYNormalMap(Texture2D<float4> bumpTex, float2 bumpTC)                                           { return GetTexture2D(bumpTex, ssMaterialAnisoHigh, bumpTC).yx; }
+float2 GetXYNormalMap(Texture2D<float4> bumpTex, SamplerState samplerState, float2 bumpTC)                { return GetTexture2D(bumpTex, samplerState, bumpTC).yx; }
+float2 GetXYNormalMapLod(Texture2D<float4> bumpTex, SamplerState samplerState, float4 bumpTC)             { return GetTexture2DLod(bumpTex, samplerState, bumpTC).yx; }
+float2 GetXYNormalMapGrad(Texture2D<float4> bumpTex, float2 bumpTC, float2 ddx_bumpTC, float2 ddy_bumpTC) { return GetTexture2DGrad(bumpTex, ssMaterialAnisoHigh, bumpTC, ddx_bumpTC, ddy_bumpTC).yx; }
+
+float3 GetNormalMap(Texture2D<float4> bumpTex, float2 bumpTC)
+{
+  float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMap(bumpTex, bumpTC.xy);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+float3 GetNormalMap(Texture2D<float4> bumpTex, SamplerState samplerState, float2 bumpTC)
+{
+  float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMap(bumpTex, samplerState, bumpTC.xy);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+float3 GetNormalMapLod(Texture2D<float4> bumpTex, SamplerState samplerState, float4 bumpTC)
+{
+  float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapLod(bumpTex, samplerState, bumpTC);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+float3 GetNormalMapGrad(Texture2D<float4> bumpTex, float2 bumpTC, float2 ddx_bumpTC, float2 ddy_bumpTC)
+{
+  float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapGrad(bumpTex, bumpTC, ddx_bumpTC, ddy_bumpTC);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+#if FEATURE_RELAXED_PRECISION
+min16float2 GetXYNormalMap(Texture2D<min16float4> bumpTex, float2 bumpTC)                                           { return GetTexture2D(bumpTex, ssMaterialAnisoHigh, bumpTC).yx; }
+min16float2 GetXYNormalMap(Texture2D<min16float4> bumpTex, SamplerState samplerState, float2 bumpTC)                { return GetTexture2D(bumpTex, samplerState, bumpTC).yx; }
+min16float2 GetXYNormalMapLod(Texture2D<min16float4> bumpTex, SamplerState samplerState, float4 bumpTC)             { return GetTexture2DLod(bumpTex, samplerState, bumpTC).yx; }
+min16float2 GetXYNormalMapGrad(Texture2D<min16float4> bumpTex, float2 bumpTC, float2 ddx_bumpTC, float2 ddy_bumpTC) { return GetTexture2DGrad(bumpTex, ssMaterialAnisoHigh, bumpTC, ddx_bumpTC, ddy_bumpTC).yx; }
+
+min16float3 GetNormalMap(Texture2D<min16float4> bumpTex, float2 bumpTC)
+{
+  min16float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMap(bumpTex, bumpTC.xy);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+min16float3 GetNormalMap(Texture2D<min16float4> bumpTex, SamplerState samplerState, float2 bumpTC)
+{
+  min16float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMap(bumpTex, samplerState, bumpTC.xy);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+min16float3 GetNormalMapLod(Texture2D<min16float4> bumpTex, SamplerState samplerState, float4 bumpTC)
+{
+  min16float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapLod(bumpTex, samplerState, bumpTC);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+
+min16float3 GetNormalMapGrad(Texture2D<min16float4> bumpTex, float2 bumpTC, float2 ddx_bumpTC, float2 ddy_bumpTC)
+{
+  min16float3 bumpNormal;
+
+  bumpNormal.xy = GetXYNormalMapGrad(bumpTex, bumpTC, ddx_bumpTC, ddy_bumpTC);
+  bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+  return bumpNormal;
+}
+#endif
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float  GetAlphaTex(Texture2D<float4> tex, float2 texTC)                                                      { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy).a; }// alpha test value in alpha channel
+float4 GetDiffuseTex(Texture2D<float4> tex, float2 texTC)                                                    { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+float4 GetDiffuseTexGrad(Texture2D<float4> tex, float2 texTC, float2 ddxUV, float2 ddyUV)                    { return GetTexture2DGrad(tex, ssMaterialAnisoHigh, texTC.xy, ddxUV, ddyUV ); }
+float4 GetDiffuseTexLod(Texture2D<float4> tex, float4 texTC)                                                 { return GetTexture2DLod(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+float4 GetDiffuseTexProj(Texture2D<float4> tex, float4 texTC)                                                { return GetTexture2DProj(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+float4 GetDiffuseTexBias(Texture2D<float4> tex, float4 texTC)                                                { return GetTexture2DBias(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+float4 GetDiffuseTexBilinear(Texture2D<float4> tex, float2 texTC)                                            { return GetTexture2D(tex, ssMaterialBilinear, texTC.xy); }
+float4 GetCustomTex(Texture2D<float4> tex, float2 texTC)                                                     { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+float4 GetCustomTexLod(Texture2D<float4> tex, float4 texTC)                                                  { return GetTexture2DLod(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+float4 GetDiffuse2Tex(Texture2D<float4> tex, float2 texTC)                                                   { return GetCustomTex(tex, texTC.xy); }
+float4 GetDiffuse2TexLod(Texture2D<float4> tex, float4 texTC)                                                { return GetCustomTexLod(tex, texTC.xyzw); }
+float4 GetDiffuseDecalTex(Texture2D<float4> tex, float2 texTC)                                               { return GetTexture2D(tex, ssMaterialAnisoHighBorder, texTC.xy); }
+float  GetHeightTex(Texture2D<float4> tex, float2 texTC)                                                     { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).r; }
+float  GetHeightTexLod(Texture2D<float4> tex, float4 texTC)                                                  { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw).r; }
+float4 GetHeight2Tex(Texture2D<float4> tex, float2 texTC)                                                    { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy); }
+float4 GetHeight2TexLod(Texture2D<float4> tex, float4 texTC)                                                 { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw); }
+float4 GetSpecularTex(Texture2D<float4> tex, float2 texTC)                                                   { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+float4 GetSpecularTexLod(Texture2D<float4> tex, float4 texTC)                                                { return GetTexture2DLod(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+float  GetSmoothnessTex(Texture2D<float4> tex, float2 texTC)                                                 { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).r; }
+float  GetSmoothness2Tex(Texture2D<float4> tex, float2 texTC)                                                { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).r; }
+float  GetSmoothness2TexLod(Texture2D<float4> tex, float4 texTC)                                             { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw).r; }
+float4 GetDetailTex(Texture2D<float4> tex, float2 texTC)                                                     { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).garb * 2 - 1; }
+float4 GetDetailTexLod(Texture2D<float4> tex, float4 texTC)                                                  { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw).garb * 2 - 1; }
+float  GetOpacityTex(Texture2D<float4> tex, float2 texTC)                                                    { return GetTexture2D(tex,  ssMaterialTrilinear, texTC.xy).r; }
+float  GetOpacityTexLod(Texture2D<float4> tex, float4 texTC)                                                 { return GetTexture2DLod(tex,  ssMaterialTrilinear, texTC.xyzw).r; }
+float4 GetBlendTex(Texture2D<float4> tex, float2 texTC)                                                      { return GetOpacityTex(tex, texTC.xy).r; }
+float4 GetBlendTexLod(Texture2D<float4> tex, float4 texTC)                                                   { return GetOpacityTexLod(tex, texTC.xyzw).r; }
+float4 GetDecalTex(Texture2D<float4> tex, float2 texTC)                                                      { return GetTexture2D(tex, ssMaterialTrilinearBorder, texTC.xy); }
+float4 GetCustomSecTex(Texture2D<float4> tex, float2 texTC)                                                  { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+float4 GetEmittanceTex(Texture2D<float4> tex, float2 texTC)                                                  { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+float4 GetEnvCubeTex(TextureCube<float4> tex, float3 texTC)                                                  { return GetTextureCube(tex, ssMaterialTrilinearClamp, texTC.xyz); }
+float4 GetEnvCubeTexLod(TextureCube<float4> tex, float4 texTC)                                               { return GetTextureCubeLod(tex, ssMaterialTrilinearClamp, texTC.xyzw); }
+float4 GetSceneTex(Texture2D<float4> tex, float2 texTC)                                                      { return GetTexture2D(tex, ssPointClamp, texTC.xy); }       // TODO: convert to load
+float4 GetSceneTexProj(Texture2D<float4> tex, float4 texTC)                                                  { return GetTexture2DProj(tex, ssPointClamp, texTC.xyzw); } // TODO: convert to load
+float4 GetDissolveTex(Texture2D<float4> tex, float2 texTC)                                                   { return GetTexture2D(tex, ssPointWrap, texTC.xy); }
+float4 GetDissolveTexLod(Texture2D<float4> tex, float4 texTC)                                                { return GetTexture2DLod(tex, ssPointWrap, texTC.xyzw); }
+float4 GetPerlinNoiseTexLod(Texture2D<float4> tex, float4 texTC)                                             { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw); }
+float4 GetTerrainTex(Texture2D<float4> tex, float2 terrainTC)                                                { return GetTexture2D(tex, ssMaterialBilinearClamp, terrainTC) * g_PS_TerrainInfo.x; }
+float3 GetTerrainNormal(Texture2D<float4> tex, float2 terrainTC) 
+{ 
+	float3 terrainNor = GetTexture2D(tex, ssMaterialBilinearClamp, terrainTC).xzy; 
+	terrainNor.xy = (terrainNor.xy - 0.5h) * 2.h; 
+	terrainNor.z = sqrt(saturate(1.02h - (terrainNor.x * terrainNor.x + terrainNor.y * terrainNor.y))); 
+	return terrainNor; 
+}
+float GetTerrainElevation(Texture2D<float4> tex, float2 terrainTC)
+{
+	float4 terrainElev = GetTexture2D(tex, ssMaterialBilinearClamp, terrainTC);
+	return terrainElev.x;
+}
+
+#if FEATURE_RELAXED_PRECISION
+min16float  GetAlphaTex(Texture2D<min16float4> tex, float2 texTC)                                                      { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy).a; }// alpha test value in alpha channel
+min16float4 GetDiffuseTex(Texture2D<min16float4> tex, float2 texTC)                                                    { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+min16float4 GetDiffuseTexGrad(Texture2D<min16float4> tex, float2 texTC, float2 ddxUV, float2 ddyUV)                    { return GetTexture2DGrad(tex, ssMaterialAnisoHigh, texTC.xy, ddxUV, ddyUV ); }
+min16float4 GetDiffuseTexLod(Texture2D<min16float4> tex, float4 texTC)                                                 { return GetTexture2DLod(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+min16float4 GetDiffuseTexProj(Texture2D<min16float4> tex, float4 texTC)                                                { return GetTexture2DProj(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+min16float4 GetDiffuseTexBias(Texture2D<min16float4> tex, float4 texTC)                                                { return GetTexture2DBias(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+min16float4 GetCustomTex(Texture2D<min16float4> tex, float2 texTC)                                                     { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+min16float4 GetCustomTexLod(Texture2D<min16float4> tex, float4 texTC)                                                  { return GetTexture2DLod(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+min16float4 GetDiffuse2Tex(Texture2D<min16float4> tex, float2 texTC)                                                   { return GetCustomTex(tex, texTC.xy); }
+min16float4 GetDiffuse2TexLod(Texture2D<min16float4> tex, float4 texTC)                                                { return GetCustomTexLod(tex, texTC.xyzw); }
+min16float4 GetDiffuseDecalTex(Texture2D<min16float4> tex, float2 texTC)                                               { return GetTexture2D(tex, ssMaterialAnisoHighBorder, texTC.xy); }
+min16float  GetHeightTex(Texture2D<min16float4> tex, float2 texTC)                                                     { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy); }
+min16float  GetHeightTexLod(Texture2D<min16float4> tex, float4 texTC)                                                  { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw); }
+min16float4 GetHeight2Tex(Texture2D<min16float4> tex, float2 texTC)                                                    { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy); }
+min16float4 GetHeight2TexLod(Texture2D<min16float4> tex, float4 texTC)                                                 { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw); }
+min16float4 GetSpecularTex(Texture2D<min16float4> tex, float2 texTC)                                                   { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+min16float4 GetSpecularTexLod(Texture2D<min16float4> tex, float4 texTC)                                                { return GetTexture2DLod(tex, ssMaterialAnisoHigh, texTC.xyzw); }
+min16float  GetSmoothnessTex(Texture2D<min16float4> tex, float2 texTC)                                                 { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).r; }
+min16float  GetSmoothness2Tex(Texture2D<min16float4> tex, float2 texTC)                                                { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).r; }
+min16float  GetSmoothness2TexLod(Texture2D<min16float4> tex, float4 texTC)                                             { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw).r; }
+min16float4 GetDetailTex(Texture2D<min16float4> tex, float2 texTC)                                                     { return GetTexture2D(tex, ssMaterialTrilinear, texTC.xy).garb * 2 - 1; }
+min16float4 GetDetailTexLod(Texture2D<min16float4> tex, float4 texTC)                                                  { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw).garb * 2 - 1; }
+min16float  GetOpacityTex(Texture2D<min16float4> tex, float2 texTC)                                                    { return GetTexture2D(tex,  ssMaterialTrilinear, texTC.xy); }
+min16float  GetOpacityTexLod(Texture2D<min16float4> tex, float4 texTC)                                                 { return GetTexture2DLod(tex,  ssMaterialTrilinear, texTC.xyzw); }
+min16float4 GetBlendTex(Texture2D<min16float4> tex, float2 texTC)                                                      { return GetOpacityTex(tex, texTC.xy); }
+min16float4 GetBlendTexLod(Texture2D<min16float4> tex, float4 texTC)                                                   { return GetOpacityTexLod(tex, texTC.xyzw); }
+min16float4 GetDecalTex(Texture2D<min16float4> tex, float2 texTC)                                                      { return GetTexture2D(tex, ssMaterialTrilinearBorder, texTC.xy); }
+min16float4 GetCustomSecTex(Texture2D<min16float4> tex, float2 texTC)                                                  { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+min16float4 GetEmittanceTex(Texture2D<min16float4> tex, float2 texTC)                                                  { return GetTexture2D(tex, ssMaterialAnisoHigh, texTC.xy); }
+min16float4 GetEnvCubeTex(TextureCube<min16float4> tex, float3 texTC)                                                  { return GetTextureCube(tex, ssMaterialTrilinearClamp, texTC.xyz); }
+min16float4 GetEnvCubeTexLod(TextureCube<min16float4> tex, float4 texTC)                                               { return GetTextureCubeLod(tex, ssMaterialTrilinearClamp, texTC.xyzw); }
+min16float4 GetSceneTex(Texture2D<min16float4> tex, float2 texTC)                                                      { return GetTexture2D(tex, ssPointClamp, texTC.xy); }       // TODO: convert to load
+min16float4 GetSceneTexProj(Texture2D<min16float4> tex, float4 texTC)                                                  { return GetTexture2DProj(tex, ssPointClamp, texTC.xyzw); } // TODO: convert to load
+min16float4 GetDissolveTex(Texture2D<min16float4> tex, float2 texTC)                                                   { return GetTexture2D(tex, ssPointWrap, texTC.xy); }
+min16float4 GetDissolveTexLod(Texture2D<min16float4> tex, float4 texTC)                                                { return GetTexture2DLod(tex, ssPointWrap, texTC.xyzw); }
+min16float4 GetPerlinNoiseTexLod(Texture2D<min16float4> tex, float4 texTC)                                             { return GetTexture2DLod(tex, ssMaterialTrilinear, texTC.xyzw); }
+min16float4 GetTerrainTex(Texture2D<min16float4> tex, float2 terrainTC)                                                { return GetTexture2D(tex, ssMaterialBilinearClamp, terrainTC) * g_PS_TerrainInfo.x; }
+min16float3 GetTerrainNormal(Texture2D<min16float4> tex, float2 terrainTC) 
+{ 
+	float3 terrainNor = GetTexture2D(tex, ssMaterialBilinearClamp, terrainTC).xzy; 
+	terrainNor.xy = (terrainNor.xy - 0.5h) * 2.h; 
+	terrainNor.z = sqrt(saturate(1.02h - (terrainNor.x * terrainNor.x + terrainNor.y * terrainNor.y))); 
+	return terrainNor; 
+}
+min16float GetTerrainElevation(Texture2D<min16float4> tex, float2 terrainTC)
+{
+	float4 terrainElev = GetTexture2D(tex, ssMaterialBilinearClamp, terrainTC);
+	return terrainElev.x;
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Depth
+
+// There is no float4 depth texture anymore, but a lot of shaders bind the linear R32F texture as float4 regardless,
+// so we need to keep the float4 overloads until we clean those up.
+
+#define USE_DEVICE_DEPTH
+
+float GetDeviceDepth(Texture2D<float4> depthTexture, float2 ScreenTC)
+{
+	int3 vPixCoord = int3(ScreenTC * PS_ScreenSize.xy, 0);
+	return depthTexture.Load(vPixCoord).x;
+}
+
+// Overload for min/max texture
+float GetLinearDepth(Texture2D<float2> depthTexture, int2 vPixCoord, bool bScaled = false)
+{
+    float fDepth = depthTexture.Load(int3(vPixCoord, 0)).x;
+    return GetLinearDepth(fDepth, bScaled);
+}
+
+// Overload for med texture
+float GetLinearDepth(Texture2D<float> depthTexture, int2 vPixCoord, bool bScaled = false)
+{
+    float fDepth = depthTexture.Load(int3(vPixCoord, 0));
+    return GetLinearDepth(fDepth, bScaled);
+}
+
+float GetLinearDepth(Texture2D<float4> depthTexture, int2 vPixCoord, bool bScaled = false)
+{
+	float fDepth = depthTexture.Load(int3(vPixCoord, 0)).x;
+	return GetLinearDepth(fDepth, bScaled);
+}
+
+float GetLinearDepth(Texture2D<float4> depthTexture, float2 ScreenTC, bool bScaled = false)
+{
+	int2 vPixCoord = int2(ScreenTC * PS_ScreenSize.xy);
+	return GetLinearDepth(depthTexture, vPixCoord, bScaled);
+}
+
+float GetLinearDepthUnclamped(Texture2D<float4> depthTexture, float2 ScreenTC, bool bScaled = false)
+{
+	int3 vPixCoord = int3(max(min(ScreenTC * PS_ScreenSize.xy, PS_ScreenSize.xy - float2(1.0f, 1.0f)), float2(0.0f, 0.0f)), 0);
+	float fDepth = depthTexture.Load(vPixCoord).x;
+	return GetLinearDepth(fDepth, bScaled);
+}
+
+float GetLinearDepthProj(Texture2D<float4> sceneLinearDepthTex, float4 ProjTC)
+{
+ 	return GetLinearDepth(sceneLinearDepthTex, ProjTC.xy / ProjTC.w);
+}
+
+float GetLinearDepthScaled(Texture2D<float4> texDepth, float2 ScreenTC)
+{
+	return GetLinearDepth(texDepth, ScreenTC, true);
+}
+
+float GetLinearDepthScaledUnclamped(Texture2D<float4> texDepth, float2 ScreenTC)
+{
+	return GetLinearDepthUnclamped(texDepth, ScreenTC, true);
+}
+
+float GetLinearDepthScaledProj(Texture2D<float4> sceneLinearDepthTex, float4 ProjTC)
+{
+ 	return GetLinearDepth(sceneLinearDepthTex, ProjTC.xy / ProjTC.w, true);
+}
+
+#if FEATURE_RELAXED_PRECISION
+
+min16float GetDeviceDepth(sampler2D depthSampler, float2 ScreenTC)
+{
+	return GetTexture2D(depthSampler, ScreenTC.xy).x;
+}
+
+min16float GetDeviceDepth(Texture2D<min16float4> depthTexture, float2 ScreenTC)
+{
+	int3 vPixCoord = int3(ScreenTC * PS_ScreenSize.xy, 0);
+	return depthTexture.Load(vPixCoord).x;
+}
+
+min16float GetLinearDepth(Texture2D<min16float4> depthTexture, int2 vPixCoord, bool bScaled = false)
+{
+	float fDepth = depthTexture.Load(int3(vPixCoord, 0)).x;
+	return GetLinearDepth(fDepth, bScaled);
+}
+
+min16float GetLinearDepth(Texture2D<min16float4> depthTexture, float2 ScreenTC, bool bScaled = false)
+{
+	int2 vPixCoord = int2(ScreenTC * PS_ScreenSize.xy);
+	return GetLinearDepth(depthTexture, vPixCoord, bScaled);
+}
+
+min16float GetLinearDepthUnclamped(Texture2D<min16float4> depthTexture, float2 ScreenTC, bool bScaled = false)
+{
+	int3 vPixCoord = int3(max(min(ScreenTC * PS_ScreenSize.xy, PS_ScreenSize.xy - float2(1.0f, 1.0f)), float2(0.0f, 0.0f)), 0);
+	float fDepth = depthTexture.Load(vPixCoord).x;
+	return GetLinearDepth(fDepth, bScaled);
+}
+
+min16float GetLinearDepthProj(Texture2D<min16float4> sceneLinearDepthTex, float4 ProjTC)
+{
+ 	return GetLinearDepth(sceneLinearDepthTex, ProjTC.xy / ProjTC.w);
+}
+
+min16float GetLinearDepthScaled(Texture2D<min16float4> texDepth, float2 ScreenTC)
+{
+	return GetLinearDepth(texDepth, ScreenTC, true);
+}
+
+min16float GetLinearDepthScaledUnclamped(Texture2D<min16float4> texDepth, float2 ScreenTC)
+{
+	return GetLinearDepthUnclamped(texDepth, ScreenTC, true);
+}
+
+min16float GetLinearDepthScaledProj(Texture2D<min16float4> sceneLinearDepthTex, float4 ProjTC)
+{
+ 	return GetLinearDepth(sceneLinearDepthTex, ProjTC.xy / ProjTC.w, true);
+}
+#endif
+

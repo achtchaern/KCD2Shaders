@@ -1,0 +1,49 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-06-19
+
+//=========================================================================
+// hsv transformation of RGB color (http://beesbuzz.biz/code/hsv_color_transforms.php)
+//=========================================================================
+half3 TransformHSV(
+	in half3 color,		// color to transform
+	float H,					// hue shift (in degrees)
+	float S,					// saturation multiplier (scalar)
+	float V						// value multiplier (scalar)
+)
+{
+	float VSU = V*S*cos(H*PI/180);
+	float VSW = V*S*sin(H*PI/180);
+
+	half3 ret;
+	ret.r = (.299*V+.701*VSU+.168*VSW)*color.r
+		+ (.587*V-.587*VSU+.330*VSW)*color.g
+		+ (.114*V-.114*VSU-.497*VSW)*color.b;
+	ret.g = (.299*V-.299*VSU-.328*VSW)*color.r
+		+ (.587*V+.413*VSU+.035*VSW)*color.g
+		+ (.114*V-.114*VSU+.292*VSW)*color.b;
+	ret.b = (.299*V-.3*VSU+1.25*VSW)*color.r
+		+ (.587*V-.588*VSU-1.05*VSW)*color.g
+		+ (.114*V+.886*VSU-.203*VSW)*color.b;
+	return saturate(ret); //avoid results out of range!
+}
+
+//=========================================================================
+half GetLayerBlendingValueMap(in half blendMap, in half blendFactor, in half blendFalloff)
+{
+	half blendFac = blendMap * (1 + abs(blendFactor));
+	blendFac = saturate(pow(blendFac, blendFalloff));
+
+	// WH GM: Mask can be inverted by setting BlendFactor to negative
+	return blendFactor < 0 ? 1 - blendFac : blendFac;
+}
+
+//=========================================================================
+half3 GetNormalMapAtlas(Texture2DArray bumpTex, float3 bumpTC)
+{
+	half3 bumpNormal;
+
+	bumpNormal.xy = bumpTex.Sample(ssMaterialTrilinear, bumpTC).yx;
+	bumpNormal.z = sqrt(saturate(1.h + dot(bumpNormal.xy, -bumpNormal.xy)));
+
+	return bumpNormal;
+}

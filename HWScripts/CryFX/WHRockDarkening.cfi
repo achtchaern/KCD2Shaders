@@ -1,0 +1,64 @@
+// Copyright (c) 2021 WarhorseStudios
+// author: Lukas Hosek
+
+#if ROCK_DARKENING
+
+half RockDarkeningThreshold
+<
+  register = REG_PM_PARAM_12.x;
+  string UIName = "RockDarkeningThreshold";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.01;
+> = 0.0;
+
+half RockDarkeningStrength
+<
+  register = REG_PM_PARAM_12.y;
+  string UIName = "RockDarkeningStrength";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 10.0;
+  float UIStep = 0.01;
+> = 0.0;
+
+half RockDarkeningSoftEdge
+<
+  register = REG_PM_PARAM_12.z;
+  string UIName = "RockDarkeningSoftEdge";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.01;
+> = 0.0;
+
+half RockDarkeningPrePostDetail
+<
+  register = REG_PM_PARAM_12.w;
+  string UIHelp = "Set 0 to apply post detail (old), 1 to apply pre detail";
+  string UIName = "RockDarkeningPrePostDetail";
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1.0;
+  float UIStep = 0.01;
+> = 1.0;
+
+// we apply darkening in two phases: 1/ pre detail map, 2/ post detailmap,
+// prePostDetail controlls in which phase we are calling this function
+void ApplyRockDarkening(inout half3 cAlbedo, half prePostDetail)
+{
+	half threshold = RockDarkeningThreshold;
+	half darkening = RockDarkeningStrength;
+	half softEdge = RockDarkeningSoftEdge;
+	half strength = abs(RockDarkeningPrePostDetail - prePostDetail);
+
+	half luminance = GetLuminance(cAlbedo);
+	if (luminance > threshold)
+	{
+		half  darkingCurve = smoothstep(threshold, saturate(threshold + softEdge ),luminance );
+		darkingCurve = 1 - darkingCurve * darkening * strength;
+		cAlbedo = cAlbedo *  darkingCurve;
+	}
+}
+#endif

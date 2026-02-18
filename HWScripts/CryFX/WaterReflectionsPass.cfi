@@ -1,0 +1,224 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Reflection.cfi"
+
+// Adapted from DeferredShading.cfx SSRefl - todo: generalize for plane
+// WH[TBa]: merged CL 2663468, removed view id 
+SsrTraceResult ReflectionPassPS( v2f_hs IN, min16float3 normal, float smoothness)
+{
+
+#if %SSREFL
+	{
+		const float3 positionWS = IN.vPosWS.xyz;
+
+		SPerPassWaterParams perPassParams = GetPerPassWaterParams();
+		SsrTraceParams params = (SsrTraceParams)0;
+
+		params.pixelCoordinates = IN.Position.xy;
+		params.viewVec = normalize(positionWS - g_VS_WorldViewPos);
+		params.linearDepth = IN.screenProj.w * CV_NearFarClipDist.w;
+		params.positionWS = positionWS;
+		params.maxLum = 10000.0f;
+		params.normalWorld = normal;
+		params.smoothness = smoothness;
+		params.reprojectToPrev = perPassParams.reprojectToPrev;
+		params.usingMirrorXSampler = true;
+		params.noiseAnimationOffset = perPassParams.ssrParams0.z;
+		params.maxDistance = perPassParams.ssrParams0.x;
+		params.maxSamples = perPassParams.ssrParams0.y;
+		params.borderSize = max(float2(0, ssrBorderSizeY), G_EPSILON);
+		params.backgroundReflectionMultiplierWH = perPassParams.backgroundReflectionMultiplierWH;
+
+		SsrTraceResult ssrResult = SSRRaytrace
+		(
+			SSRRay_LinDepthScMinMax,
+
+			refractionHalfResTex,
+			refractionHalfResTex,
+			ssLinearMirrorX,
+
+			reflectionPrevTex,
+			ssLinearMirrorX,
+
+			params
+		);
+
+		return ssrResult;
+	}
+#else
+	const SsrTraceResult emptyResult = (SsrTraceResult)0;
+	return emptyResult;
+#endif
+}
+
+pixout WaterReflPS(v2f_hs IN)
+{
+	pixout OUT = (pixout) 1;
+	
+	SVolumetricFogParams volFogParams = GetVolumetricFogParams();
+	VolumetricFogSampling vfs = GetVolumetricFogSampling();
+
+	const float fDepth = IN.screenProj.w * CV_NearFarClipDist.w;
+	float2 linearUV = IN.screenProj.xy / IN.screenProj.w;
+	float2 screenTC = MapViewportToRaster(linearUV);
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	float fDepthCenter = SSRRay_LinDepthScMinMax.Load(int3(IN.Position.xy, 0)).x;
+
+	clip( fDepthCenter - fDepth );
+
+	min16float3 vView = normalize(IN.vView.xyz);
+
+#if 0
+	// Generate normal map from 4 normal map layers + paralax
+	float2 vParalaxOffset = GetParalaxOffset( IN, vView );  
+	min16float  cSmoothness = (min16float)  1;
+	min16float4 cDiffuseMap = (min16float4) 1;
+	min16float3 vNormal = BumpGen( IN, vParalaxOffset, cSmoothness, cDiffuseMap);
+#else
+	min16float  cSmoothness = 1;
+	min16float4 cDiffuseMap = (min16float4) 1;
+	min16float3 vNormal = min16float3(0, 0, 1); // TODO: flip normal when under water (see BOT/TOP clipping above)
+#endif
+
+	min16float fNdotE =  (dot( vView.xyz, vNormal ) ) * IN.vView.w;
+
+	//////////////////////////////////////////////////////////////////////////////////////////////////    
+	// Get reflection color
+	const min16float ReflectionBumpScale = NormalsFlatten;
+	
+	min16float3 vDir = g_VS_WorldViewPos - IN.vPosWS.xyz;
+	min16float3 vReflN = lerp(min16float3(0,0,1), vNormal, ReflectionBumpScale);
+	min16float3 vRefl = reflect(vDir, vReflN);
+	min16float3 vReflNorm = normalize( vRefl );
+	
+	// Blend in screenspace reflections
+	// WH[TBa]: merged CL 2663468, removed view id
+	const float smoothness = 1;
+	SsrTraceResult ssrResult = ReflectionPassPS(IN, vReflN.xyz, smoothness);
+	min16float3 reflectColor = ssrResult.color.rgb / PS_HDR_RANGE_ADAPT_MAX;
+
+	// Blend in cubemap
+	if (ssrResult.color.a != 1.0f)
+	{
+		const min16float3 cubemapReflection = GatherCubemapSpecular(screenTC, IN.vPosWS.xyz - GetWorldViewPos(), vNormal, cSmoothness);
+		reflectColor = lerp(cubemapReflection, reflectColor, ssrResult.color.a);
+	}
+
+	// NOTE: This takes out the whole fog from the reflection, but
+	// we don't put back the fog along the two rays, just to the part
+	// until hitting the reflector, the path from reflector to hit has
+	// not precalculated fog-information available
+	// TODO: remove the fraction of the fog which corresponds to
+	// length(reflector_to_hit) / length(camera_to_hit)
+#if %_RT_FOG && %_RT_VOLUMETRIC_FOG
+	min16float3 fogColor = 0;
+	float len = length(IN.vView.xyz);
+	VolumetricFogTexcoord vtc = GetVolumetricFogTexcoordParamByScreenProj(volFogParams, IN.screenProj, false, len);
+	float4 vf = GetVolumetricFogValueJittered(volFogParams, vfs, vtc).xyzw;
+	min16float4 globalFogColor = GetVolumetricFogAnalyticalColor( volFogParams, vfs, -IN.vView.xyz, len );
+	ApplyVolumetricFog(volFogParams, vf, globalFogColor, vtc, fogColor.xyz);
+
+	// subtract fog color from refract color.
+	min16float3 reflectColorWithFog = reflectColor;
+	reflectColor -= fogColor;
+#endif
+
+#if %SSREFL
+	// Temporal filter when using SSR. Kept inside same shader to avoid additional cost of fullscreen pass.
+	{
+		const SPerPassWaterParams perPassWaterParams = GetPerPassWaterParams();
+
+		// Quad reads are used for cheap access to color neighborhood information.
+		// Not a lot of data, but good enough for reflections.
+		// Reads need to be kept inside uniform control flow, otherwise results can be undefined.
+		const float3 colorNeighborX = QuadReadAcrossX(reflectColor.rgb);
+		const float3 colorNeighborY = QuadReadAcrossY(reflectColor.rgb);
+		const float3 colorNeighborD = QuadReadAcrossDiagonal(reflectColor.rgb);
+
+		const float2 screenSizeRcp = perPassWaterParams.ssrParams1.zw;
+		const float2 screenTC = IN.Position.xy * screenSizeRcp;
+
+		// Reprojection uses reflection hit depth for correct parallax.
+		// See "Stochastic Screen-Space Reflections", Stachowiak 2015, page 67.
+		const float deviceDepth = g_PS_ProjRatio.y / ssrResult.hitDepth + g_PS_ProjRatio.x; // WH[TBa]: merged CL 2663468, removed view id
+
+		const float4 projectedHit = float4(screenTC, deviceDepth, 1);
+		const float4 reprojectedHit = mul(projectedHit, perPassWaterParams.reprojectToPrev);
+		const float2 reprojectedScreenTC = reprojectedHit.xy / reprojectedHit.w;
+		const bool isHistoryOnScreen = all(reprojectedScreenTC >= 0) && all(reprojectedScreenTC <= 1);
+
+		if (isHistoryOnScreen)
+		{
+			const float2 screenSize = perPassWaterParams.ssrParams1.xy;
+			const float2 reprojectedCoordinate = reprojectedScreenTC * screenSize - 0.5;
+			const int2 reprojectedCoordinateFloored = int2(reprojectedCoordinate);
+			const float2 fraction = reprojectedCoordinate - reprojectedCoordinateFloored;
+
+			float4 historyBL;
+			float4 historyBR;
+			float4 historyTL;
+			float4 historyTR;
+
+			// Not all pixels contain valid information.
+			// Invalid pixels are cleared to black.
+			// Do manual bilinear interpolation and filter out invalid pixels to avoid thin black lines in reflection.
+			historyBL.rgb = reflectionPrevResultTex.Load(int3(reprojectedCoordinateFloored + int2(0, 0), 0)).rgb;
+			historyBR.rgb = reflectionPrevResultTex.Load(int3(reprojectedCoordinateFloored + int2(1, 0), 0)).rgb;
+			historyTL.rgb = reflectionPrevResultTex.Load(int3(reprojectedCoordinateFloored + int2(0, 1), 0)).rgb;
+			historyTR.rgb = reflectionPrevResultTex.Load(int3(reprojectedCoordinateFloored + int2(1, 1), 0)).rgb;
+
+			historyTL.a = any(historyTL.rgb > 0);
+			historyTR.a = any(historyTR.rgb > 0);
+			historyBL.a = any(historyBL.rgb > 0);
+			historyBR.a = any(historyBR.rgb > 0);
+
+			const float4 interpolated = lerp(
+				lerp(historyBL, historyBR, fraction.x),
+				lerp(historyTL, historyTR, fraction.x),
+				fraction.y);
+
+			const bool isHistoryValid = any(interpolated.a > G_EPSILON);
+			const float3 history = isHistoryValid ? interpolated.rgb * rcp(interpolated.a) : 0;
+
+			// Basic temporal smoothing using neighborhood clamping and exponential history buffer.
+			// For more info on this topic see "A Survey of Temporal Antialiasing Techniques", Yang 2020.
+			if (isHistoryValid)
+			{
+				const float3 colorMin = min(reflectColor.rgb, min(colorNeighborX, min(colorNeighborY, colorNeighborD)));
+				const float3 colorMax = max(reflectColor.rgb, max(colorNeighborX, max(colorNeighborY, colorNeighborD)));
+
+				const float3 historyClamped = clamp(history, colorMin, colorMax);
+
+				const float historyFactor = 0.9;
+				reflectColor.rgb = lerp(reflectColor.rgb, historyClamped, historyFactor);
+			}
+		}
+	}
+#endif
+
+	OUT.Color.rgb = reflectColor;
+
+	return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique WaterReflPass
+{
+	pass p0
+	{
+		ZEnable = false; // todo use downscaled depth target for zculling
+		ZFunc = LEqual;
+		CullMode = None;
+		ZWriteEnable = false;
+		IgnoreMaterialState = true;
+
+		VertexShader = WaterVS() WaterSurfaceVS;
+#if %WATER_TESSELLATION_DX11
+		HullShader   = WaterHS() WaterSurfaceHS;
+		DomainShader = WaterReflDS() WaterSurfaceDS;
+#endif
+
+		PixelShader = WaterReflPS() WaterSurfacePS;
+	}
+}

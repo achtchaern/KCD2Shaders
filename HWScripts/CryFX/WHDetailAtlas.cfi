@@ -1,0 +1,19 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-07-17
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-7090
+
+#if %DETAIL_ATLAS
+
+//=========================================================================
+Texture2DArray<float4> DetailAtlasTex									: register(t53) = TS_DetailAtlas;
+
+//=========================================================================
+half4 GetDetailAtlasTex(Texture2D detailTex, float2 detailTC, float2 baseTC)
+{
+	float index = detailTex.Sample(ssPointWrap, baseTC).r * 32; // 32 layers in the DetailAtlas
+	half4 ret = DetailAtlasTex.Sample(ssMaterialTrilinear, float3(detailTC, index)).garb * 2 - 1;
+	return ret;
+}
+
+#endif

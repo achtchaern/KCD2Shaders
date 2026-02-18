@@ -1,0 +1,141 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+//////////////////////////////////////////////////////////////////////////
+// TODO: remove after old graphics pipeline is removed.
+
+#include "ModificatorVT.cfi"
+
+//////////////////////////////////////////////////////////////////////////
+// per pass textures
+
+Texture2D<float4> SkyDome_Tex             : register(t0);   // Longitude/Latitude
+TextureCube<float4> SkyDome_Cube          : register(t0);   // Cube-map
+Texture2D<float4> SkyDome_Moon            : register(t3);
+SamplerState SkyDome_TexSS                : register(s0);   // LinearClamp
+
+Texture2D<float4> SkyDome_Mie             : register(t1);
+Texture2D<float4> SkyDome_Rayleigh        : register(t2);
+SamplerState SkyDome_ScatSS               : register(s1);   // samplerStateLinearWrapU
+
+//////////////////////////////////////////////////////////////////////////
+// Per draw constant buffer for water volume and water fog volume.
+
+struct SSkyParams
+{
+	float4x4 WorldMatrix;
+	
+	float3 PartialMieInScatteringConst;
+	float3 PartialRayleighInScatteringConst;
+	float3 SunDirection;
+	float3 PhaseFunctionConstants;
+
+	float3 NightSkyColBase;
+	float3 NightSkyColDelta;
+	float2 NightSkyZenithColShift;
+
+	float4 NightMoonDirSize;
+	float3 NightMoonTexGenRight;
+	float3 NightMoonTexGenUp;
+	float3 NightMoonColor;
+	float4 NightMoonInnerCoronaColorScale;
+	float4 NightMoonOuterCoronaColorScale;
+
+	float4 StarSize;
+	float  StarIntensity;
+	
+	float4 SkyBoxParams;   // x: angle, y: stretching, z: multiplier
+	float4 SkyBoxExposure; // rgb: exposure color, a: exposure strength
+	float4 SkyBoxOpacity;  // rgb: opacity filter, a: opacity strength
+};
+
+cbuffer CBSky : register(b1)
+{
+	struct
+	{
+		float4x4 WorldMatrix;
+	
+		float3 PartialMieInScatteringConst;
+		float3 PartialRayleighInScatteringConst;
+		float3 SunDirection;
+		float3 PhaseFunctionConstants;
+
+		float3 NightSkyColBase;
+		float3 NightSkyColDelta;
+		float2 NightSkyZenithColShift;
+
+		float4 NightMoonDirSize;
+		float3 NightMoonTexGenRight;
+		float3 NightMoonTexGenUp;
+		float3 NightMoonColor;
+		float  StarIntensity;
+		float4 NightMoonInnerCoronaColorScale;
+		float4 NightMoonOuterCoronaColorScale;
+
+		float4 StarSize;
+		float4x4 StarRotation;
+	
+		float4 SkyBoxParams;
+		float4 SkyBoxExposure;
+		float4 SkyBoxOpacity;
+	} cbSky;
+};
+
+SSkyParams GetSkyParams()
+{
+	SSkyParams params;
+
+#if %_RT_COMPUTE_SKINNING
+	params.WorldMatrix                      = cbSky.WorldMatrix;
+	
+	params.PartialMieInScatteringConst      = cbSky.PartialMieInScatteringConst;
+	params.PartialRayleighInScatteringConst = cbSky.PartialRayleighInScatteringConst;
+	params.SunDirection                     = cbSky.SunDirection;
+	params.PhaseFunctionConstants           = cbSky.PhaseFunctionConstants;
+
+	params.NightSkyColBase                  = cbSky.NightSkyColBase;
+	params.NightSkyColDelta                 = cbSky.NightSkyColDelta;
+	params.NightSkyZenithColShift           = cbSky.NightSkyZenithColShift;
+
+	params.NightMoonDirSize                 = cbSky.NightMoonDirSize;
+	params.NightMoonTexGenRight             = cbSky.NightMoonTexGenRight;
+	params.NightMoonTexGenUp                = cbSky.NightMoonTexGenUp;
+	params.NightMoonColor                   = cbSky.NightMoonColor;
+	params.NightMoonInnerCoronaColorScale   = cbSky.NightMoonInnerCoronaColorScale;
+	params.NightMoonOuterCoronaColorScale   = cbSky.NightMoonOuterCoronaColorScale;
+	
+	params.StarSize                         = cbSky.StarSize;
+	params.StarIntensity                    = cbSky.StarIntensity;
+	
+	params.SkyBoxParams                     = cbSky.SkyBoxParams;
+	params.SkyBoxExposure                   = cbSky.SkyBoxExposure;
+	params.SkyBoxOpacity                    = cbSky.SkyBoxOpacity;
+#else
+	params.WorldMatrix                      = float4x4(Get_SPI_ObjWorldMat(0), float4(0.0f, 0.0f, 0.0f, 1.0f));
+
+	params.PartialMieInScatteringConst      = cbSky.PartialMieInScatteringConst;
+	params.PartialRayleighInScatteringConst = cbSky.PartialRayleighInScatteringConst;
+	params.SunDirection                     = cbSky.SunDirection;
+	params.PhaseFunctionConstants           = cbSky.PhaseFunctionConstants;
+
+	params.NightSkyColBase                  = cbSky.NightSkyColBase;
+	params.NightSkyColDelta                 = cbSky.NightSkyColDelta;
+	params.NightSkyZenithColShift           = cbSky.NightSkyZenithColShift;
+
+	params.NightMoonDirSize                 = cbSky.NightMoonDirSize;
+	params.NightMoonTexGenRight             = cbSky.NightMoonTexGenRight;
+	params.NightMoonTexGenUp                = cbSky.NightMoonTexGenUp;
+	params.NightMoonColor                   = cbSky.NightMoonColor;
+	params.NightMoonInnerCoronaColorScale   = cbSky.NightMoonInnerCoronaColorScale;
+	params.NightMoonOuterCoronaColorScale   = cbSky.NightMoonOuterCoronaColorScale;
+	
+	params.StarSize                         = cbSky.StarSize;
+	params.StarIntensity                    = cbSky.StarIntensity;
+	
+	params.SkyBoxParams                     = cbSky.SkyBoxParams;
+	params.SkyBoxExposure                   = cbSky.SkyBoxExposure;
+	params.SkyBoxOpacity                    = cbSky.SkyBoxOpacity;
+#endif
+
+	return params;
+}

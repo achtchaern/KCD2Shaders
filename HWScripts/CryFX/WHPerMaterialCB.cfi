@@ -1,0 +1,17 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+#if DECAL_ATLAS
+cbuffer CBPerMaterialWH : register(b12)
+{
+	struct
+	{
+		float3 uvTransformRow0;
+		int textureId;
+		float3 uvTransformRow1;
+		int padding;
+		float2 normalsFixRow0;
+		float2 normalsFixRow1;
+	} UVDecalBuffer[DECAL_ATLAS_SIZE];
+};
+#endif //DECAL_ATLAS

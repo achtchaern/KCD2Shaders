@@ -1,0 +1,1052 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+cbuffer CBFogParams : register(b8)
+{
+    struct
+    {
+        float4 Params;
+        float4 RampParams;
+        float4 SunDir;
+        float4 ColGradBase;
+        float4 ColGradDelta;
+        float4 ColGradParams;
+        float4 ColGradRadial;
+    } cbFogParams;
+};
+
+////////////////////////////////////////////////////////////////////////////
+// Shared constant buffer
+////////////////////////////////////////////////////////////////////////////
+cbuffer CBCommon : register(b10)
+{
+    struct
+    {
+        float4   FrustumTL;
+        float4   FrustumTR;
+        float4   FrustumBL;
+        float4   VolBufSize;
+        float4   VolBufInfo;
+        float4   InscatteringBufSize;
+        float4   InscatteringBufInfo;
+        float4   DepthBufSize;
+        float4   DepthBufInfo;
+        float4   ProjParams;
+        float4x4 PrevViewProjMatrix;
+        float4   InjectInscatteringParams;
+        float4   InjectDensityParams;
+        float4   SunColour;
+        float4   ExponentialHeightFogColor;
+    } cbCommon;
+};
+
+////////////////////////////////////////////////////////////////////////////
+// Dispatch constant buffer
+////////////////////////////////////////////////////////////////////////////
+cbuffer CBDispatch : register(b11)
+{
+    struct
+    {
+        float4 DispatchSize;
+    } cbDispatch;
+};
+
+struct SFogParams
+{
+	float3 viewPos; // PB_CameraPos
+
+	// PB_VolumetricFogParams
+	min16float  heightDensityScale;
+	min16float  heightDensityAtBaseHeight;
+	min16float  heightDiffFromBase;
+    min16float expHeightDiffFromBase;
+
+	// PB_VolumetricFogRampParams
+    min16float4 rampParams;
+
+	// PB_VolumetricFogSunDir
+    min16float3 sunDir;
+    min16float densityClamp;
+
+	// PB_FogColGradColBase
+    min16float3 colGradBase;
+
+	// PB_FogColGradColDelta
+    min16float3 colGradDelta;
+
+	// PB_FogColGradParams
+	min16float heightColGradScale;
+	min16float heightColGradOffset;
+	min16float radialSizeCtrl;
+	min16float radialLobeCtrl;
+
+	// PB_FogColGradRadial
+    min16float3 radialColor;
+    min16float invZFar;
+};
+
+////////////////////////////////////////////////////////////////////////////
+SFogParams GetFogParamsInternal()
+{
+	SFogParams params;
+
+	params.viewPos.xyz               = GetWorldViewPos();
+
+	params.heightDensityScale        = cbFogParams.Params.x;
+	params.heightDensityAtBaseHeight = cbFogParams.Params.y;
+	params.heightDiffFromBase        = cbFogParams.Params.z;
+	params.expHeightDiffFromBase     = cbFogParams.Params.w;
+
+	params.rampParams                = cbFogParams.RampParams;
+
+	params.sunDir                    = cbFogParams.SunDir.xyz;
+	params.densityClamp              = cbFogParams.SunDir.w;
+
+	params.colGradBase               = cbFogParams.ColGradBase.xyz;
+
+	params.colGradDelta              = cbFogParams.ColGradDelta.xyz;
+
+	params.heightColGradScale        = cbFogParams.ColGradParams.x;
+	params.heightColGradOffset       = cbFogParams.ColGradParams.y;
+	params.radialSizeCtrl            = cbFogParams.ColGradParams.z;
+	params.radialLobeCtrl            = cbFogParams.ColGradParams.w;
+
+	params.radialColor               = cbFogParams.ColGradRadial.xyz;
+	params.invZFar                   = cbFogParams.ColGradRadial.w;
+
+	return params;
+}
+
+////////////////////////////////////////////////////////////////////////////
+// impl
+
+min16float ComputeVolumetricFogInternal(in float3 cameraToWorldPos, in SFogParams fogParams)
+{
+    min16float fogInt = 1.0;
+
+    const min16float t = fogParams.heightDensityScale * cameraToWorldPos.z;
+	if (abs(t) > 0.01)
+	{
+		// Subtraction of extreme range difference such as (exp(t) - 1) causes a fog glich, it should be kept appropriate range.
+		// NOTE: fogInt *= ((exp(t) - 1.0) / t) * exp(heightDiffFromBase) causes a fog glich.
+		fogInt *= (exp(t + fogParams.heightDiffFromBase) - fogParams.expHeightDiffFromBase) / t;
+	}
+	else
+	{
+		fogInt *= fogParams.expHeightDiffFromBase;
+	}
+
+	// NOTE: heightDensityAtBaseHeight = log2(e) * fogDensity * exp(heightDensityScale * CV_WorldViewPos.z + heightOffset) / exp(heightDiffFromBase);
+    const min16float l = length(cameraToWorldPos);
+    const min16float u = l * fogParams.heightDensityAtBaseHeight;
+	fogInt *= u;
+
+    min16float f = saturate(exp2(-fogInt));
+
+	min16float r = saturate(l * fogParams.rampParams.x + fogParams.rampParams.y);
+	r = r * (2 - r);
+	r = r * fogParams.rampParams.z + fogParams.rampParams.w;
+
+    f = (min16float(1) - f) * r;
+    return max(min16float(1) - f, min16float(fogParams.densityClamp));
+}
+
+// RET.xyz = fog color (HDR)
+// RET.w = fog factor to lerp scene/object color with (i.e. lerp(RET.xyz, sceneColor.xyz, RET.w))
+min16float4 GetVolumetricFogColorInternal(
+	in float3 worldPos,
+	in float3 cameraToWorldPos,
+	in min16float radialFogShadowInfluence,
+	in min16float ambientFogShadowInfluence,
+	in SFogParams fogParams)
+{
+    const min16float fog = ComputeVolumetricFogInternal(cameraToWorldPos, fogParams);
+
+	min16float h = saturate(worldPos.z * fogParams.heightColGradScale + fogParams.heightColGradOffset);
+    h *= min16float(2) - h;
+
+	min16float3 fogColor = (fogParams.colGradBase + h * fogParams.colGradDelta) * ambientFogShadowInfluence;
+
+	const min16float l = saturate(length(cameraToWorldPos) * fogParams.invZFar);
+	const min16float radialLobe = pow(l, fogParams.radialLobeCtrl);
+	const min16float radialSize = exp2(dot(normalize(cameraToWorldPos), fogParams.sunDir.xyz) * -fogParams.radialSizeCtrl + fogParams.radialSizeCtrl); // exp2(-fogParams.radialSizeCtrl * (1-cos(x))
+
+	fogColor += radialLobe * radialSize * fogParams.radialColor * radialFogShadowInfluence;
+
+	return min16float4(fogColor, fog);
+}
+
+min16float4 GetVolumetricFogColorInternal(in float3 worldPos, in SFogParams fogParams)
+{
+	const float3 camToWorld = worldPos - fogParams.viewPos.xyz;
+	return GetVolumetricFogColorInternal(worldPos, camToWorld, 1, 1, fogParams);
+}
+
+
+////////////////////////////////////////////////////////////////////////////
+// delegates
+
+min16float4 GetVolumetricFogColor(in float3 worldPos, in float3 cameraToWorldPos, in min16float radialFogShadowInfluence, in min16float ambientFogShadowInfluence)
+{
+	const SFogParams fogParams = GetFogParamsInternal();
+	return GetVolumetricFogColorInternal(worldPos, cameraToWorldPos, radialFogShadowInfluence, ambientFogShadowInfluence, fogParams);
+}
+
+min16float4 GetVolumetricFogColor(in SFogParams fogParams, in float3 worldPos, in float3 cameraToWorldPos, in min16float radialFogShadowInfluence, in min16float ambientFogShadowInfluence)
+{
+	return GetVolumetricFogColorInternal(worldPos, cameraToWorldPos, radialFogShadowInfluence, ambientFogShadowInfluence, fogParams);
+}
+
+min16float4 GetVolumetricFogColor(in float3 worldPos, in float3 cameraToWorldPos)
+{
+	const SFogParams fogParams = GetFogParamsInternal();
+	return GetVolumetricFogColorInternal(worldPos, cameraToWorldPos, 1, 1, fogParams);
+}
+
+min16float4 GetVolumetricFogColor(in SFogParams fogParams, in float3 worldPos, in float3 cameraToWorldPos)
+{
+	return GetVolumetricFogColorInternal(worldPos, cameraToWorldPos, 1, 1, fogParams);
+}
+
+min16float4 GetVolumetricFogColor(in float3 worldPos)
+{
+	const SFogParams fogParams = GetFogParamsInternal();
+	return GetVolumetricFogColorInternal(worldPos, fogParams);
+}
+
+min16float4 GetVolumetricFogColor(in SFogParams fogParams, in float3 worldPos)
+{
+	return GetVolumetricFogColorInternal(worldPos, fogParams);
+}
+
+min16float GetVolumetricFogDensity(in float3 worldPos)
+{
+	const SFogParams fogParams = GetFogParamsInternal();
+	const float3 camToWorld = worldPos - fogParams.viewPos.xyz;
+	return ComputeVolumetricFogInternal(camToWorld, fogParams);
+}
+
+
+
+
+////////////////////////////////////////////////////////////////////////////
+// Volumetric fog using volume texture
+
+//#define SAMPLE_DISTRIBUTION_LINEAR
+
+#define VOLUMETRIC_FOG_SAMPLE_COEFFICIENT					(2.0f)
+
+struct VolumetricFogLight
+{
+    min16float3 cDiffuse;
+	min16float fFallOff;
+	min16float radialLobe;
+	min16float dotLE;
+	min16float k;
+	min16float k2;
+};
+
+struct VolumetricFogSunLight
+{
+    min16float fFallOff;
+	min16float dotLE;
+	min16float blendFactor;
+	min16float blendMode;
+	min16float3 cDiffuse1;
+	min16float3 cDiffuse2;
+	min16float2 anisotropy1;
+	min16float2 anisotropy2;
+};
+
+struct VolumetricFogTexcoord
+{
+    min16float3 texcoord;
+	min16float   range;
+	min16float   linearDepth;
+};
+
+struct VolumetricFogSampling
+{
+    Texture3D<min16float4>   volumetricFogTex;
+    TextureCube<min16float4> globalEnvProbeTex0;
+    TextureCube<min16float4> globalEnvProbeTex1;
+
+	SamplerState             trilinearClampSState;
+};
+
+struct SVolumetricFogParams
+{
+	// PB_VolumetricFogSunDir
+    min16float3 sunDir;
+    min16float padding0;
+
+	// PB_VolumetricFogSamplingParams
+	min16float  nearDist;
+	min16float  invFarMinusNearDist;
+	min16float  maxIndex;
+    min16float invMaxIndex;
+
+	min16float2 screenSize; 
+	min16float  farMinusNearDist; 
+    min16float invMaxIndexMinusOne; 
+
+	min16float3 viewPos; // PB_CameraPos
+    min16float framwCountJitter; // PB_VolumetricFogDistributionParams.w
+
+	min16float  scatterCoefficient; // PB_VolumetricFogScatteringParams.x
+	min16float  extinctionCoefficient; // PB_VolumetricFogScatteringParams.y
+	min16float  blendFactor; // PB_VolumetricFogScatteringBlendParams.x
+    min16float blendMode; // PB_VolumetricFogScatteringBlendParams.y
+
+	// SunColor * FogAlbedoColor1
+	min16float3 cDiffuse1; // PB_VolumetricFogScatteringColor
+    min16float padding1;
+
+	// SunColor * FogAlbedoColor2
+	min16float3 cDiffuse2; // PB_VolumetricFogScatteringSecondaryColor
+    min16float padding2;
+
+	// x: anisotoropy factor k1, y: 1.0 - k1 * k1
+	min16float2 anisotropy1; //PB_VolumetricFogScatteringParams.zw
+    min16float2 anisotropy2; //PB_VolumetricFogScatteringColor.w, PB_VolumetricFogScatteringSecondaryColor.w
+
+	// PB_VolumetricFogHeightDensityParams
+	min16float  heightDensityScale;
+	min16float  densityAtViewer;
+	min16float  fogVisibility;
+    min16float clampTransmittance;
+
+	// PB_VolumetricFogHeightDensityRampParams
+	min16float  rampStart;
+	min16float  rampEnd;
+	min16float  oneOverRampDiff;
+    min16float rampStartOverRampDiff;
+
+	// PB_VolumetricFogDistanceParams
+	min16float  farDistTopLeft;
+	min16float  farDistTopCenter;
+	min16float  farDistCenterLeft;
+    min16float farDistCenter;
+
+#if %_RT_VOLUMETRIC_FOG
+	// PB_VolumetricFogGlobalEnvProbe0
+	min16float3 globalProbeColor0;
+    min16float globalProbeAttenuation0;
+
+	// PB_VolumetricFogGlobalEnvProbe1
+	min16float3 globalProbeColor1;
+	min16float  globalProbeAttenuation1;
+#endif
+
+	// PB_time
+    min16float4 timeParams;
+};
+
+// TODO: remove these textures after completely moving to new graphics pipeline.
+Texture3D<min16float4>   VolumetricFogTexture     : TS_VolumetricFog;
+TextureCube<min16float4> vfGlobalEnvProbeTexture0 : register(t25) = TS_VolumetricFogGlobalEnvProbe0;
+TextureCube<min16float4> vfGlobalEnvProbeTexture1 : register(t26) = TS_VolumetricFogGlobalEnvProbe1;
+SamplerState vfTrilinearClampSState : SS_TrilinearClamp;
+
+cbuffer CBVolFogParams : register(b9)
+{
+    struct
+    {
+        // x:near distance, y:reciprocal of far minus near distance, z:depth resolution of volume tex, w:reciprocal of depth resolution
+        float4 SamplingParams;
+        
+        // x:near distance, y:far minus near distance, z:reciprocal of depth resolution minus one, w: frame count for jittering
+        float4 DistributionParams;
+        
+        // x: scattering factor, y: extinction factor, z: anisotoropy, w: one minus squared anisotoropy
+        float4 ScatteringParams;
+        
+        // x: blend factor of two radial lobes, y: blend mode of two radial lobes, z,w: not used
+        float4 ScatteringBlendParams;
+        
+        // xyz: sun color multiplied by a fog albedo, w: secondary anisotoropy
+        float4 ScatteringColor;
+        
+        // xyz: sun color multiplied by a fog albedo, w: one minus squared secondary anisotoropy
+        float4 ScatteringSecondaryColor;
+        
+        // x: height scale, y: log2(e) * fogDensity * exp(heightScale * vfViewPos.z + heightOffset)
+        // z: global fog visibility, w: max density clamp
+        float4 HeightDensityParams;
+        
+        // x: ramp start distance, y: ramp end distance, z: 1 / (RampEnd - RampStart), w: RampStart / (RampEnd - RampStart)
+        float4 HeightDensityRampParams;
+        
+        // x: far distance at top left corner of screen, y: far distance at top, z: far distance at left, w: far distance at center of screen
+        float4 DistanceParams;
+        
+        // xyz: primary global env probe color multiplied by a fog albedo, w: attenuation of primary global env probe
+        float4 GlobalEnvProbeParams0;
+        
+        // xyz: secondary global env probe color multiplied by a fog albedo, w: attenuation of secondary global env probe
+        float4 GlobalEnvProbeParams1;
+        
+        float4 TimeParams;// = { 1.0, 0.5, 0.25, 0.125};
+
+        float4 SunDir;
+    } cbVolFogParams;
+};
+
+SVolumetricFogParams vfGetVolumetricFogParamsInternal()
+{
+	SVolumetricFogParams params;
+
+	params.sunDir                  = cbVolFogParams.SunDir.xyz;
+	params.padding0                = 0.0f;
+
+	params.nearDist                = cbVolFogParams.SamplingParams.x;
+	params.invFarMinusNearDist     = cbVolFogParams.SamplingParams.y;
+	params.maxIndex                = cbVolFogParams.SamplingParams.z;
+	params.invMaxIndex             = cbVolFogParams.SamplingParams.w;
+
+	params.screenSize              = CV_ScreenSize.xy;
+	params.farMinusNearDist        = cbVolFogParams.DistributionParams.y;
+	params.invMaxIndexMinusOne     = cbVolFogParams.DistributionParams.z;
+
+	params.viewPos                 = GetWorldViewPos();
+	params.framwCountJitter        = cbVolFogParams.DistributionParams.w;
+
+	params.scatterCoefficient      = cbVolFogParams.ScatteringParams.x;
+	params.extinctionCoefficient   = cbVolFogParams.ScatteringParams.y;
+	params.blendFactor             = cbVolFogParams.ScatteringBlendParams.x;
+	params.blendMode               = cbVolFogParams.ScatteringBlendParams.y;
+
+	params.cDiffuse1               = cbVolFogParams.ScatteringColor.xyz;
+	params.padding1                = 0.0f;
+
+	params.cDiffuse2               = cbVolFogParams.ScatteringSecondaryColor.xyz;
+	params.padding2                = 0.0f;
+
+	params.anisotropy1.x           = cbVolFogParams.ScatteringParams.z;
+	params.anisotropy1.y           = cbVolFogParams.ScatteringParams.w;
+	params.anisotropy2.x           = cbVolFogParams.ScatteringColor.w;
+	params.anisotropy2.y           = cbVolFogParams.ScatteringSecondaryColor.w;
+
+	params.heightDensityScale      = cbVolFogParams.HeightDensityParams.x;
+	params.densityAtViewer         = cbVolFogParams.HeightDensityParams.y;
+	params.fogVisibility           = cbVolFogParams.HeightDensityParams.z;
+	params.clampTransmittance      = cbVolFogParams.HeightDensityParams.w;
+
+	params.rampStart               = cbVolFogParams.HeightDensityRampParams.x;
+	params.rampEnd                 = cbVolFogParams.HeightDensityRampParams.y;
+	params.oneOverRampDiff         = cbVolFogParams.HeightDensityRampParams.z;
+	params.rampStartOverRampDiff   = cbVolFogParams.HeightDensityRampParams.w;
+
+	params.farDistTopLeft          = cbVolFogParams.DistanceParams.x;
+	params.farDistTopCenter        = cbVolFogParams.DistanceParams.y;
+	params.farDistCenterLeft       = cbVolFogParams.DistanceParams.z;
+	params.farDistCenter           = cbVolFogParams.DistanceParams.w;
+
+#if %_RT_VOLUMETRIC_FOG
+	params.globalProbeColor0       = cbVolFogParams.GlobalEnvProbeParams0.xyz;
+	params.globalProbeAttenuation0 = cbVolFogParams.GlobalEnvProbeParams0.w;
+
+	params.globalProbeColor1       = cbVolFogParams.GlobalEnvProbeParams1.xyz;
+	params.globalProbeAttenuation1 = cbVolFogParams.GlobalEnvProbeParams1.w;
+#endif
+
+	params.timeParams              = cbVolFogParams.TimeParams;
+
+	return params;
+}
+
+uint vfGetClipVolumeStencilID(int nStencilVal)
+{
+	const int BIT_STENCIL_STATIC = 0x0000007F;
+	const int BIT_STENCIL_INSIDE_VOLUME = 0x00000040;// originally defined in ResolveStencilPS in DeferredShading.cfx
+	return max(nStencilVal - BIT_STENCIL_INSIDE_VOLUME, 0);
+}
+
+min16float GetJitterInternal(in uint2 pixelCoord, in min16float2 temporalJitter)
+{
+	min16float2 n = pixelCoord.xy + temporalJitter.xy;
+	min16float3 magic = {0.06711056f, 0.00583715f, 52.9829189f};
+	min16float jitter = frac(magic.z * frac(dot(n.xy, magic.xy)));
+	return jitter;
+}
+
+min16float GetJitteredTexcoordDepthInternal(
+	in min16float2 screenPos,
+	in min16float texcoordDepth,
+	in min16float invMaxIndex,
+	in min16float2 time)
+{
+	min16float jitter = GetJitterInternal(screenPos.xy, time.xy);
+	jitter *= invMaxIndex;
+	return (-1.0f * jitter) + texcoordDepth;
+}
+
+min16float GetVolumetricFogInscatteringSchlickPhaseFunction(min16float dotLE, min16float k, min16float oneMinusK2)
+{
+	// Schlick phase function
+	const min16float k2 = oneMinusK2;// k2 = 1.0 - k * k
+	min16float h = -((k * dotLE) - 1.0f);
+	return (k2 / (4.0f * PI * h * h));
+}
+
+min16float GetVolumetricFogInscatteringHenyeyGreensteinPhaseFunction(min16float dotLE, min16float g, min16float oneMinusG2)
+{
+	// Henyey-Greenstein phase function
+	const min16float g2 = oneMinusG2;// g2 = 1.0 - g * g
+	min16float h = (1.0f + (g * g) - (2 * g * dotLE));
+	return (g2 / (4.0f * PI * pow(h, 1.5f)));
+}
+
+min16float GetVolumetricFogInscatteringSideRadialPhaseFunction(min16float dotLE)
+{
+	min16float factor = (1.0f - abs(dotLE));
+	return (factor * (1.0f / (PI * PI)));
+	//return (factor * factor * (3.0f / (8.0 * PI)));
+}
+
+min16float3 GetVolumetricFogInscattering(in VolumetricFogLight light, bool isotoropic)
+{
+	min16float phaseFunc;
+	if(isotoropic)
+	{
+		// isotropic scattering
+		phaseFunc = 1.0f / (4.0f * PI);
+	}
+	else
+	{
+        const min16float dotLE = light.dotLE;
+
+        min16float mainRadialLobe = GetVolumetricFogInscatteringSchlickPhaseFunction(dotLE, light.k, light.k2);
+
+        min16float sideRadialLobe = GetVolumetricFogInscatteringSideRadialPhaseFunction(dotLE);
+
+		// blend main radial lobe with side radial lobe.
+		phaseFunc = lerp(mainRadialLobe, sideRadialLobe, light.radialLobe);
+	}
+
+	// calculate inscattering
+	const min16float attenuation = phaseFunc * light.fFallOff;
+	return attenuation * light.cDiffuse;
+}
+
+min16float3 GetVolumetricFogInscatteringSun(in VolumetricFogSunLight light)
+{
+	const min16float primaryPhaseFunc = GetVolumetricFogInscatteringSchlickPhaseFunction(light.dotLE, light.anisotropy1.x, light.anisotropy1.y);
+	const min16float secondaryPhaseFunct = GetVolumetricFogInscatteringSchlickPhaseFunction(light.dotLE, light.anisotropy2.x, light.anisotropy2.y);
+	const min16float primaryRadiation = primaryPhaseFunc * light.fFallOff;
+	const min16float secondaryRadiation = secondaryPhaseFunct * light.fFallOff;
+	const min16float3 ins0 = primaryRadiation * light.cDiffuse1;
+	const min16float3 ins1 = secondaryRadiation * light.cDiffuse2;
+
+	// blendMode parameter enables any blending between additive and alpha blending.
+	return (ins0 * (1.0f - (light.blendFactor * light.blendMode))) + (ins1 * light.blendFactor);
+}
+
+min16float4 GetVolumetricFogAnalyticalColor(
+	in SVolumetricFogParams params,
+	in VolumetricFogSampling vfs,
+	in min16float3 cameraToWorldPos,
+	in min16float lengthToTarget,
+	in bool fullSpan = false)
+{
+	min16float3 inscatter = min16float3(0.0f, 0.0f, 0.0f);
+
+	min16float4 diffuseProbe0 = min16float4(0.0f, 0.0f, 0.0f, 0.0f);
+	min16float4 diffuseProbe1 = min16float4(0.0f, 0.0f, 0.0f, 0.0f);
+#if %_RT_VOLUMETRIC_FOG
+	if(params.globalProbeAttenuation0 > 0.0f)
+	{
+		diffuseProbe0 = vfs.globalEnvProbeTex0.SampleLevel( vfs.trilinearClampSState, cameraToWorldPos, 0 );
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		diffuseProbe0.rgb = params.globalProbeAttenuation0 * DecodeHDRCubemap( diffuseProbe0 ).rgb * params.globalProbeColor0.rgb;
+	}
+	if(params.globalProbeAttenuation1 > 0.0f)
+	{
+		diffuseProbe1 = vfs.globalEnvProbeTex1.SampleLevel( vfs.trilinearClampSState, cameraToWorldPos, 0 );
+		const min16float attn = (1.0f - params.globalProbeAttenuation0) * params.globalProbeAttenuation1;
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		diffuseProbe1.rgb = attn * DecodeHDRCubemap( diffuseProbe1 ).rgb * params.globalProbeColor1.rgb;
+	}
+#endif
+	// exponential fog density parameters
+	const min16float d = lengthToTarget;// distance from camera to target matches ray-marching volumetric fog.
+	const min16float L = params.heightDensityScale;
+	const min16float M = cameraToWorldPos.z / d;
+
+	// NOTE: volFogDensityAtViewer = log2(e) * fogDensity * exp(heightDensityScale * viewPos.z + heightOffset);
+	const min16float volFogDensityAtViewer = params.densityAtViewer;
+
+	const min16float extinctionCoefficient = params.extinctionCoefficient;
+	const min16float rampStart = params.rampStart;
+	const min16float rampEnd = params.rampEnd;
+	const min16float transitionDistance = fullSpan ? 0.1f : params.farDistCenter;
+
+	VolumetricFogSunLight vfLight;
+	vfLight.dotLE = dot(params.sunDir.xyz, normalize(cameraToWorldPos));
+	vfLight.fFallOff = 1.0f;
+	vfLight.blendFactor = params.blendFactor;
+	vfLight.blendMode = params.blendMode;
+	vfLight.cDiffuse1 = params.cDiffuse1.xyz; // SunColor * FogAlbedoColor
+	vfLight.cDiffuse2 = params.cDiffuse2.xyz; // SunColor * FogAlbedoColor
+	vfLight.anisotropy1.x = params.anisotropy1.x;
+	vfLight.anisotropy1.y = params.anisotropy1.y; // 1.0 - k * k
+	vfLight.anisotropy2.x = params.anisotropy2.x;
+	vfLight.anisotropy2.y = params.anisotropy2.y; // 1.0 - k * k
+	inscatter += GetVolumetricFogInscatteringSun(vfLight);
+
+	min16float invExtinction = rcp(extinctionCoefficient);
+	inscatter *= params.scatterCoefficient * invExtinction;
+
+	min16float LM = L * M;
+	LM = abs(LM) < 0.000001f ? 0.000001f : LM;
+	min16float invLM = rcp(LM);
+	min16float cLM = -extinctionCoefficient * volFogDensityAtViewer * invLM;
+
+	min16float d2 = min(transitionDistance, d);
+	min16float minD = min(d, transitionDistance < rampStart ? rampStart : transitionDistance);
+	min16float maxD = min(d, rampEnd);
+	min16float sd = max(rampEnd, d2);
+
+    min16float logeLM = min16float(1.442695) * LM; // = log2(e) * LM
+	min16float expLMd = exp2(logeLM * d);
+
+	min16float4 fogColor;
+
+	// fog transmittance from rampEnd to the end of depth
+	// note: transmittance = exp(-extinction * (DensityIntegral(depth) - DensityIntegral(rampEnd)))
+	// = exp(-extinction * ((GlobalDensity / (heightDensityScale * cameraToWorldPos.z / distance) * (exp(heightDensityScale * (cameraToWorldPosEnd.z + viewPos.z)) - exp(heightDensityScale * (cameraToWorldPosStart.z + viewPos.z))))));
+	min16float T0 = saturate(exp2(cLM * (expLMd - exp2(logeLM * sd))));
+	fogColor.a = T0;
+
+	VolumetricFogLight fragLight;
+	fragLight.fFallOff = 1.0f;
+	fragLight.radialLobe = 0.0f;
+	fragLight.dotLE = 1.0f;
+	fragLight.k = 0.0f;
+	fragLight.k2 = 1.0f;
+	fragLight.cDiffuse = diffuseProbe0.rgb + diffuseProbe1.rgb;
+	inscatter += GetVolumetricFogInscattering(fragLight, true);
+
+	min16float trns = 1.0f;
+	fogColor.xyz = 0.0f;
+
+	// short ramp distance causes unstable calculation result.
+	// it can be ignored because it doesn't affect final result much.
+	// ramping isn't needed when start distance of analytical fog is behind ramp end.
+	if(rampEnd - rampStart > 1.0f && transitionDistance < rampEnd)
+	{
+		LM = abs(LM) < 0.0001f ? 0.0001f : LM;
+        logeLM = min16float(1.442695) * LM; // log2(e) * LM
+
+		min16float CC = rcp(LM * LM * (rampStart - rampEnd));
+		min16float cCC = -extinctionCoefficient * volFogDensityAtViewer * CC;
+		min16float A0 = exp2(logeLM * maxD) * (LM * (rampStart - maxD) + 1.0f);
+		min16float A1 = exp2(logeLM * minD) * (LM * (rampStart - minD) + 1.0f);
+
+		// integral of fog transmittance with depth based ramp from rampStart to rampEnd
+		// It's needed for proper decay of volumetric fog.
+		trns = saturate(exp2(cCC * (A0 - A1)));
+		fogColor.a *= trns;
+
+		// integral of inscattering with depth based ramp from rampStart to rampEnd
+		min16float V = exp2(logeLM * rampStart);
+		min16float IE = -exp2(cCC * (A0 - V));
+		min16float IS = -exp2(cCC * (A1 - V));
+		fogColor.xyz += inscatter * saturate(IE - IS);
+	}
+
+	// integral of inscattering from rampEnd to the end of depth
+	min16float IE = -T0;// = -saturate(exp2(cLM * (expLMd - exp2(logeLM * sd))))
+	min16float IS = -1;// = -exp2(extinctionCoefficient * volFogDensityAtViewer / LM * (-exp(LM * sd2) + exp(LM * sd2)));
+	fogColor.xyz += trns * inscatter * (IE - IS);
+
+	return fogColor;
+}
+
+min16float4 GetVolumetricFogAnalyticalColor(
+	in VolumetricFogSampling vfs,
+	in min16float3 cameraToWorldPos,
+	in min16float lengthToTarget,
+	in bool fullSpan = false)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return GetVolumetricFogAnalyticalColor(params, vfs, cameraToWorldPos, lengthToTarget, fullSpan);
+}
+
+// TODO: remove after completely moving to new graphics pipeline.
+min16float4 GetVolumetricFogAnalyticalColor(
+	in min16float3 cameraToWorldPos,
+	in min16float lengthToTarget,
+	in bool fullSpan = false)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+
+	VolumetricFogSampling vfs;
+	vfs.volumetricFogTex = VolumetricFogTexture;
+	vfs.globalEnvProbeTex0 = vfGlobalEnvProbeTexture0;
+	vfs.globalEnvProbeTex1 = vfGlobalEnvProbeTexture1;
+	vfs.trilinearClampSState = vfTrilinearClampSState;
+
+	return GetVolumetricFogAnalyticalColor(params, vfs, cameraToWorldPos, lengthToTarget, fullSpan);
+}
+
+// TODO: remove after completely moving to new graphics pipeline.
+min16float4 GetVolumetricFogAnalyticalColor(
+	in min16float3 cameraToWorldPos,
+	in bool fullSpan = false)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+
+	VolumetricFogSampling vfs;
+	vfs.volumetricFogTex = VolumetricFogTexture;
+	vfs.globalEnvProbeTex0 = vfGlobalEnvProbeTexture0;
+	vfs.globalEnvProbeTex1 = vfGlobalEnvProbeTexture1;
+	vfs.trilinearClampSState = vfTrilinearClampSState;
+
+	return GetVolumetricFogAnalyticalColor(params, vfs, cameraToWorldPos, length(cameraToWorldPos), fullSpan);
+}
+
+// TODO: remove after completely moving to new graphics pipeline.
+min16float4 GetVolumetricFogAnalyticalColorByWorldPos(
+	in min16float3 worldPos,
+	in bool fullSpan = false)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+
+	VolumetricFogSampling vfs;
+	vfs.volumetricFogTex = VolumetricFogTexture;
+	vfs.globalEnvProbeTex0 = vfGlobalEnvProbeTexture0;
+	vfs.globalEnvProbeTex1 = vfGlobalEnvProbeTexture1;
+	vfs.trilinearClampSState = vfTrilinearClampSState;
+
+	min16float3 camToWorld = worldPos - params.viewPos.xyz;
+	return GetVolumetricFogAnalyticalColor(params, vfs, camToWorld, length(camToWorld), fullSpan);
+}
+
+min16float4 BlendVolumetricFogWithGlobalFog(
+	in SVolumetricFogParams params,
+	in min16float4 volumetricFog,
+	in min16float4 globalFog,
+	in VolumetricFogTexcoord vtc)
+{
+	volumetricFog.xyz = params.fogVisibility * volumetricFog.w * globalFog.xyz + volumetricFog.xyz;
+	volumetricFog.a = volumetricFog.w * globalFog.a;
+
+	return volumetricFog;
+}
+
+min16float4 BlendVolumetricFogWithGlobalFog(
+	in min16float4 volumetricFog,
+	in min16float4 globalFog,
+	in VolumetricFogTexcoord vtc)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return BlendVolumetricFogWithGlobalFog(params, volumetricFog, globalFog, vtc);
+}
+
+min16float4 ClampFinalFogDensity(
+	in SVolumetricFogParams params,
+	in min16float4 volumetricFog)
+{
+	// Final Density Clamp decays final fog outcome.
+	volumetricFog.xyz = volumetricFog.xyz * (1.0f - params.clampTransmittance);
+	volumetricFog.a = max(volumetricFog.a, params.clampTransmittance);
+
+	return volumetricFog;
+}
+
+min16float4 ClampFinalFogDensity(in min16float4 volumetricFog)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return ClampFinalFogDensity(params, volumetricFog);
+}
+
+min16float GetVolumetricFogLinearDepth(
+	in SVolumetricFogParams params,
+	in min16float depthIndex)
+{
+#if SAMPLE_DISTRIBUTION_LINEAR
+	return params.farMinusNearDist * saturate(depthIndex * params.invMaxIndexMinusOne) + params.nearDist;
+#else
+	const min16float c = VOLUMETRIC_FOG_SAMPLE_COEFFICIENT;
+	return params.farMinusNearDist * pow(saturate(depthIndex * params.invMaxIndexMinusOne), c) + params.nearDist;
+#endif
+}
+
+min16float GetVolumetricFogLinearDepth(in min16float depthIndex)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return GetVolumetricFogLinearDepth(params, depthIndex);
+}
+
+min16float GetVolumetricFogDepthTexcoord(
+	in SVolumetricFogParams params,
+	in min16float linearDepth)
+{
+#if SAMPLE_DISTRIBUTION_LINEAR
+	min16float d = (linearDepth - params.nearDist) * params.invFarMinusNearDist;
+#else
+	const min16float c = VOLUMETRIC_FOG_SAMPLE_COEFFICIENT;
+    // We need to take max as linearDepth can be smaller than nearDist
+	min16float d = pow((max(0.f, linearDepth - params.nearDist) * params.invFarMinusNearDist), (1.0f / c));
+#endif
+	d = (0.5f - d) * params.invMaxIndex + d; // = (0.5f + ((maxIndex - 1.0f) * d)) * invMaxIndex;
+	return d;
+}
+
+min16float GetVolumetricFogDepthTexcoord(in min16float linearDepth)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return GetVolumetricFogDepthTexcoord(params, linearDepth);
+}
+
+void RectifyVolumetricFogTexcoordAndRangeApproxInternal(
+	in SVolumetricFogParams params,
+	inout VolumetricFogTexcoord vtc)
+{
+	min16float2 atc = abs(vtc.texcoord.xy * 2.0f - 1.0f);
+	vtc.range = lerp(
+		lerp(vtc.range, params.farDistCenterLeft, atc.x),
+		lerp(params.farDistTopCenter, params.farDistTopLeft, atc.x),
+		atc.y);
+	vtc.texcoord.z = min(vtc.range, vtc.texcoord.z);
+}
+
+void RectifyVolumetricFogTexcoordAndRangeInternal(
+	inout VolumetricFogTexcoord vtc,
+	in min16float lengthToTarget)
+{
+	min16float correctionFactor = (vtc.linearDepth / lengthToTarget);
+	vtc.range *= correctionFactor;
+	vtc.texcoord.z = min(vtc.range, vtc.texcoord.z);
+}
+
+VolumetricFogTexcoord GetVolumetricFogTexcoordParamByScreenProj(
+	in SVolumetricFogParams params,
+	in min16float4 screenProj,
+	in bool rectifiedRangeApprox = true,
+	in min16float lengthToTarget = 10000000.0f)
+{
+	VolumetricFogTexcoord vtc;
+	vtc.texcoord.xy = screenProj.xy / screenProj.w;
+	vtc.linearDepth = screenProj.w;
+	vtc.texcoord.z = vtc.linearDepth;
+	vtc.range = params.farDistCenter;
+
+	if(rectifiedRangeApprox)
+	{
+		RectifyVolumetricFogTexcoordAndRangeApproxInternal(params, vtc);
+	}
+	else
+	{
+		RectifyVolumetricFogTexcoordAndRangeInternal(vtc, lengthToTarget);
+	}
+
+	vtc.texcoord.z = GetVolumetricFogDepthTexcoord(params, vtc.texcoord.z);
+
+	return vtc;
+}
+
+VolumetricFogTexcoord GetVolumetricFogTexcoordParamByScreenProj(
+	in min16float4 screenProj,
+	in bool rectifiedRangeApprox = true,
+	in min16float lengthToTarget = 10000000.0f)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return GetVolumetricFogTexcoordParamByScreenProj(params, screenProj, rectifiedRangeApprox, lengthToTarget);
+}
+
+VolumetricFogTexcoord GetVolumetricFogTexcoordParamByScreenPos(
+	in SVolumetricFogParams params,
+	in min16float4 screenPos,
+	in bool rectifiedRangeApprox = true,
+	in min16float lengthToTarget = 10000000.0f)
+{
+	VolumetricFogTexcoord vtc;
+	vtc.texcoord.xy = screenPos.xy * CV_ScreenSize.zw * 2.0f;
+	vtc.linearDepth = screenPos.w;
+	vtc.texcoord.z = vtc.linearDepth;
+	vtc.range = params.farDistCenter;
+
+	if(rectifiedRangeApprox)
+	{
+		RectifyVolumetricFogTexcoordAndRangeApproxInternal(params, vtc);
+	}
+	else
+	{
+		RectifyVolumetricFogTexcoordAndRangeInternal(vtc, lengthToTarget);
+	}
+
+	vtc.texcoord.z = GetVolumetricFogDepthTexcoord(params, vtc.texcoord.z);
+
+	return vtc;
+}
+
+VolumetricFogTexcoord GetVolumetricFogTexcoordParamByScreenPos(
+	in min16float4 screenPos,
+	in bool rectifiedRangeApprox = true,
+	in min16float lengthToTarget = 10000000.0f)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return GetVolumetricFogTexcoordParamByScreenPos(params, screenPos, rectifiedRangeApprox, lengthToTarget);
+}
+
+VolumetricFogTexcoord GetVolumetricFogTexcoordParamByScreenTexcoordAndDepth(
+	in SVolumetricFogParams params,
+	in min16float2 screenTC,
+	in min16float linearDepth,
+	in bool rectifiedRangeApprox = true,
+	in min16float lengthToTarget = 10000000.0f)
+{
+	VolumetricFogTexcoord vtc;
+	vtc.texcoord.xy = screenTC;
+	vtc.linearDepth = linearDepth;
+	vtc.texcoord.z = vtc.linearDepth;
+	vtc.range = params.farDistCenter;
+
+	if(rectifiedRangeApprox)
+	{
+		RectifyVolumetricFogTexcoordAndRangeApproxInternal(params, vtc);
+	}
+	else
+	{
+		RectifyVolumetricFogTexcoordAndRangeInternal(vtc, lengthToTarget);
+	}
+
+	vtc.texcoord.z = GetVolumetricFogDepthTexcoord(params, vtc.texcoord.z);
+
+	return vtc;
+}
+
+VolumetricFogTexcoord GetVolumetricFogTexcoordParamByScreenTexcoordAndDepth(
+	in min16float2 screenTC,
+	in min16float linearDepth,
+	in bool rectifiedRangeApprox = true,
+	in min16float lengthToTarget = 10000000.0f)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	return GetVolumetricFogTexcoordParamByScreenTexcoordAndDepth(params, screenTC, linearDepth, rectifiedRangeApprox, lengthToTarget);
+}
+
+min16float4 GetVolumetricFogValue(
+	in VolumetricFogSampling vfs,
+	in VolumetricFogTexcoord vtc)
+{
+	min16float3 tc = vtc.texcoord.xyz;
+	min16float4 v = vfs.volumetricFogTex.SampleLevel(vfs.trilinearClampSState, tc.xyz, 0.0f);
+	return v;
+}
+
+// TODO: remove after completely moving to new graphics pipeline.
+min16float4 GetVolumetricFogValue(in VolumetricFogTexcoord vtc)
+{
+	VolumetricFogSampling vfs;
+	vfs.volumetricFogTex = VolumetricFogTexture;
+	vfs.trilinearClampSState = vfTrilinearClampSState;
+
+	return GetVolumetricFogValue(vfs, vtc);
+}
+
+min16float4 GetVolumetricFogValueJittered(
+	in SVolumetricFogParams params,
+	in VolumetricFogSampling vfs,
+	in VolumetricFogTexcoord vtc)
+{
+	min16float3 tc = vtc.texcoord.xyz;
+	tc.z = GetJitteredTexcoordDepthInternal(tc.xy * params.screenSize.xy, tc.z, params.invMaxIndex, params.timeParams.xw);
+	min16float4 v = vfs.volumetricFogTex.SampleLevel(vfs.trilinearClampSState, tc.xyz, 0.0f);
+	return v;
+}
+
+min16float4 GetVolumetricFogValueJittered(
+	in VolumetricFogSampling vfs,
+	in VolumetricFogTexcoord vtc)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+
+	min16float3 tc = vtc.texcoord.xyz;
+	tc.z = GetJitteredTexcoordDepthInternal(tc.xy * params.screenSize.xy, tc.z, params.invMaxIndex, params.timeParams.xw);
+	min16float4 v = vfs.volumetricFogTex.SampleLevel(vfs.trilinearClampSState, tc.xyz, 0.0f);
+	return v;
+}
+
+// TODO: remove after completely moving to new graphics pipeline.
+min16float4 GetVolumetricFogValueJittered(in VolumetricFogTexcoord vtc)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+
+	VolumetricFogSampling vfs;
+	vfs.volumetricFogTex = VolumetricFogTexture;
+	vfs.trilinearClampSState = vfTrilinearClampSState;
+
+	return GetVolumetricFogValueJittered(params, vfs, vtc);
+}
+
+void ApplyVolumetricFog(
+	in SVolumetricFogParams params,
+	in min16float4 volumetricFog,
+	in min16float4 globalFog,
+	in VolumetricFogTexcoord vtc,
+	inout min16float3 color)
+{
+	volumetricFog = BlendVolumetricFogWithGlobalFog(params, volumetricFog, globalFog, vtc);
+
+	volumetricFog = ClampFinalFogDensity(params, volumetricFog);
+
+	color.xyz = (color.xyz * volumetricFog.w) + volumetricFog.xyz;
+}
+
+void ApplyVolumetricFog(
+	in min16float4 volumetricFog,
+	in min16float4 globalFog,
+	in VolumetricFogTexcoord vtc,
+	inout min16float3 color)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	ApplyVolumetricFog(params, volumetricFog, globalFog, vtc, color);
+}
+
+void ApplyVolumetricFogTransmittance(
+	in SVolumetricFogParams params,
+	in min16float4 volumetricFog,
+	in min16float4 globalFog,
+	in VolumetricFogTexcoord vtc,
+	inout min16float3 color)
+{
+	volumetricFog = BlendVolumetricFogWithGlobalFog(params, volumetricFog, globalFog, vtc);
+
+	volumetricFog = ClampFinalFogDensity(params, volumetricFog);
+
+	color.xyz = color.xyz * volumetricFog.w;
+}
+
+void ApplyVolumetricFogTransmittance(
+	in min16float4 volumetricFog,
+	in min16float4 globalFog,
+	in VolumetricFogTexcoord vtc,
+	inout min16float3 color)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	ApplyVolumetricFogTransmittance(params, volumetricFog, globalFog, vtc, color);
+}
+
+void ApplyVolumetricFogAnalytical(
+	in SVolumetricFogParams params,
+	in min16float4 volumetricFogAnalytical,
+	inout min16float3 color)
+{
+	volumetricFogAnalytical.xyz *= params.fogVisibility;
+
+	volumetricFogAnalytical = ClampFinalFogDensity(params, volumetricFogAnalytical);
+
+	color.xyz = (color.xyz * volumetricFogAnalytical.w) + volumetricFogAnalytical.xyz;
+}
+
+void ApplyVolumetricFogAnalytical(
+	in min16float4 volumetricFogAnalytical,
+	inout min16float3 color)
+{
+	SVolumetricFogParams params = vfGetVolumetricFogParamsInternal();
+	ApplyVolumetricFogAnalytical(params, volumetricFogAnalytical, color);
+}
+

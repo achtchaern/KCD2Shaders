@@ -1,0 +1,118 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-07-17
+
+#if %DIR_OVERLAY
+
+//=========================================================================
+float DirOverlayX
+<
+	register = REG_PM_PARAM_9.x;
+	string UIHelp = "Dir overlay vector (x)";
+	string UIName = "Dir overlay X";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+float DirOverlayY
+<
+	register = REG_PM_PARAM_9.y;
+	string UIHelp = "Dir overlay vector (y)";
+	string UIName = "Dir overlay Y";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.0;
+
+float DirOverlayZ
+<
+	register = REG_PM_PARAM_9.z;
+	string UIHelp = "Dir overlay vector (z)";
+	string UIName = "Dir overlay Z";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.0;
+
+float DirOverlayBumpScale
+<
+	register = REG_PM_PARAM_9.w;
+	string UIHelp = "Dir overlay macro normal scale";
+	string UIName = "Dir overlay normal scale";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 5.0;
+	float UIStep = 0.25;
+> = 1.0;
+
+float DirOverlayThresholdMin
+<
+	register = REG_PM_PARAM_10.x;
+	string UIHelp = "Dir overlay threshold min (where overlay is 0%)";
+	string UIName = "Dir overlay threshold min";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 1.0;
+	float UIStep = 0.25;
+> = 0.0;
+
+float DirOverlayThresholdMax
+<
+	register = REG_PM_PARAM_10.y;
+	string UIHelp = "Dir overlay threshold max (where overlay is 100%)";
+	string UIName = "Dir overlay threshold max";
+	string UIWidget = "slider";
+	float UIMin = -1.0;
+	float UIMax = 1.0;
+	float UIStep = 0.25;
+> = 1.0;
+
+float DirOverlayTilingU
+<
+	register = REG_PM_PARAM_10.z;
+	string UIHelp = "Dir overlay tiling U";
+	string UIName = "Dir overlay tiling U";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 8.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+float DirOverlayTilingV
+<
+	register = REG_PM_PARAM_10.w;
+	string UIHelp = "Dir overlay tiling V";
+	string UIName = "Dir overlay tiling V";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 8.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+//=========================================================================
+half GetDirOverlayBlendFactor(half3 vInNormal)
+{
+	half3 dirOverlay = half3(DirOverlayX, DirOverlayY, DirOverlayZ);
+	
+	return smoothstep(DirOverlayThresholdMin, DirOverlayThresholdMax, dot(dirOverlay, vInNormal));
+}
+
+//=========================================================================
+void ApplyDirOverlayToAlbedo(inout half3 cAlbedo, half blendFac, float2 tc)
+{
+	half4 diffuseMap2 = GetDiffuse2Tex(Diffuse2Tex, tc * half2(DirOverlayTilingU, DirOverlayTilingV));
+	cAlbedo = lerp(cAlbedo, diffuseMap2.rgb, blendFac);
+}
+
+//=========================================================================
+void ApplyDirOverlayToNormal(inout float3 vNormalTS, float blendFac, float2 tc)
+{
+	float3 vNormal2 = GetNormalMap(Bump2Tex, tc * half2(DirOverlayTilingU, DirOverlayTilingV));
+	vNormal2.xy *= DirOverlayBumpScale;
+	vNormalTS = lerp(vNormalTS, vNormal2, blendFac);
+}
+
+#endif

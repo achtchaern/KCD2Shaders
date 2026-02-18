@@ -1,0 +1,117 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6895
+
+#if CLS_BLOOD
+
+half4 BloodTintBorder // mutually exclusive with %DECAL
+<
+	register = REG_PM_PARAM_7;
+	string UIHelp = "Blood tint border";
+	string UIName = "DS Blood Tint Border";
+	string UIWidget = "color";
+> = { 1.0, 1.0, 1.0, 1.0 };
+
+half4 BloodTintCenter // mutually exclusive with %SNDUVS
+<
+	register = REG_PM_PARAM_8;
+	string UIHelp = "Blood tint border";
+	string UIName = "DS Blood Tint Center";
+	string UIWidget = "color";
+> = { 1.0, 1.0, 1.0, 1.0 };
+
+half4 BloodSpecular // mutually exclusive with WeaponBloodColor in %WEAPON
+<
+	register = REG_PM_PARAM_9;
+	string UIHelp = "Blood tint border";
+	string UIName = "DS Blood Specular";
+	string UIWidget = "color";
+> = { 1.0, 1.0, 1.0, 1.0 };
+
+half BloodBreakup // mutually exclusive with WeaponBloodBlendFalloff in %WEAPON
+<
+	register = REG_PM_PARAM_10.x;
+	string UIHelp = "Breakup of blood";
+	string UIName = "DS Blood Breakup";
+	string UIWidget = "slider";
+	float UIMin = 0.001; // to prevent pow(0,0) because it is not well-defined in hlsl
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.4;
+
+half BloodGloss
+<
+	register = REG_PM_PARAM_10.w;
+	string UIHelp = "Gloss of blood";
+	string UIName = "DS Blood Gloss";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.0;
+
+// This could be hardcoded (it must be the same for every material anyways)
+float BloodMaskHardness
+<
+	register = REG_PM_PARAM_10.y;
+	string UIHelp = "Hardness of sphere mask used for blood";
+	string UIName = "DS Blood Mask Hardness";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 0.8;
+
+//==============================================================================
+float ComputeBloodMask(float3 vertexPosition)
+{
+	float bloodMaskSum = 0;
+	for (int i = 0; i < gs_ClothingBloodSourceCount; ++i)
+	{
+		const float4 bloodSource = MaterialInstanceBuffer[CD_MaterialInstanceIdWH].bloodSource[i];
+		const float dist = distance(vertexPosition, bloodSource.xyz);
+		const float mask = 1 - saturate(dist / max(bloodSource.w, 1e-6)); // prevent division by zero
+		bloodMaskSum += mask;
+	}
+
+	return min(bloodMaskSum, 1.f);
+}
+
+//==============================================================================
+half ComputeBloodIntensity(half macroMask, half microMask, float sphereMask)
+{
+	sphereMask = smoothstep(0, 1 - BloodMaskHardness, sphereMask);
+
+	const half macroDarkenBlend = min(macroMask.r, sphereMask);
+	const half microDarkenBlend = min(macroDarkenBlend, microMask);
+	half bloodIntensity = microDarkenBlend;
+
+	return bloodIntensity;
+}
+
+//==============================================================================
+void ApplyBloodSmoothness(inout half fSmoothness, half bloodIntensity)
+{
+	const half bloodIntensityPowered = pow(bloodIntensity, BloodBreakup);
+	half bloodGloss = bloodIntensityPowered * BloodGloss;
+
+	fSmoothness = lerp(fSmoothness, bloodGloss, bloodIntensity);
+}
+
+//==============================================================================
+void ApplyBloodAlbedo(inout half3 cAlbedo, half bloodIntensity)
+{
+	const half bloodIntensityPowered = pow(bloodIntensity, BloodBreakup);
+	half4 bloodAlbedo = lerp(BloodTintBorder, BloodTintCenter, bloodIntensityPowered);
+
+	cAlbedo.xyz = lerp(cAlbedo.xyz, bloodAlbedo.xyz, bloodIntensity);
+}
+
+//==============================================================================
+void ApplyBloodReflectance(inout half3 cReflectance, half bloodIntensity)
+{
+	cReflectance = lerp(cReflectance, BloodSpecular.xyz, bloodIntensity);
+}
+
+#endif // CLS_BLOOD

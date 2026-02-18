@@ -1,0 +1,31 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Gabor Molnar
+
+// https://youtrack.warhorsestudios.cz/articles/KCD2-A-6895
+
+#if CLS_SCRATCH
+
+half ScratchMaskHardness // mutually exclusive with WeaponBloodSpecular in %WEAPON
+<
+	register = REG_PM_PARAM_10.z;
+	string UIHelp = "ScratchMaskHardness";
+	string UIName = "DS Scratch Mask Hardness";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 1.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+//==============================================================================
+half ComputeScratchIntensity(half macroMask, int featureIndex)
+{
+	float scratchLevel = FeatureBuffer[featureIndex].scratchLevel;
+
+	const half scratchIntensity = smoothstep(0.h, (1.h - ScratchMaskHardness) * scratchLevel, scratchLevel + macroMask - 1.h);
+	// linear alternative:
+	//const half scratchIntensity = saturate((scratchLevel + macroMask - 1.h) / ((1.h - ScratchMaskHardness) * scratchLevel));
+
+	return scratchIntensity;
+}
+
+#endif // CLS_SCRATCH

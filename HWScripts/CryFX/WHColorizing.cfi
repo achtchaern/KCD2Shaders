@@ -1,0 +1,164 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-06-19
+
+//=========================================================================
+// per-material constants
+#if %COLORIZING || %COLORIZING_WITH_MASK
+float ColorizingHue
+<
+	register = REG_PM_PARAM_9.x;
+	string UIHelp = "Hue shift";
+	string UIName = "Zone0 Colorizing Hue";
+	string UIWidget = "slider"; //?
+	float UIMin = -180.0;
+	float UIMax = 180.0;
+	float UIStep = 10.0;
+> = 0.0;
+
+float ColorizingSaturation
+<
+	register = REG_PM_PARAM_9.y;
+	string UIHelp = "Saturation multiplier";
+	string UIName = "Zone0 Colorizing Saturation";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+
+float ColorizingBrightness
+<
+	register = REG_PM_PARAM_9.z;
+	string UIHelp = "Brightness multiplier";
+	string UIName = "Zone0 Colorizing Brightness";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+#endif
+
+#if %COLORIZING_WITH_MASK
+float MaskHue1
+<
+	register = REG_PM_PARAM_9.w;
+	string UIHelp = "Hue shift region 1 (0.2..0.5)";
+	string UIName = "Zone1 Colorizing Hue";
+	string UIWidget = "slider"; //?
+	float UIMin = -180.0;
+	float UIMax = 180.0;
+	float UIStep = 10.0;
+> = 0.0;
+
+float MaskHue2
+<
+	register = REG_PM_PARAM_10.x;
+	string UIHelp = "Hue shift region 2 (0.5..0.8)";
+	string UIName = "Zone2 Colorizing Hue";
+	string UIWidget = "slider"; //?
+	float UIMin = -180.0;
+	float UIMax = 180.0;
+	float UIStep = 10.0;
+> = 0.0;
+
+float MaskHue3
+<
+	register = REG_PM_PARAM_10.y;
+	string UIHelp = "Hue shift region 3 (0.8..1.0)";
+	string UIName = "Zone3 Colorizing Hue";
+	string UIWidget = "slider"; //?
+	float UIMin = -180.0;
+	float UIMax = 180.0;
+	float UIStep = 10.0;
+> = 0.0;
+
+float MaskBrightness1
+<
+	register = REG_PM_PARAM_10.z;
+	string UIHelp = "Brightness shift region 1 (0.2..0.5)";
+	string UIName = "Zone1 Colorizing Brightness";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+
+float MaskBrightness2
+<
+	register = REG_PM_PARAM_10.w;
+	string UIHelp = "Brightness shift region 2 (0.5..0.8)";
+	string UIName = "Zone2 Colorizing Brightness";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+
+float MaskBrightness3
+<
+	register = REG_PM_PARAM_11.x;
+	string UIHelp = "Brightness shift region 3 (0.8..1.0)";
+	string UIName = "Zone3 Colorizing Brightness";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+
+float MaskSaturation1
+<
+	register = REG_PM_PARAM_11.y;
+	string UIHelp = "Saturation shift region 1 (0.2..0.5)";
+	string UIName = "Zone1 Colorizing Saturation";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+
+float MaskSaturation2
+<
+	register = REG_PM_PARAM_11.z;
+	string UIHelp = "Saturation shift region 2 (0.5..0.8)";
+	string UIName = "Zone2 Colorizing Saturation";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+
+float MaskSaturation3
+<
+	register = REG_PM_PARAM_11.w;
+	string UIHelp = "Saturation shift region 3 (0.8..1.0)";
+	string UIName = "Zone3 Colorizing Saturation";
+	string UIWidget = "slider"; //?
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 1.0;
+> = 1.0;
+#endif
+
+//=========================================================================
+#if %COLORIZING 
+void ApplyColorizing(inout half3 albedo)
+{
+	albedo = TransformHSV(albedo, ColorizingHue, ColorizingSaturation, ColorizingBrightness);
+}
+#endif
+
+//=========================================================================
+#if %COLORIZING_WITH_MASK
+void ApplyColorizingWithMask(inout half3 albedo, inout half3 specMap)
+{
+	half fRegionMask = specMap.g; //store region mask (G channel)
+	specMap = specMap.rrr; //G channel used for region mask!
+
+	half4 vRegionHues = half4(ColorizingHue, MaskHue1, MaskHue2, MaskHue3);
+	half4 vRegionBrightness = half4(ColorizingBrightness, MaskBrightness1, MaskBrightness2, MaskBrightness3);
+	half4 vRegionSaturation = half4(ColorizingSaturation, MaskSaturation1, MaskSaturation2, MaskSaturation3);
+	
+	int regionIndex = floor(fRegionMask * 3.9999);
+	albedo.xyz = TransformHSV(albedo.xyz, vRegionHues[regionIndex], vRegionSaturation[regionIndex], vRegionBrightness[regionIndex]);
+}
+#endif

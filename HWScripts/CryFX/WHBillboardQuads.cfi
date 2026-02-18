@@ -1,0 +1,62 @@
+// Copyright (c) 2020 WarhorseStudios
+// author: Tomas Barak, 2020-07-17
+
+// decodes BB quad expansion vectors encoded to color
+float2 GetBBQuadExpandVec(float4 color, float scale)
+{
+	// every float is encoded into two bytes
+	float2 decVals = float2(256.0 / 257.0, 1 / 257.0);
+	float2 expandVec = float2(dot(color.gr, decVals), dot(color.ab, decVals));
+
+	expandVec = expandVec * 2 - 1; // 0..+1 -> -1..+1
+
+	return expandVec * scale;
+}
+
+void BBQuadsResetInstMatrix(inout float4x4 InstMatrix, inout streamPos IN)
+{
+	// prevent any other rotation/scale by the "local" instance matrix, used in _pos_Modificators(...)
+	IN.InstMatrix[0].xyz = InstMatrix[0].xyz = float3(1, 0, 0);
+	IN.InstMatrix[1].xyz = InstMatrix[1].xyz = float3(0, 1, 0);
+	IN.InstMatrix[2].xyz = InstMatrix[2].xyz = float3(0, 0, 1);
+}
+
+// for VTM_BB_QUADS
+void VTModifyBBQuads(inout float4 inPos, inout float4x4 InstMatrix, inout streamPos IN)
+{
+	float scale = length(InstMatrix[0].xyz) / CM_DeformWave.w; // take both the instance scale and the BB material scale, encoded to (1/WaveLength)
+	float2 expandVec = GetBBQuadExpandVec(IN.Color, scale);
+	inPos.xyz += expandVec.x * CV_CameraRightVector.xyz + expandVec.y * CV_CameraUpVector.xyz;
+
+	// correct tangent space
+	IN.ObjToTangentSpace[0] = CV_CameraRightVector.xyz;
+	IN.ObjToTangentSpace[1] = CV_CameraUpVector.xyz;
+	IN.ObjToTangentSpace[2] = normalize(cross(CV_CameraRightVector.xyz, CV_CameraUpVector.xyz));
+
+	BBQuadsResetInstMatrix(InstMatrix, IN);
+}
+
+// for VTM_BB_Z_QUADS
+void VTModifyBBZQuads(inout float4 inPos, inout float4x4 InstMatrix, inout streamPos IN, bool bRelativeToCam)
+{
+	float3 worldPos = inPos.xyz + float3(InstMatrix[0].w, InstMatrix[1].w, InstMatrix[2].w);
+	if (bRelativeToCam)
+	{
+		worldPos.xyz += g_VS_WorldViewPos.xyz;
+	}
+
+	float3 upVec = float3(0, 0, 1);
+	float3 frontVec = normalize(g_VS_WorldViewPos.xyz.xyz - worldPos);		
+	float3 rightVec = normalize(cross(upVec, frontVec));
+
+	float scale = length(InstMatrix[0].xyz) / CM_DeformWave.w; // take both the instance scale and the BB material scale, encoded to (1/WaveLength)
+	float2 expandVec = GetBBQuadExpandVec(IN.Color, scale);
+	inPos.xyz += expandVec.x * rightVec + expandVec.y * upVec;
+
+	// correct tangent space
+	IN.ObjToTangentSpace[0] = rightVec;
+	IN.ObjToTangentSpace[1] = upVec;
+	IN.ObjToTangentSpace[2] = frontVec;
+
+	BBQuadsResetInstMatrix(InstMatrix, IN);
+}
