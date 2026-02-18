@@ -1,0 +1,190 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+Version (1.00)
+
+Property
+{
+  Name = %REFRACTION
+  Mask = 0x4
+  Property    (Refraction)
+  Description (Use normal-map texture as displacement for refraction)
+}
+
+Property
+{
+  Name = %SCREEN_SPACE_DEFORMATION
+  Mask = 0x10
+  Property    (Screen space deformation)
+  Description (Use custom slot map for screen space particles deformation)
+  DependencyReset = $TEX_Custom
+}
+
+Property
+{
+  Name = %DEFORMATION
+  Mask = 0x20
+  Property    (Deformation)
+  Description (Use custom slot map for per-particle deformation)
+  DependencyReset = $TEX_Custom
+}
+
+Property
+{
+  Name = %COLOR_LOOKUP
+  Mask = 0x40
+  Property    (Color lookup)
+  Description (Use custom slot [1] map for applying color lookup)
+  DependencyReset = $TEX_CustomSecondary
+}
+
+Property
+{
+  Name = %ALPHA_LOOKUP
+  Mask = 0x80
+  Property    (Alpha Lookup)
+  Description (Use Alpha Brightness for Color Lookup and additionally lookup Alpha channel from lookup map, (requires Color Lookup to be enabled))
+}
+
+Property
+{
+  Name = %SPECULAR_LIGHTING
+  Mask = 0x100
+  Property    (Specular Lighting)
+  Description (Calculate specular lighting in addition to diffuse lighting)
+  DependencyReset = $TEX_Normals
+}
+
+Property
+{
+  Name = %DEPTH_FIXUP
+  Mask = 0x200
+  Property    (Depth Fixup)
+  Description (Write depth for depth of field and postprocessing)
+}
+
+Property
+{
+  Name = %NORMAL_MAP
+  Mask = 0x400
+  Property    (Normal map)
+  Description (Use normal-map texture)
+  DependencySet = $TEX_Normals
+  DependencyReset = $TEX_Normals
+  Hidden
+}
+
+Property
+{
+  Name = %REFRACTION_TINTING
+  Mask = 0x800
+  Property    (Refraction Tinting)
+  Description (Use color texture to tint refraction)
+}
+
+Property
+{
+  Name = %GLOW_MAP
+  Mask = 0x1000
+  Property    (Glow map)
+  Description (Use this map to mask the particle glow)
+  DependencySet = $TEX_Detail
+  DependencyReset = $TEX_Detail
+  Hidden
+}
+
+Property
+{
+  Name = %GPU_FACING_VELOCITY
+  Mask = 0x2000
+  Property    (GPU Particles Facing Velocity)
+  Description (GPU Particles Facing Velocity)
+  Hidden
+}
+
+Property
+{
+  Name = %SECOND_DIFF
+  Mask = 0x4000
+  Property    (Second Diffuse Map)
+  Description (Use SecondaryDiffuse map to blend RGB diffuse colors with original)
+}
+
+Property
+{
+  Name = %SECOND_ALPHA
+  Mask = 0x8000
+  Property    (Second Alpha Map)
+  Description (Use SecondaryAlpha Mask Map to multiply with original alpha (Greyscale / R channel))
+}
+
+Property
+{
+  Name = %MASK_SECOND_DIFF
+  Mask = 0x10000
+  Property    (Mask Second Diffuse Map)
+  Description (Use Second DiffuseMaps Alpha Channel as Mask for secondary Diffuse Blend)
+}
+
+Property
+{
+  Name = %RADIAL_MAPPING
+  Mask = 0x20000
+  Property    (Radial Mapping)
+  Description (Maps Gradient from DiffuseMap in a Circle. Use texture tiling Y to sample Vertically)
+}
+
+Property
+{
+  Name = %SECOND_ALPHA_RGB
+  Mask = 0x40000
+  Property    (4 Channels Alpha)
+  Description (Multiply SecondAlpha Maps RGB channels into Alpha as additinal Octaves (Alpha channel masks Secondary Alpha))
+}
+
+Property
+{
+  Name = %GLOW_EDGE
+  Mask = 0x80000
+  Property    (Glowing Edges)
+  Description (Adds Emissive on Alpha Edges)
+}
+
+Property
+{
+  Name = %FLOW_MAP
+  Mask = 0x100000
+  Property    (Flow Map)
+  Description (Use Flow Map Texture. (RG-Channels for direction, B-Channel for blend-time offset))
+}
+
+Property
+{
+  Name = %PIXELATE
+  Mask = 0x200000
+  Property    (Pixelate)
+  Description (Pixelate Diffuse Map to a set pixel width and height (Pixelates the refraction if Refraction is enabled))
+}
+
+Property
+{
+  Name = %ALPHA_MASK
+  Mask = 0x800000
+  Property    (Alpha from Mask)
+  Description (Use separate Greyscale Mask Map as Alpha insted of Diffuse-Map Alpha Channel)
+}
+
+Property
+{
+  Name = %MOTION_VECTOR
+  Mask = 0x2000000
+  Property    (Motion Vector)
+  Description (Use motion vector map to interpolate flipbook frames)
+}
+
+Property
+{
+  Name = %SCREEN_MASK
+  Mask = 0x4000000
+  Property    (Screen Space Mask)
+  Description (Uses a Screen Space Mask Map (Separete Alpha Map) to Mask Particles)
+}

@@ -1,0 +1,299 @@
+////////////////////////////////////////////////////////////////////////////
+//
+//  Crytek Engine Source File.
+//  Shader extension
+// Copyright (C), Crytek Studios, 2001-2020.
+// -------------------------------------------------------------------------
+//  File name:   Illumination.ext
+//  Version:     v1.00
+//  Created:     16/2/2004 by Andrey Honich.
+//  Compilers:   
+//  Description: Illumination shader extension used by the editor
+//               for automatic shader generation (based on "Illumination" shader template)
+// -------------------------------------------------------------------------
+//  History:
+//
+////////////////////////////////////////////////////////////////////////////
+
+
+
+Version (1.00)
+
+UsesCommonGlobalFlags
+
+Property
+{
+  Name = %NORMAL_MAP
+  Mask = 0x1
+  Property    (Normal map)
+  Description (Use normal-map texture)
+  DependencySet = $TEX_Normals
+  DependencyReset = $TEX_Normals
+  Hidden
+}
+
+Property
+{
+  Name = %SPECULAR_MAP
+  Mask = 0x10
+  Property    (Specular map)
+  Description (Use specular map as separate texture)
+  DependencySet = $TEX_Specular
+  DependencyReset = $TEX_Specular
+  Hidden
+}
+
+Property
+{
+  Name = %DETAIL_MAPPING
+  Mask = 0x4000
+  Property    (Detail mapping)
+  Description (Use detail mapping)
+  DependencyReset = $TEX_Detail
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %CLOTHING_SYSTEM%DETAIL_ATLAS
+}
+
+Property
+{
+  Name = %OFFSET_BUMP_MAPPING
+  Mask = 0x20000
+  Property    (Offset bump mapping)
+  Description (Use offset bump mapping (requires height map (_displ)))
+  DependencyReset = $TEX_Normals
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %CLOTHING_SYSTEM
+}
+
+Property
+{
+  Name = %VERTCOLORS
+  Mask = 0x400000
+  Property    (Vertex Colors)
+  Description (Use vertex colors)
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %CLOTHING_SYSTEM%SNDUVS
+}
+
+Property
+{
+  Name = %BILLBOARD
+  Mask = 0x2000
+  Property    (Billboard)
+  Description (Rotate geometry towards camera)
+  // WH GM: Hid this because we are using BILLBOARD_ATLAS instead
+  Hidden
+}
+
+Property
+{
+  Name = %DECAL
+  Mask = 0x2000000
+  Property    (Decal)
+  Description (Use as Decal)
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %BLENDLAYER%DIR_OVERLAY%CLOTHING_SYSTEM
+}
+
+Property
+{
+  Name = %PARALLAX_OCCLUSION_MAPPING
+  Mask = 0x8000000
+  Property    (Parallax occlusion mapping)
+  Description (Use parallax occlusion mapping (requires height map (_displ)))
+  DependencyReset = $TEX_Normals
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %CLOTHING_SYSTEM
+}
+
+#ifdef FEATURE_MESH_TESSELLATION
+Property
+{
+  Name = %DISPLACEMENT_MAPPING
+  Mask = 0x10000000
+  Property    (Displacement mapping)
+  Description (Use displacement mapping (requires height map (_displ)))
+  //DependencySet = $TEX_Height
+  DependencyReset = $TEX_Normals
+}
+
+Property
+{
+  Name = %PHONG_TESSELLATION
+  Mask = 0x20000000
+  Property    (Phong tessellation)
+  Description (Use rough approximation of smooth surface subdivision)
+}
+
+Property
+{
+  Name = %PN_TESSELLATION
+  Mask = 0x40000000
+  Property    (PN triangles tessellation)
+  Description (Use rough approximation of smooth surface subdivision)
+}
+#endif
+
+Property
+{
+  Name = %DIRTLAYER
+  Mask = 0x200000
+  Property    (Dirtlayer)
+  Description (Deprecated - Dirt layer blended on top of base map (RGBA dirt map required in Custom slot))
+  DependencyReset = $TEX_Custom
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %BLENDLAYER%CLOTHING_SYSTEM
+}
+
+Property
+{
+  Name = %BLENDLAYER
+  Mask = 0x100
+  Property    (Blendlayer)
+  Description (Normal-mapped diffuse layer blended on top of base material)
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %DIR_OVERLAY%CLOTHING_SYSTEM%WEAPON
+}
+
+Property
+{
+  Name = %ALPHAMASK_DETAILMAP
+  Mask = 0x800000
+  Property    (DetailMap mask in Diffuse alpha)
+  Description (Use diffuse map alpha for masking detail maps)
+  // WH GM: Negation is intentional, this param makes sense only if %DETAIL_MAPPING is enabled
+  DependencyHide = !%DETAIL_MAPPING
+}
+
+Property
+{
+  Name = %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+  Mask = 0x10000
+  Property    (Silhouette POM)
+  Description (Parallax occlusion mapping with silhouette (requires height map (_displ)))
+  DependencyReset = $TEX_Normals
+  // WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+  DependencyHide = %CLOTHING_SYSTEM
+}
+
+Property
+{
+  Name = %SUBSURFACE_SCATTERING
+  Mask = 0x80000
+  DependencySet = $UserEnabled
+  Hidden
+  // WH GM: No need to add DependencyHide as this is always enabled and doesn't increase combinations #KCD2-495677
+}
+
+// WH[TB, TBa]: secondary material blendig controlled by a surface normal
+Property
+{
+	Name = %DIR_OVERLAY
+	Mask = 0x40
+	Property    (Dir overlay)
+	Description (Dir affected overlay along world normal)
+	// WH GM: Added DependencyHide to reduce combinations #KCD2-495677
+	DependencyHide = %CLOTHING_SYSTEM%WEAPON
+}
+
+// WH[TB, TBa]: secondary UVs
+Property
+{
+  Name = %SNDUVS
+  Mask = 0x400
+  Property    (2UVs from VC)
+  Description (Use second UV set from vertex color)
+  DependencyHide = %CLOTHING_SYSTEM
+}
+
+Property
+{
+	Name = %USE_FIRST_UV_DETMAP
+	Mask = 0x8000000000
+	Property(Use 1st UVs for DetailMap)
+	Description(When second UVs are used, detailmap uses it by default, this swithes it back to 1st)
+	// WH GM: Negation is intentional, this param makes sense only if %SNDUVS is enabled
+	DependencyHide = !%SNDUVS
+}
+
+// WH[TBa]: weapon
+Property
+{
+	Name = %WEAPON
+	Mask = 0x800000000
+	Property    (Weapon)
+	Description (Weapon specific rust, blood and sharpening zones)
+	// WH GM: DependencyHide is not symmetric to make sure the hiding order is the same as in IllumValidations.cfi
+	// For example if both %WEAPON and %CLOTHING_SYSTEM are enabled in a legacy mtl, the %WEAPON should be hidden and not the other way around.
+	DependencyHide = %DIR_OVERLAY%CLOTHING_SYSTEM
+}
+
+// WH[TBa]: colorizing (now used for enviro)
+Property
+{
+  Name = %COLORIZING
+  Mask = 0x2000000000
+  Property    (Colorizing with HSV)
+  Description (Colorize with HSV parameter)
+  DependencyHide = %COLORIZING_WITH_MASK%DIR_OVERLAY%CLOTHING_SYSTEM%WEAPON
+}
+
+Property
+{
+  Name = %COLORIZING_WITH_MASK
+  Mask = 0x100000
+  Property    (Colorizing with region texture)
+  Description (Colorize with region texture)
+  DependencyHide = %DIR_OVERLAY%CLOTHING_SYSTEM%WEAPON
+}
+
+// WH[TB,TBa]: detail atlas
+Property
+{
+  Name = %DETAIL_ATLAS
+  Mask = 0x200000
+  Property    (Detail Atlas)
+  Description (Uses atlas of detail textures, addressed by diffuse alpha channel)
+  DependencyReset = $TEX_Detail
+  DependencyHide = %CLOTHING_SYSTEM
+}
+
+Property
+{
+  Name = %CLOTHING_SYSTEM
+  Mask = 0x4
+  Property    (Clothing system)
+  Description (Enables properties required for clothing system.)
+  // WH GM: DependencyHide is not symmetric to make sure the hiding order is the same as in IllumValidations.cfi
+  // For example if both %WEAPON and %CLOTHING_SYSTEM are enabled in a legacy mtl, the %WEAPON should be hidden and not the other way around.
+}
+
+// WH TBa: turn of transmittance for two sided materials
+Property
+{
+  Name = %TRANSMITTANCE
+  Mask = 0x20
+  Property    (Transmittance)
+  Description (Enables transmittance for double-sided materials.)
+  DependencyHide = %CLOTHING_SYSTEM
+}
+
+// WH[DH]: Sample sun shadow in the transparent pass
+Property
+{
+  Name = %TRANSPARENT_SHADOW
+  Mask = 0x8
+  Property    (Transparent sun shadow)
+  Description (Sample sun shadow in the transparent pass)
+}
+
+// WH GM: Ported from HumanSkin shader to use for shield painting #KCD2-509266
+Property
+{
+  Name = %DECAL_MAP
+  Mask = 0x80
+  Property    (Decal map)
+  Description (Use a decal map which is blended on top of the diffuse map)
+  // WH GM: Negation is intentional, available only if %CLOTHING_SYSTEM is enabled to reduce combinations
+  DependencyHide = !%CLOTHING_SYSTEM
+}
