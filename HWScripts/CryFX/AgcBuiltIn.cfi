@@ -1,0 +1,339 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+// This file is also included on the C++ side to ensure no mismatching structures.
+// These structures are intended to be passed under SV_UserData semantic (AGC extension).
+
+struct SConstantColor
+{
+	float4 color;
+};
+
+struct SMemSet32
+{
+	RWStructuredBuffer<uint> target;
+	uint source[4];
+};
+
+struct SMemSet128
+{
+	RWStructuredBuffer<uint4> target;
+	uint4 source;
+};
+
+struct SMemCpy
+{
+	RWStructuredBuffer<uint4> target;
+	StructuredBuffer<uint4> source;
+};
+
+struct STexCpy1DRawIndirect
+{
+    RWTexture1DArray<uint4> target;
+    Texture1DArray<uint4> source;
+};
+
+struct STexCpy1DF2FIndirect
+{
+    RWTexture1DArray<float4> target;
+    Texture1DArray<float4> source;
+};
+
+struct STexCpy1DF2SIndirect
+{
+    RWTexture1DArray<int4> target;
+    Texture1DArray<float4> source;
+};
+
+struct STexCpy1DF2UIndirect
+{
+    RWTexture1DArray<uint4> target;
+    Texture1DArray<float4> source;
+};
+
+struct STexCpy1DS2FIndirect
+{
+    RWTexture1DArray<float4> target;
+    Texture1DArray<int4> source;
+};
+
+struct STexCpy1DU2FIndirect
+{
+    RWTexture1DArray<float4> target;
+    Texture1DArray<uint4> source;
+};
+
+struct STexCpy1DRaw
+{
+	STexCpy1DRawIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint targetOffset;
+    uint sourceOffset;
+    uint region;
+};
+
+struct STexCpy1DF2F
+{
+	STexCpy1DF2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint targetOffset;
+    uint sourceOffset;
+    uint region;
+};
+
+struct STexCpy1DF2S
+{
+	STexCpy1DF2SIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint targetOffset;
+    uint sourceOffset;
+    uint region;
+};
+
+struct STexCpy1DF2U
+{
+	STexCpy1DF2UIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint targetOffset;
+    uint sourceOffset;
+    uint region;
+};
+
+struct STexCpy1DS2F
+{
+	STexCpy1DS2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint targetOffset;
+    uint sourceOffset;
+    uint region;
+};
+
+struct STexCpy1DU2F
+{
+	STexCpy1DU2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint targetOffset;
+    uint sourceOffset;
+    uint region;
+};
+
+struct STexCpy2DRawIndirect
+{
+    RWTexture2DArray<uint4> target;
+    Texture2DArray<uint4> source;
+};
+
+struct STexCpy2DF2FIndirect
+{
+    RWTexture2DArray<float4> target;
+    Texture2DArray<float4> source;
+};
+
+struct STexCpy2DF2SIndirect
+{
+    RWTexture2DArray<int4> target;
+    Texture2DArray<float4> source;
+};
+
+struct STexCpy2DF2UIndirect
+{
+    RWTexture2DArray<uint4> target;
+    Texture2DArray<float4> source;
+};
+
+struct STexCpy2DS2FIndirect
+{
+    RWTexture2DArray<float4> target;
+    Texture2DArray<int4> source;
+};
+
+struct STexCpy2DU2FIndirect
+{
+    RWTexture2DArray<float4> target;
+    Texture2DArray<uint4> source;
+};
+
+struct STexCpy2DRaw
+{
+	STexCpy2DRawIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint2 targetOffset;
+    uint2 sourceOffset;
+    uint2 region;
+};
+
+struct STexCpy2DF2F
+{
+	STexCpy2DF2FIndirect* pIndirect;
+	uint targetMip;
+	uint sourceMip;
+	uint targetSlice;
+	uint sourceSlice;
+	uint2 targetOffset;
+	uint2 sourceOffset;
+	uint2 region;
+};
+
+struct STexCpy2DF2S
+{
+	STexCpy2DF2SIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint2 targetOffset;
+    uint2 sourceOffset;
+    uint2 region;
+};
+
+struct STexCpy2DF2U
+{
+	STexCpy2DF2UIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint2 targetOffset;
+    uint2 sourceOffset;
+    uint2 region;
+};
+
+struct STexCpy2DS2F
+{
+	STexCpy2DS2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint2 targetOffset;
+    uint2 sourceOffset;
+    uint2 region;
+};
+
+struct STexCpy2DU2F
+{
+	STexCpy2DU2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint targetSlice;
+    uint sourceSlice;
+    uint2 targetOffset;
+    uint2 sourceOffset;
+    uint2 region;
+};
+
+struct STexCpy3DRawIndirect
+{
+    RWTexture3D<uint4> target;
+    Texture3D<uint4> source;
+};
+
+struct STexCpy3DF2FIndirect
+{
+    RWTexture3D<float4> target;
+    Texture3D<float4> source;
+};
+
+struct STexCpy3DF2SIndirect
+{
+    RWTexture3D<int4> target;
+    Texture3D<float4> source;
+};
+
+struct STexCpy3DF2UIndirect
+{
+    RWTexture3D<uint4> target;
+    Texture3D<float4> source;
+};
+
+struct STexCpy3DS2FIndirect
+{
+    RWTexture3D<float4> target;
+    Texture3D<int4> source;
+};
+
+struct STexCpy3DU2FIndirect
+{
+    RWTexture3D<float4> target;
+    Texture3D<uint4> source;
+};
+
+struct STexCpy3DRaw
+{
+	STexCpy3DRawIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint3 targetOffset;
+    uint3 sourceOffset;
+    uint3 region;
+};
+
+struct STexCpy3DF2F
+{
+	STexCpy3DF2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint3 targetOffset;
+    uint3 sourceOffset;
+    uint3 region;
+};
+
+struct STexCpy3DF2S
+{
+	STexCpy3DF2SIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint3 targetOffset;
+    uint3 sourceOffset;
+    uint3 region;
+};
+
+struct STexCpy3DF2U
+{
+	STexCpy3DF2UIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint3 targetOffset;
+    uint3 sourceOffset;
+    uint3 region;
+};
+
+struct STexCpy3DS2F
+{
+	STexCpy3DS2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint3 targetOffset;
+    uint3 sourceOffset;
+    uint3 region;
+};
+
+struct STexCpy3DU2F
+{
+	STexCpy3DU2FIndirect* pIndirect;
+    uint targetMip;
+    uint sourceMip;
+    uint3 targetOffset;
+    uint3 sourceOffset;
+    uint3 region;
+};
