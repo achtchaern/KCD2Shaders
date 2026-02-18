@@ -1,0 +1,555 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+/////////////////////////////////////////////
+// Has to be included after VolumetricFog.cfi
+/////////////////////////////////////////////
+
+// Samplers
+SamplerState            ssFwdBilinearWrap      : register(s10);
+SamplerComparisonState  ssFwdComparison        : register(s11);
+
+// Resources
+Texture2D<min16float4>               Fwd_SceneTarget        : register(t38);
+Texture2D<min16float4>               Fwd_ShadowMap0         : register(t50);
+Texture2D<min16float4>               Fwd_ShadowMap1         : register(t15);
+Texture2D<min16float4>               Fwd_ShadowMap2         : register(t19);
+Texture2D<min16float4>               Fwd_ShadowMap3         : register(t30);
+// WH[TBa]: vol clouds use different texture format, KCD2-117194
+#if VOLUMETRIC_CLOUD_SHADOWS_WH
+Texture3D<min16float4>               Fwd_CloudShadowMap     : register(t31);
+#else
+Texture2D<min16float4>               Fwd_CloudShadowMap     : register(t31);
+#endif
+Texture2D<min16float4>               Fwd_ShadowNoise        : register(t34);
+Texture2D<min16float4>               Fwd_SceneDepth         : register(t32);
+Texture2DArray<min16float4>          Fwd_SunShadowMask      : register(t38);
+Texture3D<min16float4>               Fwd_volFogTex          : register(t42);
+TextureCube<min16float4>             Fwd_volFogEnvTex0      : register(t43);
+TextureCube<min16float4>             Fwd_volFogEnvTex1      : register(t44);
+TextureCube<min16float4>             Fwd_GlobalProbe        : register(t45);
+TextureCube<min16float4>             Fwd_EnvProbeSpecular   : register(t20);
+TextureCube<min16float4>             Fwd_EnvProbeDiffuse    : register(t21);
+
+// Constants
+cbuffer CBPerPassForward : register(b5)
+{
+	// Fog parameters
+	struct
+	{
+		float4 vfParams;
+		float4 vfRampParams;
+		float4 vfSunDir;
+		float3 vfColGradBase;
+		float  padding0;
+		float3 vfColGradDelta;
+		float  padding1;
+		float4 vfColGradParams;
+		float4 vfColGradRadial;
+		float4 vfShadowDarkening;
+		float4 vfShadowDarkeningSunAmb;
+	} cbFog;
+
+	// Voxel-based volumetric fog parameters
+	struct
+	{
+		float4 vfSamplingParams;
+		float4 vfDistributionParams;
+		float4 vfScatteringParams;
+		float4 vfScatteringBlendParams;
+		float4 vfScatteringColor;
+		float4 vfScatteringSecondaryColor;
+		float4 vfHeightDensityParams;
+		float4 vfHeightDensityRampParams;
+		float4 vfDistanceParams;
+		float4 vfGlobalEnvProbeParams0;
+		float4 vfGlobalEnvProbeParams1;
+	} cbVoxelFog;
+
+	// Forward shadow map sampling parameters
+	struct
+	{
+		float4x4 TexGen0;
+		float4x4 TexGen1;
+		float4x4 TexGen2;
+		float4x4 TexGen3;
+
+		float4 vInvShadowMapSize;
+		float4 fDepthTestBias;
+		float4 fOneDivFarDist;
+		float4 fKernelRadius;
+
+		float4 CloudShadowParams;
+		float4 CloudShadowAnimParams;
+
+		float4 irreg_kernel_2d[8];  // HALF_MAX_SHADOW_SAMPLES_NUM
+	} cbShadowSampling;
+	
+	struct
+	{
+		float4 CloudShadingColorSun;
+		float4 CloudShadingColorSky;
+	} cbClouds;
+	
+	struct
+	{
+		float4 IntegrationMode;
+	} cbSVOGI;
+};
+
+#include "TiledShading.cfi"
+
+SShadowSamplingParams GetShadowSamplingParams()
+{
+	SShadowSamplingParams s;
+
+    s.TexGen0 = cbShadowSampling.TexGen0;
+    s.TexGen1 = cbShadowSampling.TexGen1;
+    s.TexGen2 = cbShadowSampling.TexGen2;
+    s.TexGen3 = cbShadowSampling.TexGen3;
+
+    s.InvShadowMapSize = cbShadowSampling.vInvShadowMapSize;
+    s.DepthTestBias = cbShadowSampling.fDepthTestBias; // defines how hard depth test is (default is 100 - hard test)
+    s.OneDivFarDist = cbShadowSampling.fOneDivFarDist;
+    s.KernelRadius = cbShadowSampling.fKernelRadius;
+
+    s.CloudShadowParams = cbShadowSampling.CloudShadowParams;
+    s.CloudShadowAnimParams = cbShadowSampling.CloudShadowAnimParams;
+
+    s.IrregKernel2D = cbShadowSampling.irreg_kernel_2d;
+
+    return s;
+}
+
+min16float Fwd_SampleSunShadowMaps(float3 worldPos)
+{
+	ShadowCascades shadowCascades;
+	shadowCascades.shadowMap0 = Fwd_ShadowMap0;
+	shadowCascades.shadowMap1 = Fwd_ShadowMap1;
+	shadowCascades.shadowMap2 = Fwd_ShadowMap2;
+	shadowCascades.shadowMap3 = Fwd_ShadowMap3;
+	shadowCascades.cloudShadowTex = Fwd_CloudShadowMap;
+	
+	ShadowSamplingContext samplingContext;
+	samplingContext.comparisonSampler = ssFwdComparison;
+	samplingContext.pointSamplerWrap = ssPointWrap;
+	samplingContext.pointSamplerClamp = ssPointClamp;
+	samplingContext.bilinearSamplerWrap = ssFwdBilinearWrap;
+	samplingContext.noiseTex = Fwd_ShadowNoise;
+	
+	return 1 - ShadowDepthTest(GetShadowSamplingParams(), shadowCascades, samplingContext, worldPos);
+}
+
+min16float Fwd_SampleCachedShadowMap(float3 worldPos)
+{
+	float4 p;
+	ShadowTexSpace(float4(worldPos, 1), cbShadowSampling.TexGen0, cbShadowSampling.fOneDivFarDist.x, p);
+	
+	p.xy /= p.w;
+	p.z -= cbShadowSampling.fDepthTestBias.x;
+	
+    min16float fShadow0, fShadow1, fShadow2, fShadow3;
+	float2 texelOffset = cbShadowSampling.vInvShadowMapSize.xx * 0.5;
+	
+	shadow_sample(Fwd_ShadowMap1, ssFwdComparison, float3(p.xy + float2(-texelOffset.x, -texelOffset.y), p.z), fShadow0);
+	shadow_sample(Fwd_ShadowMap1, ssFwdComparison, float3(p.xy + float2(+texelOffset.x, -texelOffset.y), p.z), fShadow1);
+	shadow_sample(Fwd_ShadowMap1, ssFwdComparison, float3(p.xy + float2(+texelOffset.x, +texelOffset.y), p.z), fShadow2);
+	shadow_sample(Fwd_ShadowMap1, ssFwdComparison, float3(p.xy + float2(-texelOffset.x, +texelOffset.y), p.z), fShadow3);
+	
+	return (fShadow0 + fShadow1 + fShadow2 + fShadow3) / 4;
+}
+
+SFogParams GetFogParams()
+{
+	SFogParams params;
+
+	params.viewPos.xyz = g_VS_WorldViewPos.xyz;
+
+	params.heightDensityScale = cbFog.vfParams.x;
+	params.heightDensityAtBaseHeight = cbFog.vfParams.y;
+	params.heightDiffFromBase = cbFog.vfParams.z;
+	params.expHeightDiffFromBase = cbFog.vfParams.w;
+
+	params.rampParams = cbFog.vfRampParams;
+
+	params.sunDir = cbFog.vfSunDir.xyz;
+	params.densityClamp = cbFog.vfSunDir.w;
+
+	params.colGradBase = cbFog.vfColGradBase;
+
+	params.colGradDelta = cbFog.vfColGradDelta;
+
+	params.heightColGradScale = cbFog.vfColGradParams.x;
+	params.heightColGradOffset = cbFog.vfColGradParams.y;
+	params.radialSizeCtrl = cbFog.vfColGradParams.z;
+	params.radialLobeCtrl = cbFog.vfColGradParams.w;
+
+	params.radialColor = cbFog.vfColGradRadial.xyz;
+	params.invZFar = cbFog.vfColGradRadial.w;
+
+	return params;
+}
+
+SVolumetricFogParams GetVolumetricFogParams()
+{
+	SVolumetricFogParams params;
+
+	params.sunDir = CV_SunLightDir.xyz;
+	params.padding0 = 0.0f;
+
+	params.nearDist = cbVoxelFog.vfSamplingParams.x;
+	params.invFarMinusNearDist = cbVoxelFog.vfSamplingParams.y;
+	params.maxIndex = cbVoxelFog.vfSamplingParams.z;
+	params.invMaxIndex = cbVoxelFog.vfSamplingParams.w;
+
+	params.screenSize = CV_ScreenSize.xy;
+	params.farMinusNearDist = cbVoxelFog.vfDistributionParams.y;
+	params.invMaxIndexMinusOne = cbVoxelFog.vfDistributionParams.z;
+
+	params.viewPos = g_VS_WorldViewPos.xyz;
+	params.framwCountJitter = cbVoxelFog.vfDistributionParams.w;
+
+	params.scatterCoefficient = cbVoxelFog.vfScatteringParams.x;
+	params.extinctionCoefficient = cbVoxelFog.vfScatteringParams.y;
+	params.blendFactor = cbVoxelFog.vfScatteringBlendParams.x;
+	params.blendMode = cbVoxelFog.vfScatteringBlendParams.y;
+
+	params.cDiffuse1 = cbVoxelFog.vfScatteringColor.xyz;
+	params.padding1 = 0.0f;
+
+	params.cDiffuse2 = cbVoxelFog.vfScatteringSecondaryColor.xyz;
+	params.padding2 = 0.0f;
+
+	params.anisotropy1.x = cbVoxelFog.vfScatteringParams.z;
+	params.anisotropy1.y = cbVoxelFog.vfScatteringParams.w;
+	params.anisotropy2.x = cbVoxelFog.vfScatteringColor.w;
+	params.anisotropy2.y = cbVoxelFog.vfScatteringSecondaryColor.w;
+
+	params.heightDensityScale = cbVoxelFog.vfHeightDensityParams.x;
+	params.densityAtViewer = cbVoxelFog.vfHeightDensityParams.y;
+	params.fogVisibility = cbVoxelFog.vfHeightDensityParams.z;
+	params.clampTransmittance = cbVoxelFog.vfHeightDensityParams.w;
+
+	params.rampStart = cbVoxelFog.vfHeightDensityRampParams.x;
+	params.rampEnd = cbVoxelFog.vfHeightDensityRampParams.y;
+	params.oneOverRampDiff = cbVoxelFog.vfHeightDensityRampParams.z;
+	params.rampStartOverRampDiff = cbVoxelFog.vfHeightDensityRampParams.w;
+
+	params.farDistTopLeft = cbVoxelFog.vfDistanceParams.x;
+	params.farDistTopCenter = cbVoxelFog.vfDistanceParams.y;
+	params.farDistCenterLeft = cbVoxelFog.vfDistanceParams.z;
+	params.farDistCenter = cbVoxelFog.vfDistanceParams.w;
+
+#if %_RT_VOLUMETRIC_FOG
+	params.globalProbeColor0 = cbVoxelFog.vfGlobalEnvProbeParams0.xyz;
+	params.globalProbeAttenuation0 = cbVoxelFog.vfGlobalEnvProbeParams0.w;
+
+	params.globalProbeColor1 = cbVoxelFog.vfGlobalEnvProbeParams1.xyz;
+	params.globalProbeAttenuation1 = cbVoxelFog.vfGlobalEnvProbeParams1.w;
+#endif
+
+	params.timeParams.x = CV_AnimGenParams.z;
+	params.timeParams.y = CV_AnimGenParams.z * 0.5f;
+	params.timeParams.z = CV_AnimGenParams.y;
+	params.timeParams.w = CV_AnimGenParams.w;
+
+	return params;
+}
+
+VolumetricFogSampling GetVolumetricFogSampling()
+{
+	VolumetricFogSampling vfs;
+
+	vfs.volumetricFogTex = Fwd_volFogTex;
+	vfs.globalEnvProbeTex0 = Fwd_volFogEnvTex0;
+	vfs.globalEnvProbeTex1 = Fwd_volFogEnvTex1;
+	vfs.trilinearClampSState = ssMaterialTrilinearClamp;
+
+	return vfs;
+}
+
+void Fwd_ApplyFog(in float3 worldPos, in float3 cameraToWorldPos, in float4 WPos, inout min16float3 color)
+{
+#if %_RT_FOG
+	#if %_RT_VOLUMETRIC_FOG
+		SVolumetricFogParams params = GetVolumetricFogParams();
+		VolumetricFogSampling vfs = GetVolumetricFogSampling();
+		const min16float4 globalFogColor = GetVolumetricFogAnalyticalColor(params, vfs, cameraToWorldPos, length(cameraToWorldPos));
+		VolumetricFogTexcoord vtc = GetVolumetricFogTexcoordParamByScreenPos(params, WPos.xyzw);
+		const min16float4 vf = GetVolumetricFogValue(vfs, vtc);
+		ApplyVolumetricFog(params, vf, globalFogColor, vtc, color.rgb);
+#else
+		SFogParams params = GetFogParams();
+		min16float4 localFogColor = GetVolumetricFogColor(params, worldPos, cameraToWorldPos);
+		color.xyz = lerp(localFogColor.xyz , color.xyz, saturate(localFogColor.w));
+#endif
+#endif
+}
+
+float4 Fwd_GetLocalFogColor(in float3 worldPos, in float3 cameraToWorldPos)
+{
+	float4 localFogColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+#if %_RT_FOG
+	#if %_RT_VOLUMETRIC_FOG
+		SVolumetricFogParams params = GetVolumetricFogParams();
+		VolumetricFogSampling vfs = GetVolumetricFogSampling();
+		localFogColor = GetVolumetricFogAnalyticalColor(params, vfs, cameraToWorldPos, length(cameraToWorldPos)).xyzw;
+	#else
+		SFogParams params = GetFogParams();
+		localFogColor = GetVolumetricFogColor(params, worldPos, cameraToWorldPos);
+	#endif
+#endif
+
+	return localFogColor;
+}
+
+void Fwd_ApplyFog(in float4 localFogColor, in float4 WPos, inout min16float3 color)
+{
+#if %_RT_FOG
+	#if %_RT_VOLUMETRIC_FOG
+		SVolumetricFogParams params = GetVolumetricFogParams();
+		VolumetricFogSampling vfs = GetVolumetricFogSampling();
+		VolumetricFogTexcoord vtc = GetVolumetricFogTexcoordParamByScreenPos(params, WPos.xyzw);
+		min16float4 vf = GetVolumetricFogValue(vfs, vtc);
+		ApplyVolumetricFog(params, vf, localFogColor, vtc, color.rgb);
+	#else
+		color.xyz = lerp(localFogColor.xyz, color.xyz, saturate(localFogColor.w));
+	#endif
+#endif
+}
+
+struct ForwardShadingParams
+{
+	bool                   applyProbes;
+	bool                   applyNonProbes;
+	bool                   skipSpecularProbes;
+	
+	SamplerState           ssTrilinearClamp;
+};
+
+void Fwd_QuickShading(in ForwardShadingParams shadingParams, in ForwardShadingAttribs attribs, inout float3 diffuseAcc, inout float3 specularAcc)
+{
+    min16float probeWeightSum = 0;
+	float3 viewVec = -normalize(attribs.worldPos);
+    min16float specCubeLod = TILED_SHADING_SPECPROBE_MAXMIP - attribs.smoothness * TILED_SHADING_SPECPROBE_MAXMIP;
+    min16float NdotV = saturate(dot(viewVec, attribs.normalSpecProbe));
+    min16float3 envFresnel = GetEnvmapFresnel(attribs.reflectance, attribs.smoothness, NdotV);
+    min16float2 envBRDF = Fwd_EnvironmentBRDF.SampleLevel(shadingParams.ssTrilinearClamp, min16float2(NdotV, attribs.smoothness), 0).xy;
+	envFresnel = lerp(envBRDF.xxx, envBRDF.yyy, attribs.reflectance);
+
+	uint lightShadeInfoIdx = 0;
+	
+	if (shadingParams.applyProbes)
+	{
+		[loop]
+		while (lightShadeInfoIdx < TILED_SHADING_MAX_NUM_LIGHTS && Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType == TILEDLIGHT_TYPE_PROBE)
+		{
+			if (probeWeightSum < 1)
+			{
+				STiledLightShadeInfo light = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx];
+				float3 position = attribs.worldPos;
+				float3 lightVec = (light.posRad.xyz - GetWorldViewPos()) - position;
+				
+				// Compute attenuation for box
+                min16float3 tmpLightVec;
+				tmpLightVec.x = dot( light.projectorMatrix[0].xyz, lightVec );
+				tmpLightVec.y = dot( light.projectorMatrix[1].xyz, lightVec );
+				tmpLightVec.z = dot( light.projectorMatrix[2].xyz, lightVec );
+				
+				[branch] if (abs(tmpLightVec.x) < 1 && abs(tmpLightVec.y) < 1 && abs(tmpLightVec.z) < 1)  // Required for correctness and performance
+				{
+					tmpLightVec = MapCubeToSphere( tmpLightVec );
+                    min16float attenuation = GetAttenuation(tmpLightVec, 1, true, light.attenuationParams.y) * light.attenuationParams.x;
+					uint4 resIndexClamps = GetResourceIndexAndMipClamps(light.resIndex);
+				
+					// Diffuse
+                    min16float4 diffuseProbe = Fwd_DiffuseCubeArray.SampleLevel(shadingParams.ssTrilinearClamp, float4(attribs.normal, resIndexClamps.x), resIndexClamps.y);
+					diffuseProbe.rgb = DecodeHDRCubemap( diffuseProbe ).rgb;
+                    min16float probeWeight = (1 - probeWeightSum) * attenuation;
+					diffuseAcc += diffuseProbe.rgb * light.color.rgb * probeWeight;
+			
+					if (!shadingParams.skipSpecularProbes)
+					{
+						// Specular
+                        min16float tmpGloss = 0;
+						float3 tmpReflVec = reflect(-viewVec, attribs.normalSpecProbe);
+						CubemapBoxParallaxCorrection( tmpReflVec, (light.posRad.xyz - GetWorldViewPos()) - position, light.shadowMatrix[0].xyz, light.shadowMatrix[1].xyz, tmpGloss );
+                        min16float4 specularProbe = Fwd_SpecCubeArray.SampleLevel(shadingParams.ssTrilinearClamp, float4(tmpReflVec, resIndexClamps.x), max(resIndexClamps.z, specCubeLod));
+						specularProbe.rgb = DecodeHDRCubemap( specularProbe ).rgb * envFresnel;
+						specularAcc += specularProbe.rgb * light.color.rgb * light.color.a * probeWeight;
+					}	
+					
+					probeWeightSum += probeWeight;
+				}
+			}
+			
+			lightShadeInfoIdx++;
+		}
+	}
+		
+	if (shadingParams.applyNonProbes)
+	{
+		while (lightShadeInfoIdx < TILED_SHADING_MAX_NUM_LIGHTS && 
+		       Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType > TILEDLIGHT_TYPE_PROBE)
+		{
+			const float3 position = attribs.worldPos;
+            const min16float4 posRad = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].posRad;
+            const float3 lightVec = (posRad.xyz - GetWorldViewPos()) - position;
+			
+			if (length( lightVec ) < posRad.w && Fwd_TiledLightsShadeInfo[lightShadeInfoIdx].lightType != TILEDLIGHT_TYPE_SUN)
+			{
+				STiledLightShadeInfo light = Fwd_TiledLightsShadeInfo[lightShadeInfoIdx];
+				bool skipShading = false;
+			
+				ForwardLightParams lightParams = CreateForwardLightParamsWH(LT_TILED);
+				lightParams.lightVec = normalize(lightVec);
+				lightParams.illuminanceWH.color = light.color.rgb;
+				lightParams.illuminanceWH.clipping = GetLightClippingWH(light, length( lightVec ));
+
+				if (light.lightType == LIGHT_TYPE_REGULAR_AREA || light.lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+				{
+					lightParams.illuminanceWH.inverseSquareAttenuation = GetAreaLighAsAttenuatedPointWH(light, position);
+				}
+				else
+				{
+					lightParams.illuminanceWH.inverseSquareAttenuation = GetPhysicalBulbLightAttenuationWH(light, length( lightVec ));
+				}
+
+				if (light.lightType == TILEDLIGHT_TYPE_REGULAR_PROJECTOR)
+				{
+					if (lightParams.illuminanceWH.clipping > 0)
+					{
+						float4 projTC = mul( light.projectorMatrix, float4( position + GetWorldViewPos(), 1.0f ) );  
+						projTC.xy /= projTC.w;		
+						
+						if (projTC.w < 0 || min( projTC.x, projTC.y ) < 0 || max( projTC.x, projTC.y ) > 1)  // Avoid back-projection
+							skipShading = true;
+						else
+						{
+							uint4 resIndexClamps = GetResourceIndexAndMipClamps(light.resIndex);
+							lightParams.illuminanceWH.color *= Fwd_SpotTexArray.SampleLevel( shadingParams.ssTrilinearClamp, float3(projTC.xy, resIndexClamps.x), resIndexClamps.y ).xxx;
+						}
+					}
+				}
+				else if (light.lightType == TILEDLIGHT_TYPE_REGULAR_POINTFACE)
+				{
+					uint cubeFace = selectCubeFace(lightVec);
+					
+					if (light.resIndex != cubeFace)
+						skipShading = true;
+				}
+					
+				if (!skipShading)
+				{
+                    float3 diffuse, specular;
+					Callback_ShadingDirect(attribs, lightParams, diffuse, specular);
+					
+					diffuseAcc  += diffuse;
+					specularAcc += specular;
+				}
+			}
+		
+			lightShadeInfoIdx++;
+		}
+	}
+}
+
+void Fwd_StandardShading(in MaterialAttribsCommon commonAttribs, inout ForwardShadingAttribs fwdAttribs, inout float3 diffuseAcc, inout float3 specularAcc, bool applySunShadows = true, bool isOpaque = true)
+{
+	fwdAttribs.normal = commonAttribs.NormalWorld;
+	fwdAttribs.normalSpecProbe = fwdAttribs.normal;
+	fwdAttribs.reflectance = commonAttribs.Reflectance;
+	fwdAttribs.albedo = commonAttribs.Albedo;
+	fwdAttribs.smoothness = commonAttribs.Smoothness;
+    fwdAttribs.areaAttribs = (AreaLightShadingAttribs) 0; // will be filled out by TiledForwardShading
+	
+	// Sun shading
+	{
+		min16float shadowOcclusion = 1.0;
+		
+		// WH[DH]: Sample sun shadow in the transparent pass
+	#if !%_RT_SECONDARY_VIEW && %_RT_TILED_SHADING
+        if (isOpaque && applySunShadows)
+        {
+            shadowOcclusion = 1 - Fwd_SunShadowMask.Load(int4(fwdAttribs.screenUV * CV_ScreenSize.xy, 0, 0)).r;
+        }
+    #if %TRANSPARENT_SHADOW
+        else
+        {
+            shadowOcclusion = 1 - Fwd_SampleSunShadowMaps(fwdAttribs.worldPos + GetWorldViewPos());
+        }
+    #endif    
+    #else
+        // [DEV-22752] Fix shadow support in forward opaque without tiled shading
+        // shadowOcclusion = Fwd_SampleCachedShadowMap(fwdAttribs.worldPos + GetWorldViewPos(viewId));
+    #endif
+		
+		ForwardLightParams lightParams = CreateForwardLightParamsWH(LIGHT_TYPE_SUN);
+		lightParams.lightVec = CV_SunLightDir.xyz;
+		lightParams.illuminanceWH.color = CV_SunColor.xyz * shadowOcclusion;
+		Callback_ShadingDirect(fwdAttribs, lightParams, diffuseAcc, specularAcc);
+	}
+	
+#if %_RT_SECONDARY_VIEW	
+	// Global environment probe
+	{
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		diffuseAcc += Fwd_GlobalProbe.SampleLevel(ssMaterialTrilinear, fwdAttribs.normal, 8).rgb;
+		float3 viewVec = normalize(-fwdAttribs.worldPos);
+		float NdotV = saturate(dot(viewVec, fwdAttribs.normal));
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		specularAcc += GetEnvironmentCMap(Fwd_GlobalProbe, SampStateTrilinearClamp, reflect(-viewVec, fwdAttribs.normal), fwdAttribs.smoothness).rgb * GetEnvmapFresnel(fwdAttribs.reflectance, fwdAttribs.smoothness, NdotV);
+	}
+#endif
+	
+#if %_RT_TILED_SHADING
+
+	TiledForwardShadingParams shadingParams;
+	
+	shadingParams.applyProbes = true;
+	shadingParams.applyNonProbes = true;
+	shadingParams.skipSpecularProbes = false;
+
+	shadingParams.applyThreePointLighting = false; // WH[Woody]
+	
+	shadingParams.localLightShadowsMode = isOpaque ? Mode_Deferred : Mode_Forward;
+	shadingParams.highQualityShadowFiltering = true;
+	
+	shadingParams.ssdoMode =  isOpaque ? Mode_Deferred : Mode_Disabled;
+	shadingParams.svogiMode = isOpaque ? Mode_Deferred : Mode_Disabled;
+
+	shadingParams.ssTrilinearClamp = SampStateTrilinearClamp;
+	shadingParams.ssComparison = ssFwdComparison;
+	
+	#if %_RT_MOBILE_PIPELINE
+		shadingParams.localLightShadowsMode = Mode_Disabled;
+		shadingParams.ssdoMode = Mode_Disabled;
+		shadingParams.svogiMode = Mode_Disabled;
+	#endif
+	
+	TiledForwardShading(shadingParams, fwdAttribs, diffuseAcc, specularAcc);
+	
+#else
+
+	#if %_RT_MOBILE_PIPELINE
+		// Sample single environment probe only for performance reasons
+		diffuseAcc += GetTextureCubeLod(Fwd_EnvProbeDiffuse, ssFwdBilinearWrap, min16float4(fwdAttribs.normal, min16float(0)));
+		min16float3 viewVec = normalize(-fwdAttribs.worldPos);
+		min16float NdotV = saturate(dot(viewVec, fwdAttribs.normal));
+		specularAcc += GetEnvironmentCMap(Fwd_EnvProbeSpecular, ssFwdBilinearWrap, reflect(-viewVec, fwdAttribs.normal), fwdAttribs.smoothness) * GetEnvmapFresnel(fwdAttribs.reflectance, fwdAttribs.smoothness, NdotV);
+	#else
+		ForwardShadingParams shadingParams;
+	
+		shadingParams.applyProbes = true;
+		shadingParams.applyNonProbes = true;
+		shadingParams.skipSpecularProbes = false;
+	
+		shadingParams.ssTrilinearClamp = ssFwdBilinearWrap;
+
+		Fwd_QuickShading(shadingParams, fwdAttribs, diffuseAcc, specularAcc);
+	#endif
+#endif
+
+	// Apply albedo (using simple energy conservation between specular and diffuse)
+	diffuseAcc *= fwdAttribs.albedo * saturate(min16float(1) - GetLuminance(fwdAttribs.reflectance));
+}

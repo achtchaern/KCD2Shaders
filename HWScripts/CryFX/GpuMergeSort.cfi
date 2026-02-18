@@ -1,0 +1,7 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+struct SMergeSortItem 
+{
+	uint key;
+	uint payload;
+};

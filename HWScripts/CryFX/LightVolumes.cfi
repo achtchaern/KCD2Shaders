@@ -1,0 +1,136 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+// WH[TBa]: unify usage of STiledLightShadeInfo, KCD2-266483
+// keep the index type in sync with CLightVolumeBuffer::TiledLightIndex
+Buffer<uint> lightIndicesWH   : register(t33);
+
+struct SParticleLightInfo
+{
+	min16float3 cDirectional;
+	min16float3 vDirectional;
+	min16float sunShadow;
+	min16float ambientMult;
+};
+
+SParticleLightInfo FromLightData(min16float4 lightData0, min16float4 lightData1)
+{
+	SParticleLightInfo lightInfo;
+	lightInfo.cDirectional.rgb = lightData0.rgb;
+	lightInfo.vDirectional.rgb = lightData1.rgb;
+	lightInfo.sunShadow = lightData0.a;
+	lightInfo.ambientMult = lightData1.a;
+	return lightInfo;
+}
+
+void ToLightData(SParticleLightInfo lightInfo, out min16float4 lightData0, out min16float4 lightData1)
+{
+	lightData0 = min16float4(lightInfo.cDirectional, lightInfo.sunShadow);
+	lightData1 = min16float4(lightInfo.vDirectional, lightInfo.ambientMult);
+}
+
+
+// Add light properties into accumulators
+void SumLight(inout min16float4 cDirectional, inout min16float4 vDirectional, min16float3 vLight, min16float3 cDiffuse ) 
+{ 
+	// Set a total luminance component in color.a, for averaging
+	const min16float3 cRGBSum = min16float3(1,1,1);
+	min16float4 cDiffRGBL = min16float4(cDiffuse, dot(cDiffuse, cRGBSum));
+
+	// Sum directional scalar RGBL values
+	cDirectional += cDiffRGBL;
+
+	// Average direction, scaling by overall luminance.
+	vDirectional.xyz += vLight * cDiffRGBL.a;
+}
+
+// WH[TBa]: to mitigate flickering when particle vertices cross the light plane, KCD2-266483
+void SoftenAreaLightBoundariesWH(inout STiledLightShadeInfo light)
+{
+	// ensure there is always some fade-in
+	const float minFadeInRadius = 1.f;
+	light.projectorMatrix[3][3] = max(minFadeInRadius, light.projectorMatrix[3][3]);
+
+	// disable thick wall as it introduces sharp boundaries in the shading
+	light.areaLightWallThickness = 0;
+}
+
+void ProjectLightVolume(in float3 vWorldPos, in min16float sunShadow, in min16float backLighting, inout SParticleLightInfo lightInfo)
+{
+	lightInfo = (SParticleLightInfo)0;
+	min16float4 cDirectional = min16float4(0,0,0,0.00001);
+	min16float4 vDirectional = min16float4(0,0,0,0.00001);
+
+#if %_RT_LIGHTVOLUME0
+	[loop] for (uint i = particleInstance.lightVolumeStart; i < particleInstance.lightVolumeEnd; ++i)
+	{
+		// WH[TBa]: unify usage of STiledLightShadeInfo, KCD2-81869
+		uint lightId = lightIndicesWH[i];
+		STiledLightShadeInfo light = Fwd_TiledLightsShadeInfo[lightId];
+
+		float3 LightVecWS = light.posRad.xyz - vWorldPos;
+
+		float attenuation;
+		float clipping;
+		if (light.lightType == LIGHT_TYPE_SUN)
+		{
+			attenuation = 1;
+			clipping = sunShadow;
+			LightVecWS = light.posRad.xyz;
+		}
+		else if (light.lightType == LIGHT_TYPE_REGULAR_AREA || light.lightType == LIGHT_TYPE_REGULAR_AREAFACE)
+		{
+			SoftenAreaLightBoundariesWH(light);
+			clipping = GetLightClippingWH(light, length(LightVecWS));
+			attenuation = GetAreaLighAsAttenuatedPointWH(light, (vWorldPos - GetWorldViewPos()));
+		}
+		else
+		{
+			clipping = GetLightClippingWH(light, length(LightVecWS));
+			attenuation = GetPhysicalBulbLightAttenuationWH(light, length(LightVecWS));
+
+			if (light.lightType == LIGHT_TYPE_REGULAR_PROJECTOR)
+			{
+				float4 projTC = mul(light.projectorMatrix, float4(vWorldPos, 1.0f));  
+				projTC.xy /= projTC.w;		
+
+				// tradeoff bettwen flickering and correctness
+				const float smoothingBoundaries = 0.3f;
+				float minCoord = min(projTC.x, projTC.y);
+				float maxCoord = max(projTC.x, projTC.y);
+				// inside frustum in XY coordinates
+				clipping *= smoothstep(0, smoothingBoundaries, min(minCoord, 1.f - maxCoord));
+				// back projection
+				clipping *= smoothstep(0, smoothingBoundaries, projTC.w);
+			}
+		}
+
+		float3 LightVec = normalize(LightVecWS);
+
+		min16float3 cDiffuse = light.color.xyz * attenuation * clipping;
+		SumLight(cDirectional, vDirectional, LightVec, cDiffuse);
+	}
+#else
+
+    // Add sun.
+    min16float3 cDiffuse = CV_SunColor.rgb * sunShadow;
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	SumLight(cDirectional, vDirectional, CV_SunLightDir.xyz, cDiffuse);
+#endif
+
+	min16float fTotalDir = length(vDirectional);
+	min16float fDirectional = fTotalDir * rcp(cDirectional.a);
+
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	lightInfo.cDirectional = cDirectional.xyz * fDirectional;
+	lightInfo.vDirectional = vDirectional.xyz * (1 - backLighting) * rcp(fTotalDir);
+	lightInfo.ambientMult = (1 - fDirectional) * 0.25;
+	lightInfo.sunShadow = sunShadow;
+}
+
+
+
+min16float3 GetEnvLighting(SParticleLightInfo lightInfo, min16float3 vNormal, min16float diffuseTerm, min16float emissiveTerm, min16float backLighting)
+{
+	min16float3 cLight = lightInfo.cDirectional * (lightInfo.ambientMult + max(0, dot(lightInfo.vDirectional, vNormal) + backLighting));
+	return cLight * diffuseTerm + emissiveTerm;
+}

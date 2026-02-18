@@ -1,0 +1,970 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "PostEffectsLib.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = PostProcess;"
+>; 
+
+
+
+/// Constants ////////////////////////////
+float4 vDofParamsFocus0;
+float4 vDofParamsFocus1;
+float4 vDofParams2;//WH ocg.polischuk .xy contains jitter, z = inverted downscaleRatio //WH[Owlcat/Kazakov]: Z is empty, W is blurAmount for Near DoF. blurAmount for Far DoF is vDofParamsFocus1.w
+float4 vDofParams3;//WH ocg.polischuk .xy contains OffsetToSrcHalfPixel.xy
+float4 vAspectRatio;
+min16float4 vRainColor;
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Sprite-Based DOF
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct pixoutDofMRT
+{
+	min16float4 LayerNear  : COLOR0;
+	min16float4 LayerFar   : COLOR1;
+};
+
+struct a2vBokehQuad
+{
+  float4 Position  : POSITION;
+  float2 baseTC	   : TEXCOORD0;
+  float4 Color     : COLOR0;
+};
+
+struct v2fBokehQuad
+{
+	float4 Position  : SV_POSITION;  
+	float4 QuadPos   : TEXCOORD0; //zw dof params
+	float4 Color     : COLOR0;
+};
+
+struct fragBokehQuad
+{
+  float4 Position  : POSITION;  
+  float4 QuadPos   : TEXCOORD0; // this is implicitly filled by GPU after point sprite expansion
+  float4 Color     : COLOR0;
+};
+
+Texture2D texDofBkRef_SceneTarget : register(t0);
+Texture2D texDofBkRef_SceneDepth  : register(t1);
+Texture2D texDofBkRef_Dither      : register(t2);
+
+SamplerState ssDofBkRef_SceneTarget : register(s0);
+SamplerState ssDofBkRef_SceneDepth  : register(s1);
+SamplerState ssDofBkRef_Dither      : register(s2);
+
+v2fBokehQuad DofBokehRefVS(a2vBokehQuad IN, uint nVertexID : SV_VertexID)
+{
+	v2fBokehQuad OUT = (v2fBokehQuad) 0;
+
+	int nQuadID = nVertexID / 6;
+	float4 INPos = float4( nQuadID % g_VS_ScreenSize.x,  (nQuadID  - nQuadID % g_VS_ScreenSize.x)/g_VS_ScreenSize.x, 0, 0);
+	INPos.xy /= g_VS_HPosScale.xy;
+
+	float4 vOutPos = INPos;
+  float4 vPos = INPos;
+	
+	INPos.xy *= g_VS_ScreenSize.zw * 2.0;
+	INPos.xy += g_VS_ScreenSize.zw;
+
+	vOutPos = INPos;
+	vOutPos.xy =  vOutPos.xy *2 -1;
+
+	OUT.Position = float4(vOutPos.xy, 0, 1);//vWorldPos.z, fDepth); //mul(vpMatrix, vPos);  
+	float4 screenProj = HPosToScreenTC(OUT.Position);
+		
+	// fetch scene color - output vertex/quad color
+	float fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy, 0, 0)).x;
+	
+#if %_RT_SAMPLE1
+	// Dilate to avoid ghosting on edges due to lower resolution DOF
+	// This can cause artifacts in small cavities and on alpha-tested geometry
+	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * min16float2( vAspectRatio.w, vAspectRatio.w), 0, 0)).x);
+	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * min16float2(-vAspectRatio.w, vAspectRatio.w), 0, 0)).x);
+	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * min16float2( vAspectRatio.w,-vAspectRatio.w), 0, 0)).x);
+	fDepth = GetTexture2DLod(texDofBkRef_SceneDepth, ssDofBkRef_SceneDepth, float4(screenProj.xy + g_VS_ScreenSize.zw * min16float2(-vAspectRatio.w,-vAspectRatio.w), 0, 0)).x);
+#endif
+
+	// fetch depth - scale quad here
+	int2 vPosScreen = (screenProj.xy * g_VS_ScreenSize.xy);
+
+	OUT.QuadPos = 1;
+
+	fDepth *= g_VS_NearFarClipDist.y;
+
+	min16float fFocusRangeFar = 0;
+	min16float fFocusRangeNear = 0;
+	min16float fDepthBlur = 0;
+
+	min16float4 vFocusRanges = saturate( min16float4(fDepth.xxxx ) * vDofParamsFocus0.xzxz + vDofParamsFocus0.ywyw );
+	fFocusRangeFar  = max(vFocusRanges.x, vFocusRanges.z);
+	fFocusRangeNear = max(vFocusRanges.y, vFocusRanges.w);
+
+	min16float fFocusRangeNearMin =  (vDofParamsFocus1.y) * saturate( 1 - (fDepth / vDofParamsFocus1.x) ) ;		
+	fDepthBlur = (saturate( fFocusRangeNear * vDofParamsFocus1.z) +fFocusRangeFar)*vDofParamsFocus1.w;
+	
+	fDepthBlur *= 5.5;
+	fDepthBlur = min(20, fDepthBlur);
+
+	if( fDepthBlur < 0.1 )
+	{
+		OUT.Position.xy=0;
+		return OUT;
+	}
+
+	{
+    OUT.QuadPos = max(1, fDepthBlur );
+
+		// discard pixel sized quads
+		if( OUT.QuadPos.x == 0  )
+		{
+			OUT.Position.xy=0;
+			return OUT;
+		}
+	}
+
+	// lod blend weight
+	OUT.Color.w = ( sqrt(OUT.QuadPos.z) );
+
+	// Need to scale by pixel size
+	OUT.QuadPos.xy *= g_VS_ScreenSize.zw * 2.0;
+  // Scale by aspect ratio
+  OUT.QuadPos.xy *= vAspectRatio.xy;
+
+	OUT.QuadPos.xy = max(g_VS_ScreenSize.zw * 2.0, OUT.QuadPos.xy);
+
+	vFocusRanges = saturate( min16float4(fDepth.xxxx ) * vDofParamsFocus0.xzxz + vDofParamsFocus0.ywyw );
+	fDepthBlur = (saturate( fFocusRangeNear * vDofParamsFocus1.z) )*vDofParamsFocus1.w;
+	fDepthBlur += fFocusRangeNearMin;
+	fDepthBlur = min(20, fDepthBlur);
+	
+	OUT.QuadPos.z = fDepthBlur; // near blur
+
+	float4 vQuad[4] = 
+	{
+		GetTexture2DLod(texDofBkRef_SceneTarget, ssDofBkRef_SceneTarget, float4(screenProj.xy, 0, 0)),
+		GetTexture2DLod(texDofBkRef_SceneTarget, ssDofBkRef_SceneTarget, float4(screenProj.xy + g_VS_ScreenSize.zw * float2(2,2), 0, 0)),
+		GetTexture2DLod(texDofBkRef_SceneTarget, ssDofBkRef_SceneTarget, float4(screenProj.xy + g_VS_ScreenSize.zw * float2(2,0), 0, 0)),
+		GetTexture2DLod(texDofBkRef_SceneTarget, ssDofBkRef_SceneTarget, float4(screenProj.xy + g_VS_ScreenSize.zw * float2(0,2), 0, 0)),
+	};
+
+	vQuad[0].w = GetLuminance(vQuad[0]);
+	vQuad[1].w = GetLuminance(vQuad[1]);
+	vQuad[2].w = GetLuminance(vQuad[2]);
+	vQuad[3].w = GetLuminance(vQuad[3]);
+	min16float fLumDelta = abs(vQuad[0].w *3 - (vQuad[1].w+vQuad[2].w+vQuad[3].w));
+
+	const int2 WPos = (int2) vPosScreen.xy;
+	const int nIndex = WPos % 2;
+	if ((nIndex > 0) && fLumDelta <0.02) // if quad pixel similar luminance wise, just emit single geometry quad
+	{
+		OUT.Position.xy=0;
+		return OUT;
+	}
+
+	OUT.Color.rgb  = vQuad[0] + vQuad[1] + vQuad[2] + vQuad[3];
+	OUT.Color.rgb /= 4.0;
+
+  const float2 Verts[6] =
+  {
+      float2( 1,  1),
+      float2(-1,  1),
+      float2( 1, -1),
+
+      float2( 1, -1),
+      float2(-1,  1),
+      float2(-1, -1)
+  };
+  
+  OUT.Position.xy += Verts[nVertexID%6].xy * OUT.QuadPos.xy;
+  OUT.QuadPos = float4(Verts[nVertexID%6].xy*0.5+0.5, OUT.QuadPos.zw);
+
+	return OUT;
+}
+
+pixoutDofMRT DofBokehRefPS(fragBokehQuad IN)
+{
+	pixoutDofMRT OUT = (pixoutDofMRT) 0.0;
+
+	//clip(-1);
+	min16float2 tcQuad = IN.QuadPos.xy*2-1;	
+	// -8 ms for big kernels
+	min16float fLen = (dot(tcQuad, tcQuad));
+
+	clip( (1 - fLen  )  );
+
+	//tcQuad*=1.1; // add slight border offset
+	fLen = (dot(tcQuad, tcQuad));
+	
+	min16float fShapeBokeh = pow(fLen, ((IN.Color.w))) ;// * fLen;  // ^2
+	min16float4 cBokehShape = saturate(1-fShapeBokeh);
+	
+	// aproximate diffusion ring
+  cBokehShape += saturate(1-abs(fShapeBokeh*2-1));
+
+	min16float4 cScene = min16float4(IN.Color.rgb, 1);
+	cScene *= min16float4(cBokehShape.rgb, dot(cBokehShape.rgb, 0.333));
+
+	// Background layer splats
+	min16float fRangeNormK = vAspectRatio.z; // range normalization factor
+	OUT.LayerFar = cScene * saturate(1-IN.QuadPos.z) * fRangeNormK;
+	//OUT.LayerFar.rgb *=;
+
+	cScene = min16float4((IN.Color.rgb), 1); //*0.25
+	cScene *= min16float4(cBokehShape.rgb, dot(cBokehShape.rgb, 0.333));
+
+	// Foreground layer splats
+	OUT.LayerNear = cScene  *fRangeNormK* saturate(IN.QuadPos.z);
+
+	// Apply dither pattern (minimize banding artefacts from accumulation/blending + aproximate lens particles)	
+	min16float fDither = GetTexture2D(texDofBkRef_Dither, ssDofBkRef_Dither, IN.QuadPos.xy).w;
+	OUT.LayerFar += OUT.LayerFar * fDither;
+	OUT.LayerNear += OUT.LayerNear * fDither;
+
+	return OUT;
+}
+
+technique DofBokehRef
+{
+  pass p0
+  {
+    VertexShader = DofBokehRefVS() PostMotionBlurVS;
+    PixelShader = DofBokehRefPS() PostMotionBlurPS;
+    CullMode = None;        
+  }
+}
+
+Texture2D texDofNrm_DofLayer0   : register(t0);
+Texture2D texDofNrm_DofLayer1   : register(t1);
+Texture2D texDofNrm_SceneTarget : register(t2);
+Texture2D texDofNrm_DepthTarget : register(t3);
+
+SamplerState ssDofNrm_DofLayer0   : register(s0)
+SamplerState ssDofNrm_DofLayer1   : register(s1)
+SamplerState ssDofNrm_SceneTarget : register(s2)
+SamplerState ssDofNrm_DepthTarget : register(s3)
+
+pixout RefDofMBNormalizePS(vtxOut IN)
+{
+	pixout OUT = (pixout) 0;
+
+	PS_ScreenSize.zw*=2;
+	min16float4 cScene = GetTexture2D(texDofNrm_SceneTarget, ssDofNrm_SceneTarget, IN.baseTC.xy); 	
+		
+	min16float fDepth = GetTexture2D(texDofNrm_DepthTarget, ssDofNrm_DepthTarget, IN.baseTC.xy).x * PS_NearFarClipDist.y; 
+
+	min16float2 fullScaleTC = IN.baseTC.xy/CV_HPosScale.xy;
+	
+	min16float4 cLayerNear = GetTexture2D(texDofNrm_DofLayer0, ssDofNrm_DofLayer0, fullScaleTC + PS_ScreenSize.zw * float2(-1, -1)); 
+	cLayerNear.rgb /= cLayerNear.w>0? cLayerNear.w: 1;
+
+	min16float4 cLayerFar  = GetTexture2D(texDofNrm_DofLayer1, ssDofNrm_DofLayer1, fullScaleTC + PS_ScreenSize.zw * float2(-1, -1)); 
+	min16float4 cLayerFar1 = GetTexture2D(texDofNrm_DofLayer1, ssDofNrm_DofLayer1, fullScaleTC + PS_ScreenSize.zw * float2(1, -1)); 
+	min16float4 cLayerFar2 = GetTexture2D(texDofNrm_DofLayer1, ssDofNrm_DofLayer1, fullScaleTC + PS_ScreenSize.zw * float2(-1, 1)); 
+	min16float4 cLayerFar3 = GetTexture2D(texDofNrm_DofLayer1, ssDofNrm_DofLayer1, fullScaleTC + PS_ScreenSize.zw * float2(1, 1)); 
+	
+	// Blur final result - minimize noticeable bilinear upscaling artefacts
+	cLayerFar = (cLayerFar + cLayerFar1 + cLayerFar2 + cLayerFar3)*0.25;
+	cLayerFar.rgb /= cLayerFar.w>0? cLayerFar.w: 1;
+
+	min16float4 vFocusRanges = saturate( min16float4(fDepth.xxxx ) * vDofParamsFocus0.xzxz + vDofParamsFocus0.ywyw );
+	//min16float fDepthBlur = saturate( vFocusRanges.x)*vDofParamsFocus1.w;	
+	//min16float fDepthBlur = saturate( vFocusRanges.x*vFocusRanges.x*vFocusRanges.x*vFocusRanges.x)*vDofParamsFocus1.w;	
+	vFocusRanges.x *= vFocusRanges.x;
+	min16float fDepthBlur = saturate( vFocusRanges.xx)*vDofParamsFocus1.w;	
+
+	const float fFarBlend = saturate(fDepthBlur);
+    const float fNearBlend = saturate(sqrt(2.0 * cLayerNear.w));
+	OUT.Color = lerp(float4(cScene.rgb, 0), float4(cLayerFar.rgb, 1), fFarBlend);		
+	OUT.Color = lerp(OUT.Color, float4(cLayerNear.rgb, 1), fNearBlend);
+
+	return OUT;
+}
+
+technique RefDofMbNormalizePass
+{
+  pass p0
+  {
+    VertexShader = FullscreenTriVS() PostMotionBlurVS;
+    PixelShader = RefDofMBNormalizePS() PostMotionBlurPS;
+    CullMode = None;        
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Gather-Based DOF
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// NOTE: The DepthOfField stage uses matching formulas to determine if the near or far planes can
+// be skipped as an optimization. If this logic is changed, make sure the stage's logic is updated too.
+// Note that `depths` should have already been multiplied by the far plane distance by this point as well.
+void ComputeCircleOfConfusion(in float4 depths, out float4 nearCoC, out float4 farCoC)
+{
+	float4 FocusRangeNearMin = vDofParamsFocus1.y * saturate(1 - (depths / vDofParamsFocus1.x)) ;
+
+#if %_RT_SAMPLE2	
+	float4 vCocNear = saturate(depths * vDofParamsFocus0.z + vDofParamsFocus0.w) + FocusRangeNearMin;
+	nearCoC = vCocNear * vCocNear * vDofParams2.w; //WH[Owlcat/Kazakov]: Changed to use dedicated near DoF amount parameter
+	
+	nearCoC = clamp(nearCoC, -4, 4);
+#endif
+
+#if %_RT_SAMPLE3
+	float4 vCocFar = saturate(depths * vDofParamsFocus0.x + vDofParamsFocus0.y);
+	farCoC = vCocFar * vCocFar * vDofParamsFocus1.w;
+	
+	farCoC = max(farCoC, 0.00001);
+	farCoC = clamp(farCoC, -4, 4);
+#endif
+}
+
+float w0(float a)
+{
+	return (1.0/6.0)*(a*(a*(-a + 3.0) - 3.0) + 1.0);
+}
+
+float w1(float a)
+{
+	return (1.0/6.0)*(a*a*(3.0*a - 6.0) + 4.0);
+}
+
+float w2(float a)
+{
+	return (1.0/6.0)*(a*(a*(-3.0*a + 3.0) + 3.0) + 1.0);
+}
+
+float w3(float a)
+{
+	return (1.0/6.0)*(a*a*a);
+}
+
+// g0 and g1 are the two amplitude functions
+float g0(float a)
+{
+	return w0(a) + w1(a);
+}
+
+float g1(float a)
+{
+	return w2(a) + w3(a);
+}
+
+// h0 and h1 are the two offset functions
+float h0(float a)
+{
+	return -1.0 + w1(a) / (w0(a) + w1(a));
+}
+
+float h1(float a)
+{
+	return 1.0 + w3(a) / (w2(a) + w3(a));
+}
+
+float4 tex2D_bicubic(Texture2D tex, SamplerState samp, float2 uv, float2 res)
+{
+	uv = uv * res + 0.5;
+	float2 iuv = floor( uv );
+	float2 fuv = frac( uv );
+
+	float g0x = g0(fuv.x);
+	float g1x = g1(fuv.x);
+	float h0x = h0(fuv.x);
+	float h1x = h1(fuv.x);
+	float h0y = h0(fuv.y);
+	float h1y = h1(fuv.y);
+
+	float2 p0 = (float2(iuv.x + h0x, iuv.y + h0y) - 0.5) / res;
+	float2 p1 = (float2(iuv.x + h1x, iuv.y + h0y) - 0.5) / res;
+	float2 p2 = (float2(iuv.x + h0x, iuv.y + h1y) - 0.5) / res;
+	float2 p3 = (float2(iuv.x + h1x, iuv.y + h1y) - 0.5) / res;
+
+	return g0(fuv.y) * (g0x * GetTexture2D(tex, samp, p0)  + g1x * GetTexture2D(tex, samp, p1)) + g1(fuv.y) * (g0x * GetTexture2D(tex, samp, p2) + g1x * GetTexture2D(tex, samp, p3));
+}
+
+
+Texture2D<float4> DnScDoF_Depth            : register(t0);
+SamplerState DnScDoF_DepthSamp             : register(s0);  //PointClamp
+Texture2D<float4> DnScDoF_HDRTarg          : register(t1);
+SamplerState DnScDoF_HDRTargSamp           : register(s1);  //LinearClamp
+
+
+struct vtxOutDownscaleDof
+{
+	float4 HPosition  : SV_POSITION;
+	float2 tc : TEXCOORD0;
+};
+
+vtxOutDownscaleDof DownscaleDofVS(uint VertexID : SV_VertexID)
+{
+	vtxOutDownscaleDof OUT = (vtxOutDownscaleDof)0; 
+	OUT.HPosition = GetHPos_FromTriVertexID(VertexID);
+	OUT.tc = GetBaseTC_FromTriVertexID(VertexID);
+
+	return OUT;
+}
+
+struct OutDownscaleDof
+{
+#if %_RT_SAMPLE2
+	float4 LayerNear  : SV_Target0;
+#endif
+#if %_RT_SAMPLE3
+	float4 LayerFar   : SV_Target1;	
+#endif
+	float2 CocNearFar : SV_Target2;
+};
+
+// We must avoid leaking between layers and in-focus pixels. We take several measures to avoid this.
+// As a basic measure we store the CoC along with the color and use that as a weight during gathering (see DofPS).
+// To improve quality we use a bilinear sampler during the gather pass. This can reintroduce leaking.
+// To get rid of this we premultiply the color with the CoC during downsampling.
+// Finally, the downsampling can be another source of leaking.
+// Instead of simply averaging out the full resolution pixels we already weigh the colors during downsampling using the CoC from the full resolution depth.
+// See "Graphics Gems from Cryengine 3" Sousa 2013, page 42.
+
+//WH ocg.polischuk: modified to return unclamped alpha for KCD2-457929 and KCD2-508627, now does not apply 0.25 scale for better code reuse
+float4 DownsampleAndPremultiply(float3 color0, float3 color1, float3 color2, float3 color3, float4 CoC)
+{
+	// Weighted downsample
+	float4 CoCClamped = max(CoC, 0.0f.xxxx);
+	float3 resultColor =
+		float3(color0) * CoCClamped.x +
+		float3(color1) * CoCClamped.y +
+		float3(color2) * CoCClamped.z +
+		float3(color3) * CoCClamped.w;
+	float resultA = (CoC.x + CoC.y + CoC.z + CoC.w);
+
+	// The colors are now already weighted by the CoC.
+	// This is already the premultiplication that we want to avoid leaking, no need to normalize and re-apply CoC scaling.
+
+	return float4(resultColor, resultA);
+}
+
+//WH ocg.polischuk: helper functions for dof downscale
+//sample 4 tap color with gather
+void Sample4TapWH(in float2 tc, int2 offset, inout float3 color0, inout float3 color1, inout float3 color2, inout float3 color3)
+{
+	// Gather color from the corresponding pixels
+	float4 samplesRed   = DnScDoF_HDRTarg.GatherRed(  DnScDoF_HDRTargSamp, tc, offset);
+	float4 samplesGreen = DnScDoF_HDRTarg.GatherGreen(DnScDoF_HDRTargSamp, tc, offset);
+	float4 samplesBlue  = DnScDoF_HDRTarg.GatherBlue( DnScDoF_HDRTargSamp, tc, offset);
+
+	color0 = float3(samplesRed.x, samplesGreen.x, samplesBlue.x);
+	color1 = float3(samplesRed.y, samplesGreen.y, samplesBlue.y);
+	color2 = float3(samplesRed.z, samplesGreen.z, samplesBlue.z);
+	color3 = float3(samplesRed.w, samplesGreen.w, samplesBlue.w);
+}
+
+//accumulate dof downscale for 4 taps
+void DownscaleDof4TapWH(float4 depths, float3 color0, float3 color1, float3 color2, float3 color3, inout float3 OutLayerNear, inout float4 OutLayerFar, inout float OutCocNear)
+{
+	// Compute the circle of confusion (CoC) for the depth values
+	float4 CocNear, CocFar;
+	ComputeCircleOfConfusion(depths, CocNear, CocFar);
+#if %_RT_SAMPLE2
+	OutLayerNear += (color0 + color1 + color2 + color3);
+	OutCocNear = max(OutCocNear, max(max(CocNear.x,CocNear.y), max(CocNear.z,CocNear.w)));
+#endif
+#if %_RT_SAMPLE3
+	OutLayerFar += DownsampleAndPremultiply(color0, color1, color2, color3, CocFar);
+#endif
+}
+
+//accumulate dof downscale for single tap
+//with compiler optimizations there should be zero overhead from using 4 of DownscaleDof1Tap vs DownscaleDof4Tap
+//selection of DownscaleDof4Tap vs DownscaleDof1Tap depends on whether samples are taken with gather or individually
+void DownscaleDof1TapWH(float depth, float3 color, inout float3 OutLayerNear, inout float4 OutLayerFar, inout float OutCocNear)
+{
+	// Compute the circle of confusion (CoC) for the depth values
+	float4 CocNear, CocFar;
+	ComputeCircleOfConfusion(depth.xxxx, CocNear, CocFar);
+#if %_RT_SAMPLE2
+	OutLayerNear += color;
+	OutCocNear = max(OutCocNear, CocNear.x);
+#endif
+#if %_RT_SAMPLE3
+	float CoCClamped = max(CocFar.x, 0.0f);
+	OutLayerFar.rgb += color * CoCClamped;
+	OutLayerFar.a += CocFar.x;
+#endif
+}
+
+//get 4 depth samples individually
+float4 SampleDepth4TapWH(float2 baseUV, float2 pixelSize)
+{
+	float4 depths;
+	//uses same samples order as gather
+	depths.x = DnScDoF_Depth.Sample(DnScDoF_DepthSamp, baseUV + float2(0.0, pixelSize.y)).r;
+	depths.y = DnScDoF_Depth.Sample(DnScDoF_DepthSamp, baseUV + pixelSize.xy).r;
+	depths.z = DnScDoF_Depth.Sample(DnScDoF_DepthSamp, baseUV + float2(pixelSize.x, 0.0)).r;
+	depths.w = DnScDoF_Depth.Sample(DnScDoF_DepthSamp, baseUV).r;
+	depths *= PS_NearFarClipDist.y;
+	return depths;
+}
+
+//WH ocg.polischuk:
+//this function was rewritten to correctly support downscale with different ratios (mainly for KCD2-540459)
+//and correctly matching depth to color when they have different resolution
+//(we cant just use gather for depth in this case)
+//ratio is selected with combinations of _RT_SAMPLE4, _RT_SAMPLE0 and _RT_SAMPLE1 switches
+//2*2 ratio uses gather over 1 quad for depth and color
+//4*4 and 6*6 use gather for color, and separate depth samples
+//then there are exact 3*3 downsample which uses some gather over 2 quads + 2 individual samples for color,
+//	and individual samples for depth because of mismatching depth resolution
+//and 3*3 + 5*5 downscales with linear color samples filtering for non-exact 3*3 and 5*5 downscale modes
+
+OutDownscaleDof DownscaleDofPS(vtxOutDownscaleDof IN)
+{	
+	OutDownscaleDof OUT = (OutDownscaleDof) 0;
+
+	IN.tc += vDofParams3.xy;
+
+	float3 LayerNear = float3(0,0,0);
+	float4 LayerFar = float4(0,0,0,0);
+	float CocNear = 0.0;
+	float2 oneSrcPixelOffset = vDofParams2.z * PS_ScreenSize.zw;
+#if %_RT_SAMPLE4
+	//2*2, 4*4 or 6*6
+#if %_RT_SAMPLE1
+	//exact 4x4 downscale
+	float scalingCoeff = 1.0 / 16.0;
+#elif %_RT_SAMPLE0
+	//exact 2x2 downscale
+	float scalingCoeff = 0.25;
+#else
+	//6x6
+	float scalingCoeff = 1.0 / 36.0;
+#endif
+	float4 depths;
+	float3 color0, color1, color2, color3;
+#if %_RT_SAMPLE0
+	//2x2 downscale use gather, src color have same resolution as src depth
+	depths = DnScDoF_Depth.GatherRed(DnScDoF_DepthSamp, IN.tc);
+	depths *= PS_NearFarClipDist.y;
+#else
+	//4x4 and 6x6 downscale use single taps with unjitter
+	float2 unjitteredUV = IN.tc - vDofParams2.xy;
+	//move color uv to highres pixel cross
+	IN.tc += 0.5 * oneSrcPixelOffset.xy;
+	depths = SampleDepth4TapWH(unjitteredUV, oneSrcPixelOffset);
+#endif
+	Sample4TapWH(IN.tc, int2(0,0), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+#if !%_RT_SAMPLE0
+	depths = SampleDepth4TapWH(unjitteredUV + float2(2.0*oneSrcPixelOffset.x, 0.0), oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(2,0), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + float2(0.0, 2.0*oneSrcPixelOffset.y), oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(0,2), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + 2.0 * oneSrcPixelOffset.xy, oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(2,2), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+#if !%_RT_SAMPLE1
+	depths = SampleDepth4TapWH(unjitteredUV + float2(4.0*oneSrcPixelOffset.x, 0.0), oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(4,0), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + float2(0.0, 4.0*oneSrcPixelOffset.y), oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(0,4), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + float2(2.0, 4.0) * oneSrcPixelOffset.xy, oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(2,4), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + float2(4.0, 2.0) * oneSrcPixelOffset.xy, oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(4,2), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + 4.0 * oneSrcPixelOffset.xy, oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(4,4), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+#endif
+#endif
+
+#elif %_RT_SAMPLE0
+	// ~3.5*3.5 or ~4.5*4.5 downscale
+
+	//needs color samples with bilinear filtering
+	//needs individual depth samples with unjitter
+#if %_RT_SAMPLE1
+	int loopCount = 3;
+	float scalingCoeff = 1.0 / 9.0;
+#else
+	int loopCount = 5;
+	float scalingCoeff = 1.0 / 25.0;
+#endif
+	[unroll]
+	for (int i = 0; i < loopCount; ++i)
+	{
+		float2 TC = IN.tc;
+		[unroll]
+		for (int j = 0; j < loopCount; ++j)
+		{
+			float depth = GetTexture2D(DnScDoF_Depth, DnScDoF_DepthSamp, TC - vDofParams2.xy).r;
+			depth *= PS_NearFarClipDist.y;
+			float3 color = GetTexture2D(DnScDoF_HDRTarg, DnScDoF_HDRTargSamp, TC).rgb;
+			DownscaleDof1TapWH(depth, color, LayerNear, LayerFar, CocNear);
+			TC.x += oneSrcPixelOffset.x;
+		}
+		IN.tc.y += oneSrcPixelOffset.y;
+	}
+#else
+	//exact 3*3 downscale
+	float scalingCoeff = 1.0 / 9.0;
+
+	//uses individual depth samples and color samples with gather where possible
+	//sample 2 quads, drop one overlapping sample from second quat, + sample two corners separately
+	float2 unjitteredUV = IN.tc - vDofParams2.xy;
+	float4 depths = SampleDepth4TapWH(unjitteredUV, oneSrcPixelOffset);
+	float3 color0, color1, color2, color3;
+	Sample4TapWH(IN.tc, int2(0,0), color0, color1, color2, color3);
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	depths = SampleDepth4TapWH(unjitteredUV + oneSrcPixelOffset, oneSrcPixelOffset);
+	Sample4TapWH(IN.tc, int2(1,1), color0, color1, color2, color3);
+	//replace overlapping sample
+	depths.w = DnScDoF_Depth.Sample(DnScDoF_DepthSamp, unjitteredUV, int2(2,0)).r * PS_NearFarClipDist.y;
+	color3 = DnScDoF_HDRTarg.Sample(DnScDoF_HDRTargSamp, IN.tc, int2(2,0)).rgb;
+	DownscaleDof4TapWH(depths, color0, color1, color2, color3, LayerNear, LayerFar, CocNear);
+
+	//add last sample manually
+	depths.w = DnScDoF_Depth.Sample(DnScDoF_DepthSamp, unjitteredUV, int2(0,2)).r * PS_NearFarClipDist.y;
+	color3 = DnScDoF_HDRTarg.Sample(DnScDoF_HDRTargSamp, IN.tc, int2(0,2)).rgb;
+	DownscaleDof1TapWH(depths.w, color3, LayerNear, LayerFar, CocNear);
+#endif
+
+	LayerNear *= scalingCoeff;
+	LayerFar *= scalingCoeff;
+
+#if %_RT_SAMPLE2
+	OUT.LayerNear.rgb = LayerNear;
+	OUT.CocNearFar.x = CocNear;
+	OUT.LayerNear.a = saturate(OUT.CocNearFar.x);
+	OUT.LayerNear.rgb *= OUT.LayerNear.a;
+#endif
+
+#if %_RT_SAMPLE3
+	OUT.LayerFar = LayerFar;
+	OUT.CocNearFar.y = OUT.LayerFar.a;
+#endif
+	
+	return OUT;
+}
+
+technique DownscaleDof
+{
+  pass p0
+  {
+    VertexShader = DownscaleDofVS();
+    PixelShader = DownscaleDofPS();
+    CullMode = None;        
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float4> TMCoC_SCoC          : register(t0);
+SamplerState TMCoC_SCoCSamp           : register(s0);  //LinearClamp
+
+struct vtxOutMinCoC
+{
+	float4 HPosition : SV_POSITION;
+	float4 tc0 : TEXCOORD0;
+	float4 tc1 : TEXCOORD1;
+	float4 tc2 : TEXCOORD2;
+	float4 tc3 : TEXCOORD3;
+};
+
+struct OutTileMinCoC
+{
+	float2 CocNearFar : SV_Target0;
+};
+
+vtxOutMinCoC TileMinCoCVS(uint VertexID : SV_VertexID)
+{
+	vtxOutMinCoC OUT = (vtxOutMinCoC)0; 
+	OUT.HPosition = GetHPos_FromTriVertexID(VertexID);
+	float2 baseTC = GetBaseTC_FromTriVertexID(VertexID);
+	
+	OUT.tc0 = baseTC.xyxy + float4(-1,  0, 1,  0) * vDofParamsFocus1.zwzw;
+	OUT.tc1 = baseTC.xyxy + float4( 0, -1, 0,  1) * vDofParamsFocus1.zwzw;
+	OUT.tc2 = baseTC.xyxy + float4(-1, -1, 1,  1) * vDofParamsFocus1.zwzw;
+	OUT.tc3 = baseTC.xyxy + float4(-1,  1, 1, -1) * vDofParamsFocus1.zwzw;
+
+	return OUT;
+}
+
+OutTileMinCoC TileMinCoCPS(vtxOutMinCoC IN)
+{	
+	OutTileMinCoC OUT = (OutTileMinCoC) 0;
+
+	float2 coc0 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc0.xy).rg);
+	float2 coc1 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc0.zw).rg);
+	float2 coc2 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc1.xy).rg);
+	float2 coc3 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc1.zw).rg);
+	float2 coc4 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc2.xy).rg);
+	float2 coc5 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc2.zw).rg);
+	float2 coc6 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc3.xy).rg);
+	float2 coc7 = (GetTexture2D(TMCoC_SCoC, TMCoC_SCoCSamp, IN.tc3.zw).rg);
+
+	OUT.CocNearFar.r = max(coc0.rg, max(coc1, max(coc2, coc3))).r; // direction is inverted, take max
+	OUT.CocNearFar.g = min(coc0.rg, min(coc1, min(coc2, coc3))).g;
+
+	OUT.CocNearFar.r = max(OUT.CocNearFar.rg, max(coc4, max(coc5, max(coc6, coc7)))).r; // direction is inverted, take max
+	OUT.CocNearFar.g = min(OUT.CocNearFar.rg, min(coc4, min(coc5, min(coc6, coc7)))).g;
+
+	return OUT;
+}
+
+technique TileMinCoC
+{
+  pass p0
+  {
+    VertexShader = TileMinCoCVS();
+    PixelShader = TileMinCoCPS();
+    CullMode = None;        
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float4> DOF_CoCM           : register(t4);
+SamplerState DOF_PCSamp              : register(s0);  //PointClamp
+
+Texture2D<float4> DOF_HDRDoF0        : register(t1);
+Texture2D<float4> DOF_HDRDoF1        : register(t2);
+SamplerState DOF_LCSamp              : register(s1);  //LinearClamp
+
+float4 g_Taps[7*7];  // Max is 7x7 (for first iteration)
+
+struct pixout_dof
+{
+#if %_RT_SAMPLE2
+	float4 LayerNear  : SV_Target0;	
+#endif
+#if %_RT_SAMPLE3
+	float4 LayerFar   : SV_Target1;
+#endif
+	float2 CocNearFar : SV_Target2;		
+};
+
+pixout_dof DofPS(vtxOut IN)
+{
+	pixout_dof OUT = (pixout_dof) 0;
+
+	const int nNumTaps = vDofParamsFocus1.z;
+
+	float2 fCocScale = PS_ScreenSize.zw * 2.0;
+	
+	// Rescale (tweaked to be compatible with Sprite DOF)
+	float scale = max(PS_ScreenSize.x / 1920, PS_ScreenSize.y / 1080) * 4;
+	fCocScale *= scale;
+
+	static const float fOpticalVignettingAmount = 0.2f;
+	float2 optv_tc = (IN.baseTC.xy * 2 - 1) * fOpticalVignettingAmount;
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+	fCocScale *= 0.15;
+#endif
+
+#if %_RT_SAMPLE2
+	float4 cCenterTapNear = GetTexture2DLod(DOF_HDRDoF0, DOF_LCSamp, float4(IN.baseTC.xy, 0, 0));
+	float fCocNear = cCenterTapNear.w;
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1	
+	float4 cAccNear = float4(0,0,0,0);
+	float caccNear = 0;
+	OUT.LayerNear = cCenterTapNear;
+#else
+	float4 cAccNear = float4(0,0,0,0);
+	float caccNear = 0;
+#endif
+#endif
+
+#if %_RT_SAMPLE3
+	float4 cCenterTapFar = GetTexture2DLod(DOF_HDRDoF1, DOF_LCSamp, float4(IN.baseTC.xy, 0, 0));
+	float fCocFar = cCenterTapFar.w;
+
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1	
+	float4 cAccFar = float4(0,0,0,fCocFar);
+	float caccFar = 0;
+	OUT.LayerFar = cCenterTapFar;
+#else
+	float4 cAccFar = float4(0,0,0,0);
+	float caccFar = 0;
+#endif
+#endif
+
+	const float2 vMinTileCoC = (GetTexture2DLod(DOF_CoCM, DOF_PCSamp, float4(IN.baseTC.xy, 0, 0)).rg);
+	
+#if %_RT_SAMPLE2
+	// note - on nvidia getting better perf with single branch outside loops. on amd the oposite
+
+	[branch] if (vMinTileCoC.r>0.0)
+	{
+		[loop] for(int t = 0; t < nNumTaps; t ++)
+		{	
+			const float2 offset = g_Taps[t].xy;
+			const float fOptVignetting = 1 - abs(dot(optv_tc.xy, offset.xy));
+
+			float2 cocOffset = vMinTileCoC.r * fOptVignetting * fCocScale * offset.xy;
+			float4 cn = GetTexture2DLod(DOF_HDRDoF0, DOF_LCSamp, float4(IN.baseTC.xy + cocOffset, 0, 0));
+		
+			const float k = 1.075;
+			float wn = (cn.w >= vMinTileCoC.r * k) ? 1 : saturate(vMinTileCoC.r * k - cn.w);
+			
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+			cAccNear = max(cAccNear, cn);
+#else
+			cAccNear += cn*wn;
+			caccNear += wn;
+#endif
+		}
+	}
+#endif
+
+#if %_RT_SAMPLE3
+	[branch] if (vMinTileCoC.g>0.0)
+	{
+		[loop] for(int t = 0; t < nNumTaps; t ++)
+		{	
+			const float2 offset = g_Taps[t].xy;
+			const float fOptVignetting = 1-abs(dot(optv_tc.xy, offset.xy));
+
+			float2 cocOffset = fCocFar * fOptVignetting * fCocScale * offset.xy;
+			
+			float4 cf = GetTexture2DLod(DOF_HDRDoF1, DOF_LCSamp, float4(IN.baseTC.xy + cocOffset, 0, 0));
+			float wf = (cf.w >= fCocFar) ? 1 : saturate( cf.w );
+			
+#if %_RT_SAMPLE0 || %_RT_SAMPLE1
+			cAccFar = max(cAccFar, cf*wf);
+#else
+			cAccFar += cf*wf;
+			caccFar += wf;
+#endif
+		}
+	}
+#endif
+
+#if !%_RT_SAMPLE0 && !%_RT_SAMPLE1
+#if %_RT_SAMPLE2
+	cAccNear = caccNear ? cAccNear * rcp(caccNear) : cCenterTapNear;
+#endif
+#if %_RT_SAMPLE3
+	cAccFar = caccFar? cAccFar * rcp(caccFar) : cCenterTapFar;
+#endif
+#endif
+
+#if %_RT_SAMPLE2
+	OUT.LayerNear = cAccNear;
+	OUT.LayerNear.a = OUT.LayerNear.a;
+	OUT.CocNearFar.r = OUT.LayerNear.a;
+#endif
+#if %_RT_SAMPLE3
+	OUT.LayerFar = cAccFar;
+	OUT.LayerFar.a = OUT.LayerFar.a;
+	OUT.CocNearFar.g = OUT.LayerFar.a;
+#endif
+
+	return OUT;
+}
+
+technique Dof
+{
+  pass p0
+  {
+    VertexShader = FullscreenTriVS() PostMotionBlurVS;
+    PixelShader = DofPS() HDRPostProcessPS;
+    CullMode = None;        
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float4> CDOF_Depth         : register(t0);
+Texture2D<float4> CDOF_STarg         : register(t4);
+SamplerState CDOF_PCSamp             : register(s0);  //PointClamp
+
+Texture2D<float4> CDOF_HDRDoF0       : register(t1);
+Texture2D<float4> CDOF_HDRDoF1       : register(t2);
+SamplerState CDOF_LCSamp             : register(s1);  //LinearClamp
+
+pixout CompositeDofPS(vtxOut IN)
+{
+	pixout OUT = (pixout) 0;
+
+	min16float4 cScene = GetTexture2D(CDOF_STarg, CDOF_PCSamp, IN.baseTC.xy);
+	OUT.Color = cScene;
+
+#if %_RT_SAMPLE2
+	min16float4 cLayerNear = tex2D_bicubic(CDOF_HDRDoF0, CDOF_LCSamp, IN.baseTC.xy, PS_ScreenSize.xy * vDofParams2.z);//WH ocg.polischuk - vDofParams2.z contains downscaling ratio coeff
+#endif
+#if %_RT_SAMPLE3
+	min16float4 cLayerFar = tex2D_bicubic(CDOF_HDRDoF1, CDOF_LCSamp, IN.baseTC.xy, PS_ScreenSize.xy * vDofParams2.z);
+#endif
+	float4 nearCoC, farCoC;
+#if %_RT_SAMPLE1
+	//WH ocg.polischuk use edge smoothing when running with downscaled depth due to SR
+	//unjitter depth when running with SR upscale
+	float2 unjitteredUV = IN.baseTC.xy - vDofParams2.xy;
+
+	float2 depthOffset = PS_ScreenSize.zw / vDofParams2.z;
+	float4 depths;
+	depths.x = CDOF_Depth.Sample(CDOF_PCSamp, unjitteredUV - depthOffset.xy).r*PS_NearFarClipDist.y;
+	depths.y = CDOF_Depth.Sample(CDOF_PCSamp, unjitteredUV).r*PS_NearFarClipDist.y;
+	depths.z = CDOF_Depth.Sample(CDOF_PCSamp, unjitteredUV + float2(0, depthOffset.y)).r*PS_NearFarClipDist.y;
+	depths.w = CDOF_Depth.Sample(CDOF_PCSamp, unjitteredUV + float2(depthOffset.x, 0)).r*PS_NearFarClipDist.y;
+
+	ComputeCircleOfConfusion(depths, nearCoC, farCoC);
+
+	float2 minFar, maxFar;
+	minFar.xy = min(farCoC.xy, farCoC.zw);
+	minFar.x = min(minFar.x, minFar.y);
+	maxFar.xy = max(farCoC.xy, farCoC.zw);
+	maxFar.x = max(maxFar.x, maxFar.y);
+	farCoC.x = lerp(saturate(minFar.x), saturate(maxFar.x), pow(smoothstep(minFar.x, maxFar.x, cLayerFar.a), 1.5));
+#else
+	float depth = GetTexture2D(CDOF_Depth,CDOF_PCSamp, IN.baseTC.xy).x * PS_NearFarClipDist.y;
+	ComputeCircleOfConfusion(depth.xxxx, nearCoC, farCoC);
+#endif
+
+//WH ocg.polischuk: swapped near & far application order, as it was before 864077. this makes near plane objects edges being blurred
+#if %_RT_SAMPLE3
+	cLayerFar.rgb /= cLayerFar.a > 0 ? cLayerFar.a : 1.0f;
+	cLayerFar.a = saturate( farCoC.x );
+	OUT.Color = lerp(OUT.Color, cLayerFar, cLayerFar.a);
+#endif
+
+#if %_RT_SAMPLE2
+	cLayerNear.rgb = cLayerNear.rgb / (cLayerNear.a > 0 ? cLayerNear.a : 1.0f);
+	cLayerNear.a = saturate(cLayerNear.a);
+	OUT.Color = lerp(OUT.Color, cLayerNear, cLayerNear.a);
+#endif
+	
+	return OUT;
+}
+
+technique CompositeDof
+{
+  pass p0
+  {
+    VertexShader = FullscreenTriVS() PostMotionBlurVS;
+    PixelShader = CompositeDofPS() HDRPostProcessPS;
+    CullMode = None;        
+  }
+}

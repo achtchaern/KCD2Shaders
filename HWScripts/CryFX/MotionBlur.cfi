@@ -1,0 +1,237 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Motion Blur Helpers
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helpers for encoding/decoding motion vector for low precision 8-Bit UNorm textures.
+// This encoding is memory efficient and sufficient for motion blur, but should not be used for anything that requires accurate reprojection, e.g. TAA, super resolution or temporal denoising.
+float2 EncodeMotionVector8Bit(float2 vMotion)
+{
+	vMotion = sqrt(abs(vMotion)) * (vMotion.xy > 0.0f ? float2(1, 1) : float2(-1, -1));
+	return vMotion * 0.5h + 127.f / 255.f;
+}
+
+float2 DecodeMotionVector8Bit(float2 vMotionEncoded)
+{
+	vMotionEncoded.xy = (vMotionEncoded.xy - 127.f / 255.f) * 2.0f;
+	return (vMotionEncoded.xy * vMotionEncoded.xy) * (vMotionEncoded.xy > 0.0f ? float2(1, 1) : float2(-1, -1));
+}
+
+float2 PackLengthAndDepth(float2 motion, float depthLinear, float farClipDistance)
+{
+	const float velocityEncoded = saturate(sqrt(length(motion.xy) * 32.0f));
+	const float depthEncoded = depthLinear * farClipDistance / 255.0f;
+
+	return float2(velocityEncoded, depthEncoded);
+}
+
+// Depth is rescaled into [0, 255] range, but not scaled with far plane.
+// Ensures that depth weights are independent of far plane setting.
+float2 UnpackLengthAndDepth(float2 packedLenDepth)
+{
+	packedLenDepth.x = (packedLenDepth.x * packedLenDepth.x) / 32.0f;
+	packedLenDepth.y = packedLenDepth.y * 255.0f;
+	return packedLenDepth;
+}
+
+struct VelocityTileData
+{
+	float2 motionEncoded;
+	float velocityEncoded;
+};
+
+uint PackMaxVelocityTileDataToUint(VelocityTileData data)
+{
+	// Pack three 8-bit UNorm values into single uint.
+	// Pack velocity into most significant bits for efficient computation of motion with max velocity using max().
+	return (uint(data.motionEncoded.x * 255.0f + 0.5) << 0) |
+	       (uint(data.motionEncoded.y * 255.0f + 0.5) << 8) |
+	       (uint(data.velocityEncoded * 255.0f + 0.5) << 16);
+}
+
+VelocityTileData UnpackMaxVelocityTileDataFromUint(uint tileData)
+{
+	VelocityTileData result;
+
+	result.motionEncoded   = float2(
+		((tileData >> 0)  & 0xFF) / 255.0,
+		((tileData >> 8)  & 0xFF) / 255.0);
+	result.velocityEncoded = 
+		((tileData >> 16) & 0xFF) / 255.0;
+
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Motion Blur Filter
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// References:
+// [0] Next Generation Post Processing in Call of Duty Advances Warfare, Jimenez 2014
+// [1] A Reconstruction Filter for Plausible Motion Blur, Mcguire 2012
+// [2] A Fast and Stable Feature-Aware Motion Blur Filter, McGuire 2014
+
+// See [0], pages 62-63
+float MBSampleWeight(float centerDepth, float sampleDepth, float centerVelLen, float sampleVelLen, float sampleIndex, float lenToSampleIndex)
+{
+	// We are not using an explicit depth scale like in [0].
+	// Instead our depth scale is implicit in the depth range we get from our depth encoding, see UnpackLengthAndDepth().
+	const float2 depthCompare = saturate(0.5f + float2(1, -1) * (sampleDepth - centerDepth));
+	const float2 spreadCompare = saturate(1 + lenToSampleIndex * float2(centerVelLen, sampleVelLen) - sampleIndex);
+	return dot(depthCompare.xy, spreadCompare.xy);
+}
+
+float3 ApplyMotionBlur(float2 pos, float2 texcoord, Texture2D<float4> target,
+	SamplerState targetSampler, Texture2D<float2> velocity, SamplerState velSampler, Texture2D<float4> tiles,
+	float4 MotionBlurParams, bool tileOptimizationDebugVisualization = false)
+{
+#if %_RT_QUALITY
+	const int numSamples = 24; // High spec
+#elif %_RT_QUALITY1
+    // WH[DH]: Decreased number of samples
+	const int numSamples = 12; // Medium
+#else
+	const int numSamples = 6;  // Low
+#endif
+
+	// Randomize lookup into max velocity to reduce visibility of tiles with opposing directions.
+	// See [2], section 4.2
+	const float2 tileBorderDist = abs(frac(pos * MotionBlurParams.xy) - 0.5) * 2;
+
+	const float rndValue = NRand3(texcoord).x - 0.5;
+	const float2 tileOffset = tileBorderDist * rndValue;
+
+	const float2 screenTC = MapViewportToRaster(texcoord);
+
+	const float4 maxVelocityTileData = GetTexture2DLod(tiles, velSampler, float4(screenTC.xy + tileOffset * MotionBlurParams.xy, 0, 0));
+	const float2 maxVelocityTileMotion = DecodeMotionVector8Bit(maxVelocityTileData.xy);
+
+	// When min/max tile velocity is close the motion blur filter converges to a simple color average.
+	// In that case we skip sampling the depth/velocity texture.
+	const float tileMaxVelocity = maxVelocityTileData.b;
+	const float tileMinVelocity = maxVelocityTileData.a;
+
+	const float fastGatherThreshold = MotionBlurParams.z;
+	const float tileMinMaxDifference = tileMaxVelocity - tileMinVelocity;
+	const bool useFastGather = tileMinMaxDifference <= fastGatherThreshold;
+
+	// Sample count is divided evenly between forward/backwards directions.
+	// We need to cover the entire velocity vector in each direction.
+	const float sampleCountPerDirection = numSamples / 2;
+	const float2 blurStep = maxVelocityTileMotion.xy * rcp(sampleCountPerDirection);
+
+	// Quads are arranged in Z order via their lane indices:
+	// https://microsoft.github.io/DirectX-Specs/d3d/HLSL_SM_6_6_Derivatives.html
+	const int pixQuadIdx = WaveGetLaneIndex() % 4;
+	const int xOffset = pixQuadIdx & 0x1;
+	const int yOffset = pixQuadIdx >> 1;
+
+	// Simple checkerboard dither with 0.25 magnitude.
+	// See [0], pages 76-80.
+	const float samplingDither = (-0.25 + 2.0 * 0.25 * xOffset) * (-1.0 + 2.0 * yOffset);
+
+	// Early out when no motion (disabled to have more predictable costs)
+	//if (length(maxVelocityTileMotion.xy) < 0.0001f) return float4(sampleCenter.rgb, 1.0f);
+
+	// The 0.5 offset is important to ensure that both blur directions are evenly spaced.
+	// Without it the first samples will both be at zero, leading to an uneven blur distribution, which is visible as a hard line in the blur.
+	// See [0], page 81.
+	const float baseOffset = samplingDither + 0.5;
+
+	float3 result;
+
+	// Fast path when all threads in wave use fast gather.
+	// Avoids branches, reading background color, center depth/velocity and reduces ALU.
+	// Saves roughly 0.07ms on Series S.
+	// Adding another fast path when no threads are fast gather is slightly slower due to increasing register usage a bit.
+	const bool waveUniformFastGather = WaveActiveAllTrue(useFastGather);
+	if (waveUniformFastGather)
+	{
+		result = 0;
+
+		// All weights are known to be 1.
+		// Therefore can skip interpolation with center sample as well.
+		[unroll]
+		for (int s = 0; s < numSamples / 2; ++s)
+		{
+			const float curStep = s + baseOffset;
+			float2 tc0 = texcoord + blurStep * curStep;
+			float2 tc1 = texcoord - blurStep * curStep;
+
+			result.rgb += GetTexture2DLod(target, targetSampler, float4(tc0.xy, 0, 0)).rgb;
+			result.rgb += GetTexture2DLod(target, targetSampler, float4(tc1.xy, 0, 0)).rgb;
+		}
+		result *= rcp((float)numSamples);
+	}
+	else
+	{
+		// It is not faster to branch around this read using useFastGather
+		const float2 centerLenDepth = UnpackLengthAndDepth(GetTexture2DLod(velocity, velSampler, float4(screenTC.xy, 0, 0)));
+		float4 acc = float4(0, 0, 0, 0);
+
+		[unroll]
+		for (int s = 0; s < numSamples / 2; ++s)
+		{
+			const float curStep = s + baseOffset;
+			float2 tc0 = texcoord + blurStep * curStep;
+			float2 tc1 = texcoord - blurStep * curStep;
+
+			float weight0 = 1;
+			float weight1 = 1;
+
+			if (!useFastGather)
+			{
+				tc0 = MapViewportToRaster(tc0);
+				tc1 = MapViewportToRaster(tc1);
+
+				const float2 lenDepth0 = UnpackLengthAndDepth(GetTexture2DLod(velocity, velSampler, float4(tc0.xy, 0, 0)));
+				const float2 lenDepth1 = UnpackLengthAndDepth(GetTexture2DLod(velocity, velSampler, float4(tc1.xy, 0, 0)));
+
+				weight0 = MBSampleWeight(centerLenDepth.y, lenDepth0.y, centerLenDepth.x, lenDepth0.x, s, 1.0 / length(blurStep));
+				weight1 = MBSampleWeight(centerLenDepth.y, lenDepth1.y, centerLenDepth.x, lenDepth1.x, s, 1.0 / length(blurStep));
+
+				// Mirror weights to avoid discontinuities between real vs reconstructed background.
+				// See [0], pages 66-74.
+				const bool2 mirror = bool2(lenDepth0.y > lenDepth1.y, lenDepth1.x > lenDepth0.x);
+				weight0 = all(mirror) ? weight1 : weight0;
+				weight1 = any(mirror) ? weight1 : weight0;
+			}
+
+			acc += float4(GetTexture2DLod(target, targetSampler, float4(tc0.xy, 0, 0)).rgb, 1.0f) * weight0;
+			acc += float4(GetTexture2DLod(target, targetSampler, float4(tc1.xy, 0, 0)).rgb, 1.0f) * weight1;
+		}
+		acc.rgba *= rcp((float)numSamples);
+
+		const float3 sampleCenter = target.Load(int3(pos, 0)).rgb;
+
+		// Combine with background using accumulated alpha to ensure smooth gradients.
+		// See [0], pages 48-65.
+		// 
+		// This works great for smooth gradients of blurry foreground objects over background.
+		// However, it can cause artifacts for blurry background next to sharp foreground. This will fade in the sharp background due to not accumulating alpha over the sharp foreground objects.
+		// This can cause a visible discontinuity between the entirely blurry background and the less blurry background next to the foreground.
+		// This aritfact is visible with low shutterspeed and full camera motion vectors under camera movement on the blurred background next to the sharp weapon.
+		result = acc.rgb + sampleCenter * (1.0 - acc.a);
+	}
+
+	if (tileOptimizationDebugVisualization)
+	{
+		float3 debugColor;
+		if (waveUniformFastGather)
+		{
+			debugColor = float3(0, 1, 0);
+		}
+		else if (useFastGather)
+		{
+			debugColor = float3(1, 1, 0);
+		}
+		else
+		{
+			debugColor = float3(1, 0, 0);
+		}
+		result = lerp(result, debugColor, 0.5);
+	}
+
+	return result;
+}

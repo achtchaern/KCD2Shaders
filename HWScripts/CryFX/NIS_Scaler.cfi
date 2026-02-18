@@ -1,0 +1,448 @@
+// The MIT License(MIT)
+//
+// Copyright(c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files(the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and / or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions :
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+//---------------------------------------------------------------------------------
+// NVIDIA Image Scaling SDK  - v1.0.3
+//---------------------------------------------------------------------------------
+// The NVIDIA Image Scaling SDK provides a single spatial scaling and sharpening algorithm
+// for cross-platform support. The scaling algorithm uses a 6-tap scaling filter combined
+// with 4 directional scaling and adaptive sharpening filters, which creates nice smooth images
+// and sharp edges. In addition, the SDK provides a state-of-the-art adaptive directional sharpening algorithm
+// for use in applications where no scaling is required.
+//
+// The directional scaling and sharpening algorithm is named NVScaler while the adaptive-directional-sharpening-only
+// algorithm is named NVSharpen. Both algorithms are provided as compute shaders and
+// developers are free to integrate them in their applications. Note that if you integrate NVScaler, you
+// should NOT integrate NVSharpen, as NVScaler already includes a sharpening pass
+//
+// Pipeline Placement
+// ------------------
+// The call into the NVIDIA Image Scaling shaders must occur during the post-processing phase after tone-mapping.
+// Applying the scaling in linear HDR in-game color-space may result in a sharpening effect that is
+// either not visible or too strong. Since sharpening algorithms can enhance noisy or grainy regions, it is recommended
+// that certain effects such as film grain should occur after NVScaler or NVSharpen. Low-pass filters such as motion blur or
+// light bloom are recommended to be applied before NVScaler or NVSharpen to avoid sharpening attenuation.
+//
+// Color Space and Ranges
+// ----------------------
+// NVIDIA Image Scaling shaders can process color textures stored as either LDR or HDR with the following
+// restrictions:
+// 1) LDR
+//    - The range of color values must be in the [0, 1] range
+//    - The input color texture must be in display-referred color-space after tone mapping and OETF (gamma-correction)
+//      has been applied
+// 2) HDR PQ
+//    - The range of color values must be in the [0, 1] range
+//    - The input color texture must be in display-referred color-space after tone mapping with Rec.2020 PQ OETF applied
+// 3) HDR Linear
+//    - The recommended range of color values is [0, 12.5], where luminance value (as per BT. 709) of
+//      1.0 maps to brightness value of 80nits (sRGB peak) and 12.5 maps to 1000nits
+//    - The input color texture may have luminance values that are either linear and scene-referred or
+//      linear and display-referred (after tone mapping)
+//
+// If the input color texture sent to NVScaler/NVSharpen is in HDR format set NIS_HDR_MODE define to either
+// NIS_HDR_MODE_LINEAR (1) or NIS_HDR_MODE_PQ (2).
+//
+// Supported Texture Formats
+// -------------------------
+// Input and output formats:
+// Input and output formats are expected to be in the rages defined in previous section and should be
+// specified using non-integer data types such as DXGI_FORMAT_R8G8B8A8_UNORM.
+//
+// Coefficients formats:
+// The scaler coefficients and USM coefficients format should be specified using float4 type such as
+// DXGI_FORMAT_R32G32B32A32_FLOAT or DXGI_FORMAT_R16G16B16A16_FLOAT.
+//
+// Resource States, Buffers, and Sampler:
+// The game or application calling NVIDIA Image Scaling SDK shaders must ensure that the textures are in
+// the correct state.
+// - Input color textures must be in pixel shader read state. Shader Resource View (SRV) in DirectX
+// - The output texture must be in read/write state. Unordered Access View (UAV) in DirectX
+// - The coefficients texture for NVScaler must be in read state. Shader Resource View (SRV) in DirectX
+// - The configuration variables must be passed as constant buffer. Constant Buffer View (CBV) in DirectX
+// - The sampler for texture pixel sampling. Linear clamp SamplerState in Direct
+//
+// Adding NVIDIA Image Scaling SDK to a Project
+// --------------------------------------------
+// Include NIS_Scaler.h directly in your application or alternative use the provided NIS_Main.hlsl shader file.
+// Use NIS_Config.h to get the ideal shader dispatch values for your platform, to configure the algorithm constant
+// values (NVScalerUpdateConfig, and NVSharpenUpdateConfig), and to access the algorithm coefficients (coef_scale and coef_USM).
+//
+// Defines:
+// NIS_SCALER: default (1) NVScaler, (0) fast NVSharpen only, no upscaling
+// NIS_HDR_MODE: default (0) disabled, (1) Linear, (2) PQ
+// NIS_BLOCK_WIDTH: pixels per block width. Use GetOptimalBlockWidth query for your platform
+// NIS_BLOCK_HEIGHT: pixels per block height. Use GetOptimalBlockHeight query for your platform
+// NIS_THREAD_GROUP_SIZE: number of threads per group. Use GetOptimalThreadGroupSize query for your platform
+// NIS_USE_HALF_PRECISION: default (0) disabled, (1) enable half pression computation
+// NIS_HLSL: (1) enabled, (0) disabled
+// NIS_HLSL_6_2: default (0) HLSL v5, (1) HLSL v6.2 forces NIS_HLSL=1
+// NIS_GLSL: (1) enabled, (0) disabled
+// NIS_VIEWPORT_SUPPORT: default(0) disabled, (1) enable input/output viewport support
+// NIS_NV12_SUPPORT: default(0) disabled, (1) enable NV12 input
+// NIS_CLAMP_OUTPUT: default(0) disabled, (1) enable output clamp
+//
+// Default NVScaler shader constants:
+// [NIS_BLOCK_WIDTH, NIS_BLOCK_HEIGHT, NIS_THREAD_GROUP_SIZE] = [32, 24, 256]
+//
+// Default NVSharpen shader constants:
+// [NIS_BLOCK_WIDTH, NIS_BLOCK_HEIGHT, NIS_THREAD_GROUP_SIZE] = [32, 32, 256]
+// 
+// NIS_UNROLL: default [unroll]
+// NIS_UNROLL_INNER: default NIS_UNROLL, define in case of a compiler error for inner nested loops
+//---------------------------------------------------------------------------------
+
+// Taken from NISGPUArchitecture::NVIDIA_Generic
+#define NIS_BLOCK_WIDTH 32
+#define NIS_BLOCK_HEIGHT 32
+#define NIS_THREAD_GROUP_SIZE 128
+
+#define NIS_SCALER 0
+#define NIS_HDR_MODE_LINEAR  1
+#define NIS_USE_HALF_PRECISION 0
+#define NIS_HLSL 1
+#define NIS_HLSL_6_2 1
+#define NIS_GLSL 0
+#define NIS_VIEWPORT_SUPPORT 0
+#define NIS_NV12_SUPPORT 0
+#define NIS_CLAMP_OUTPUT 0
+
+
+#define kHDRCompressionFactor  0.282842712f
+
+
+#if NIS_HLSL
+// Generic type and function aliases for HLSL
+#define NVF float
+#define NVF2 float2
+#define NVF3 float3
+#define NVF4 float4
+#define NVI int
+#define NVI2 int2
+#define NVU uint
+#define NVU2 uint2
+#define NVB bool
+#if NIS_USE_HALF_PRECISION
+#if NIS_HLSL_6_2
+#define NVH float16_t
+#define NVH2 float16_t2
+#define NVH3 float16_t3
+#define NVH4 float16_t4
+#else
+#define NVH min16float
+#define NVH2 min16float2
+#define NVH3 min16float3
+#define NVH4 min16float4
+#endif // NIS_HLSL_6_2
+#else // FP32 types
+#define NVH NVF
+#define NVH2 NVF2
+#define NVH3 NVF3
+#define NVH4 NVF4
+#endif // NIS_USE_HALF_PRECISION
+#define NVSHARED groupshared
+//#define NVTEX_LOAD(x, pos) x[pos]
+//#define NVTEX_SAMPLE(x, sampler, pos) x.SampleLevel(sampler, pos, 0)
+//#define NVTEX_SAMPLE_RED(x, sampler, pos) x.GatherRed(sampler, pos)
+//#define NVTEX_SAMPLE_GREEN(x, sampler, pos) x.GatherGreen(sampler, pos)
+//#define NVTEX_SAMPLE_BLUE(x, sampler, pos) x.GatherBlue(sampler, pos)
+//#define NVTEX_STORE(x, pos, v) x[pos] = v
+#ifndef NIS_UNROLL
+#define NIS_UNROLL [unroll]
+#endif
+#endif // NIS_HLSL
+
+
+#ifndef NIS_UNROLL_INNER
+#define NIS_UNROLL_INNER NIS_UNROLL
+#endif
+
+// Texture gather
+#ifndef NIS_TEXTURE_GATHER
+#define NIS_TEXTURE_GATHER 0
+#endif
+
+// NIS Scaling
+#define NIS_SCALE_INT 1
+#define NIS_SCALE_FLOAT NVF(1.f)
+
+// NIS output clamp
+//#if NIS_CLAMP_OUTPUT
+//#if NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
+//#define NVCLAMP(x) ( clamp(x, 0.0f, 12.5f) )
+//#else
+//#define NVCLAMP(x) ( saturate(x) )
+//#endif
+//#else
+//#define NVCLAMP(x) (x)
+//#endif
+
+NVF getY(NVF3 rgba)
+{
+#if NIS_HDR_MODE == NIS_HDR_MODE_PQ
+    return NVF(0.262f) * rgba.x + NVF(0.678f) * rgba.y + NVF(0.0593f) * rgba.z;
+#elif NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
+    return sqrt(NVF(0.2126f) * rgba.x + NVF(0.7152f) * rgba.y + NVF(0.0722f) * rgba.z) * kHDRCompressionFactor;
+#else
+    return NVF(0.2126f) * rgba.x + NVF(0.7152f) * rgba.y + NVF(0.0722f) * rgba.z;
+#endif
+}
+
+NVF getYLinear(NVF3 rgba)
+{
+    return NVF(0.2126f) * rgba.x + NVF(0.7152f) * rgba.y + NVF(0.0722f) * rgba.z;
+}
+
+NVF3 YUVtoRGB(NVF3 yuv)
+{
+    float y = yuv.x - 16.0f / 255.0f;
+    float u = yuv.y - 128.0f / 255.0f;
+    float v = yuv.z - 128.0f / 255.0f;
+    NVF3 rgb;
+    rgb.x = saturate(1.164f * y + 1.596f * v);
+    rgb.y = saturate(1.164f * y - 0.392f * u - 0.813f * v);
+    rgb.z = saturate(1.164f * y + 2.017f * u);
+    return rgb;
+}
+
+NVF4 GetEdgeMap(NVF p[5][5], NVI i, NVI j)
+{
+    const NVF g_0 = abs(p[0 + i][0 + j] + p[0 + i][1 + j] + p[0 + i][2 + j] - p[2 + i][0 + j] - p[2 + i][1 + j] - p[2 + i][2 + j]);
+    const NVF g_45 = abs(p[1 + i][0 + j] + p[0 + i][0 + j] + p[0 + i][1 + j] - p[2 + i][1 + j] - p[2 + i][2 + j] - p[1 + i][2 + j]);
+    const NVF g_90 = abs(p[0 + i][0 + j] + p[1 + i][0 + j] + p[2 + i][0 + j] - p[0 + i][2 + j] - p[1 + i][2 + j] - p[2 + i][2 + j]);
+    const NVF g_135 = abs(p[1 + i][0 + j] + p[2 + i][0 + j] + p[2 + i][1 + j] - p[0 + i][1 + j] - p[0 + i][2 + j] - p[1 + i][2 + j]);
+
+    const NVF g_0_90_max = max(g_0, g_90);
+    const NVF g_0_90_min = min(g_0, g_90);
+    const NVF g_45_135_max = max(g_45, g_135);
+    const NVF g_45_135_min = min(g_45, g_135);
+
+    NVF e_0_90 = 0;
+    NVF e_45_135 = 0;
+
+    if (g_0_90_max + g_45_135_max == 0)
+    {
+        return NVF4(0, 0, 0, 0);
+    }
+
+    e_0_90 = min(g_0_90_max / (g_0_90_max + g_45_135_max), 1.0f);
+    e_45_135 = 1.0f - e_0_90;
+
+    NVB c_0_90 = (g_0_90_max > (g_0_90_min * kDetectRatio)) && (g_0_90_max > kDetectThres) && (g_0_90_max > g_45_135_min);
+    NVB c_45_135 = (g_45_135_max > (g_45_135_min * kDetectRatio)) && (g_45_135_max > kDetectThres) && (g_45_135_max > g_0_90_min);
+    NVB c_g_0_90 = g_0_90_max == g_0;
+    NVB c_g_45_135 = g_45_135_max == g_45;
+
+    NVF f_e_0_90 = (c_0_90 && c_45_135) ? e_0_90 : 1.0f;
+    NVF f_e_45_135 = (c_0_90 && c_45_135) ? e_45_135 : 1.0f;
+
+    NVF weight_0 = (c_0_90 && c_g_0_90) ? f_e_0_90 : 0.0f;
+    NVF weight_90 = (c_0_90 && !c_g_0_90) ? f_e_0_90 : 0.0f;
+    NVF weight_45 = (c_45_135 && c_g_45_135) ? f_e_45_135 : 0.0f;
+    NVF weight_135 = (c_45_135 && !c_g_45_135) ? f_e_45_135 : 0.0f;
+
+    return NVF4(weight_0, weight_90, weight_45, weight_135);
+}
+
+
+#define kSupportSize 5
+#define kNumPixelsX  (NIS_BLOCK_WIDTH + kSupportSize + 1)
+#define kNumPixelsY  (NIS_BLOCK_HEIGHT + kSupportSize + 1)
+
+NVSHARED NVF shPixelsY[kNumPixelsY][kNumPixelsX];
+
+NVF CalcLTIFast(const NVF y[5])
+{
+    const NVF a_min = min(min(y[0], y[1]), y[2]);
+    const NVF a_max = max(max(y[0], y[1]), y[2]);
+
+    const NVF b_min = min(min(y[2], y[3]), y[4]);
+    const NVF b_max = max(max(y[2], y[3]), y[4]);
+
+    const NVF a_cont = a_max - a_min;
+    const NVF b_cont = b_max - b_min;
+
+    const NVF cont_ratio = max(a_cont, b_cont) / (min(a_cont, b_cont) + kEps);
+    return (1.0f - saturate((cont_ratio - kMinContrastRatio) * kRatioNorm)) * kContrastBoost;
+}
+
+NVF EvalUSM(const NVF pxl[5], const NVF sharpnessStrength, const NVF sharpnessLimit)
+{
+    // USM profile
+    NVF y_usm = -0.6001f * pxl[1] + 1.2002f * pxl[2] - 0.6001f * pxl[3];
+    // boost USM profile
+    y_usm *= sharpnessStrength;
+    // clamp to the limit
+    y_usm = min(sharpnessLimit, max(-sharpnessLimit, y_usm));
+    // reduce ringing
+    y_usm *= CalcLTIFast(pxl);
+
+    return y_usm;
+}
+
+NVF4 GetDirUSM(const NVF p[5][5])
+{
+    // sharpness boost & limit are the same for all directions
+    const NVF scaleY = 1.0f - saturate((p[2][2] - kSharpStartY) * kSharpScaleY);
+    // scale the ramp to sharpen as a function of luma
+    const NVF sharpnessStrength = scaleY * kSharpStrengthScale + kSharpStrengthMin;
+    // scale the ramp to limit USM as a function of luma
+    const NVF sharpnessLimit = (scaleY * kSharpLimitScale + kSharpLimitMin) * p[2][2];
+
+    NVF4 rval;
+    // 0 deg filter
+    NVF interp0Deg[5];
+    {
+        for (NVI i = 0; i < 5; ++i)
+        {
+            interp0Deg[i] = p[i][2];
+        }
+    }
+
+    rval.x = EvalUSM(interp0Deg, sharpnessStrength, sharpnessLimit);
+
+    // 90 deg filter
+    NVF interp90Deg[5];
+    {
+        for (NVI i = 0; i < 5; ++i)
+        {
+            interp90Deg[i] = p[2][i];
+        }
+    }
+
+    rval.y = EvalUSM(interp90Deg, sharpnessStrength, sharpnessLimit);
+
+    //45 deg filter
+    NVF interp45Deg[5];
+    interp45Deg[0] = p[1][1];
+    interp45Deg[1] = lerp(p[2][1], p[1][2], 0.5f);
+    interp45Deg[2] = p[2][2];
+    interp45Deg[3] = lerp(p[3][2], p[2][3], 0.5f);
+    interp45Deg[4] = p[3][3];
+
+    rval.z = EvalUSM(interp45Deg, sharpnessStrength, sharpnessLimit);
+
+    //135 deg filter
+    NVF interp135Deg[5];
+    interp135Deg[0] = p[3][1];
+    interp135Deg[1] = lerp(p[3][2], p[2][1], 0.5f);
+    interp135Deg[2] = p[2][2];
+    interp135Deg[3] = lerp(p[2][3], p[1][2], 0.5f);
+    interp135Deg[4] = p[1][3];
+
+    rval.w = EvalUSM(interp135Deg, sharpnessStrength, sharpnessLimit);
+    return rval;
+}
+
+//-----------------------------------------------------------------------------------------------
+// NVSharpen
+//-----------------------------------------------------------------------------------------------
+void NVSharpen(NVU2 blockIdx, NVU threadIdx)
+{
+    const NVI dstBlockX = NVI(NIS_BLOCK_WIDTH * blockIdx.x);
+    const NVI dstBlockY = NVI(NIS_BLOCK_HEIGHT * blockIdx.y);
+
+    // fill in input luma tile in batches of 2x2 pixels
+    // we use texture gather to get extra support necessary
+    // to compute 2x2 edge map outputs too
+    const NVF kShift = 0.5f - kSupportSize / 2;
+
+    for (NVI i = NVI(threadIdx) * 2; i < kNumPixelsX * kNumPixelsY / 2; i += NIS_THREAD_GROUP_SIZE * 2)
+    {
+        NVU2 pos = NVU2(NVU(i) % NVU(kNumPixelsX), NVU(i) / NVU(kNumPixelsX) * 2);
+        NIS_UNROLL
+        for (NVI dy = 0; dy < 2; dy++)
+        {
+            NIS_UNROLL
+            for (NVI dx = 0; dx < 2; dx++)
+            {
+#if NIS_VIEWPORT_SUPPORT
+                const NVF tx = (dstBlockX + pos.x + kInputViewportOriginX + dx + kShift) * kSrcNormX;
+                const NVF ty = (dstBlockY + pos.y + kInputViewportOriginY + dy + kShift) * kSrcNormY;
+#else
+                const NVF tx = (dstBlockX + pos.x + dx + kShift) * kSrcNormX;
+                const NVF ty = (dstBlockY + pos.y + dy + kShift) * kSrcNormY;
+#endif
+				const NVF4 px = in_texture.SampleLevel(samplerLinearClamp, NVF2(tx, ty), 0);
+                shPixelsY[pos.y + dy][pos.x + dx] = getY(px.xyz);
+            }
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for (NVI k = NVI(threadIdx); k < NIS_BLOCK_WIDTH * NIS_BLOCK_HEIGHT; k += NIS_THREAD_GROUP_SIZE)
+    {
+        const NVI2 pos = NVI2(NVU(k) % NVU(NIS_BLOCK_WIDTH), NVU(k) / NVU(NIS_BLOCK_WIDTH));
+
+        // load 5x5 support to regs
+        NVF p[5][5];
+        NIS_UNROLL
+        for (NVI i = 0; i < 5; ++i)
+        {
+            NIS_UNROLL
+            for (NVI j = 0; j < 5; ++j)
+            {
+                p[i][j] = shPixelsY[pos.y + i][pos.x + j];
+            }
+        }
+
+        // get directional filter bank output
+        NVF4 dirUSM = GetDirUSM(p);
+
+        // generate weights for directional filters
+        NVF4 w = GetEdgeMap(p, kSupportSize / 2 - 1, kSupportSize / 2 - 1);
+
+        // final USM is a weighted sum filter outputs
+        const NVF usmY = (dirUSM.x * w.x + dirUSM.y * w.y + dirUSM.z * w.z + dirUSM.w * w.w);
+
+        // do bilinear tap and correct rgb texel so it produces new sharpened luma
+        const NVI dstX = dstBlockX + pos.x;
+        const NVI dstY = dstBlockY + pos.y;
+
+#if NIS_VIEWPORT_SUPPORT
+        NVF2 coord = NVF2((dstX + kInputViewportOriginX + 0.5f) * kSrcNormX, (dstY + kInputViewportOriginY + 0.5f) * kSrcNormY);
+        NVF2 dstCoord = NVF2(dstX + kOutputViewportOriginX, dstY + kOutputViewportOriginY);
+        if (!(NVU(dstX) > kOutputViewportWidth || NVU(dstY) > kOutputViewportHeight))
+#else
+        NVF2 coord = NVF2((dstX + 0.5f) * kSrcNormX, (dstY + 0.5f) * kSrcNormY);
+        NVF2 dstCoord = NVF2(dstX, dstY);
+#endif
+        {
+            NVF4 op = in_texture.SampleLevel(samplerLinearClamp, coord, 0);
+#if NIS_HDR_MODE == NIS_HDR_MODE_LINEAR
+            const NVF kEps = 1e-4f * kHDRCompressionFactor * kHDRCompressionFactor;
+            NVF newY = p[2][2] + usmY;
+            newY = max(newY, 0.0f);
+            const NVF oldY = p[2][2];
+            const NVF corr = (newY * newY + kEps) / (oldY * oldY + kEps);
+            op.x *= corr;
+            op.y *= corr;
+            op.z *= corr;
+#else
+            op.x += usmY;
+            op.y += usmY;
+            op.z += usmY;
+#endif
+			out_texture[dstCoord] = clamp(op, 0.0f, 12.5f);
+		}
+    }
+}

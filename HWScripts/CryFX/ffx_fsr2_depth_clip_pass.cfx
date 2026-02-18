@@ -1,0 +1,24 @@
+// Copyright 2001-2023 Crytek GmbH / Crytek Group. All rights reserved.
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = PostProcess;"
+>; 
+
+#include "ffx_fsr2_typedefs.cfi"
+
+// External AMD code
+#include "ffx_fsr2_depth_clip_pass.cfi"
+
+
+technique Default
+{
+    pass p0
+    {
+        ComputeShader = CS();
+    }
+}

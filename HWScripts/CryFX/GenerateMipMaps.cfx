@@ -1,0 +1,183 @@
+#include "CommonMath.cfi"
+#define	GEN3_TILE_SIZE_X	8
+#define	GEN3_TILE_SIZE_Y	8
+#define MAX_MIP_COUNT		4
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// <default>                       -> generate 4 mipmaps
+// %_RT_SAMPLE0                    -> generate 1 mipmaps
+// %_RT_SAMPLE1                    -> generate 2 mipmaps
+// %_RT_SAMPLE2                    -> generate 3 mipmaps
+// <default>                       -> use a box filter
+// %_RT_SAMPLE3                    -> use a max filter
+// %_RT_SAMPLE4                    -> use a min filter
+// %_RT_SAMPLE5                    -> use a min/max filter
+// %_RT_SHADOW_DEPTH_OUTPUT_LINEAR -> Perform sRGB to linear conversion
+
+Texture2D<float4> InputMip0: register(t0);
+RWTexture2D<float4> OutputMip0: register(u0); //(u0-u3)
+RWTexture2D<float4> OutputMip1: register(u1); //(u0-u3)
+RWTexture2D<float4> OutputMip2: register(u2); //(u0-u3)
+RWTexture2D<float4> OutputMip3: register(u3); //(u0-u3)
+
+// WH[LH] we're doing everything in-place
+groupshared float4 sWorkData[GEN3_TILE_SIZE_Y][GEN3_TILE_SIZE_X];
+
+float4 globalDims;
+
+SamplerState Linear : register(s0);
+SamplerState Maximum : register(s1);
+SamplerState Minimum : register(s2);
+
+// Perform sRGB convertion based on RT flags
+float4 GetColour(float4 inColour)
+{
+#if %_RT_SHADOW_DEPTH_OUTPUT_LINEAR
+	return float4(SRGBToLinear(inColour.xyz), inColour.w);
+#else
+	return inColour;
+#endif
+}
+
+
+float4 SetColour(float4 inColour)
+{
+#if %_RT_SHADOW_DEPTH_OUTPUT_LINEAR
+	return float4(LinearToSRGB(inColour.xyz), inColour.w);
+#else
+	return inColour;
+#endif
+}
+
+
+// WH[LH]: function rewritten
+void Reduce(
+	uint2 localCoordPx,
+	uint2 globalOffsetPx,
+	uint level, // we're starting with level 1
+	inout RWTexture2D<float4> OutputMip)
+{
+	GroupMemoryBarrierWithGroupSync();
+
+	// WH[TBa]: ambiguous type for bit shift; use a type suffix on literal values, like 'L' or 'U', or a cast
+	uint threadMask = (1u << level) - 1; // bits that have to be 0 in localCoordPx
+
+	if (!any(localCoordPx & threadMask))
+	{
+		uint halfPxShift = 1u << (level - 1);
+
+#if !%_RT_SAMPLE3 && !%_RT_SAMPLE4 && !%_RT_SAMPLE5
+		// GetColour and SetColour are here for sRGB conversion (this is not needed for min/max)
+		float4 filteredColor = SetColour((
+			GetColour(sWorkData[localCoordPx.x][localCoordPx.y]) +
+			GetColour(sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y]) +
+			GetColour(sWorkData[localCoordPx.x][localCoordPx.y + halfPxShift]) +
+			GetColour(sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y + halfPxShift])
+			) * 0.25);
+#elif %_RT_SAMPLE3
+		float4 filteredColor = max(
+			max(sWorkData[localCoordPx.x][localCoordPx.y],
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y]),
+			max(sWorkData[localCoordPx.x][localCoordPx.y + halfPxShift],
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y + halfPxShift]));
+#elif %_RT_SAMPLE4
+		float4 filteredColor = min(
+			min(sWorkData[localCoordPx.x][localCoordPx.y],
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y]),
+			min(sWorkData[localCoordPx.x][localCoordPx.y + halfPxShift],
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y + halfPxShift]));
+#elif %_RT_SAMPLE5
+		float4 filteredColor;
+		filteredColor.xy = max(
+			max(sWorkData[localCoordPx.x][localCoordPx.y].xy,
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y].xy),
+			max(sWorkData[localCoordPx.x][localCoordPx.y + halfPxShift].xy,
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y + halfPxShift].xy));
+		filteredColor.zw = min(
+			min(sWorkData[localCoordPx.x][localCoordPx.y].zw,
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y].zw),
+			min(sWorkData[localCoordPx.x][localCoordPx.y + halfPxShift].zw,
+				sWorkData[localCoordPx.x + halfPxShift][localCoordPx.y + halfPxShift].zw));
+#endif
+
+		uint2 globalCoordPx = (globalOffsetPx + localCoordPx) >> level; // destination pixel coordinates for this mip level
+		OutputMip[globalCoordPx] = filteredColor;
+
+		sWorkData[localCoordPx.x][localCoordPx.y] = filteredColor;
+	}
+
+}
+
+
+// WH[LH]: function rewritten
+[numthreads(GEN3_TILE_SIZE_X, GEN3_TILE_SIZE_Y, 1)]
+void Generate4MipMapsCS(
+	uint3 GroupID : SV_GroupID,
+	uint3 GroupThreadID : SV_GroupThreadID)
+{
+	// WH[LH] (0,0) in texel coordinates points (-0.5,-0.5) texels to the left&up from the centre of texel (0,0)
+	// If we want to linear sample the average of pexels (0,0)..(1,1), we have to request a sample at (1,1)
+	
+	const uint2 globalOffsetPx = GroupID.xy * uint2(GEN3_TILE_SIZE_X, GEN3_TILE_SIZE_Y);
+	const uint2 localCoordPx = GroupThreadID.xy;
+	const uint2 globalCoordPx = globalOffsetPx + localCoordPx;
+	
+	// this is the linear sample of level 1 reduction,
+	// globalDims stores the dimensions of the first mip level to be generated
+	const float2 globalCoordUV = (float2(globalCoordPx) + float2(0.5, 0.5)) / globalDims.xy;
+
+	float4 vOutputValue;
+	
+#if !%_RT_SAMPLE3 && !%_RT_SAMPLE4 && !%_RT_SAMPLE5
+	// average box filter
+	vOutputValue = InputMip0.SampleLevel(Linear, globalCoordUV, 0);
+#elif %_RT_SAMPLE3
+	// max filter
+	vOutputValue = InputMip0.SampleLevel(Maximum, globalCoordUV, 0);
+#elif %_RT_SAMPLE4
+	// min filter
+	vOutputValue = InputMip0.SampleLevel(Minimum, globalCoordUV, 0);
+#elif %_RT_SAMPLE5
+	// max/min filter
+	vOutputValue.xz = InputMip0.SampleLevel(Maximum, globalCoordUV, 0).xy;
+	vOutputValue.yw = InputMip0.SampleLevel(Minimum, globalCoordUV, 0).xy;
+#endif
+
+	
+	OutputMip0[globalCoordPx] = vOutputValue;
+
+
+	sWorkData[localCoordPx.x][localCoordPx.y] = vOutputValue;
+
+#if !%_RT_SAMPLE0
+	Reduce(
+		localCoordPx,
+		globalOffsetPx,
+		1,
+		OutputMip1);
+#if !%_RT_SAMPLE1
+	Reduce(
+		localCoordPx,
+		globalOffsetPx,
+		2,
+		OutputMip2);
+#if !%_RT_SAMPLE2
+	Reduce(
+		localCoordPx,
+		globalOffsetPx,
+		3,
+		OutputMip3);
+#endif
+#endif
+#endif
+
+}
+
+
+technique GenerateMipMaps
+{
+  pass p0
+  {
+    ComputeShader = Generate4MipMapsCS() GenerateMipMapsCS;
+  }
+}

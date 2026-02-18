@@ -1,0 +1,987 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+// Todo for refactor phases:
+//  - Rename to GBufferPass
+//	- All shared functionality should be extrated into outside functions, reuse on regular passes
+//	- eg: Decal, Detail Mapping, BlendLayer, etc
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+vert2geomZ Common_ZPassVS(app2vertGBuffer IN_common)
+#else
+vert2fragZ Common_ZPassVS(app2vertGBuffer IN_common)
+#endif
+{
+  vert2fragZ OUT = (vert2fragZ)0;
+
+  app2vertGBuffer IN = IN_common;
+
+  streamPos vertPassPos = (streamPos)0;
+  streamPos_FromGBuffer(IN, vertPassPos);
+	streamPos vertPassPosPrev = (streamPos) vertPassPos;
+
+#if %BILLBOARD_ATLAS
+	half3 bbInstNorm = GetBillboardAtlasNormal(vertPassPos);
+#endif
+
+#if CLS_BLOOD //before skinning
+	OUT.bloodSphereMask = ComputeBloodMask(vertPassPos.Position.xyz);
+#endif
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+	const float3 SilPomDispl = SilPomDisplacement * TangNormal(IN.vertCommon.Tangent, IN.vertCommon.Binormal);
+	vertPassPos.Position.xyz += SilPomDispl * -HeightBias;
+#endif
+
+	float4 HPosition = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPos);
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	vertPassPosPrev.PositionCurr = vertPassPos.Position;
+	OUT.HPosPrev.xyz = HPosToScreenTC( Pos_Prev_VS_General(g_VS_ViewProjZeroMatr, vertPassPosPrev) ).xyw;
+#endif
+
+	float3 vPos = vertPassPos.WorldPos.xyz;
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+	//relative position
+	OUT.vView.xyz = vPos.xyz;
+	OUT.vNormal.xyz = normalize(mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.Normal.xyz));
+#else
+	OUT.HPosition = HPosition;
+#endif
+
+#if !%_RT_OBJ_IDENTITY
+	vPos += g_VS_WorldViewPos.xyz;
+#endif
+	
+	min16float3 worldTangentS = mul((min16float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]);
+	min16float3 worldTangentT = mul((min16float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]);
+	min16float3 worldTangentN = mul((min16float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2]);
+
+	// WH GM: world-space UVs
+#if %_TT_TEXCOORD_GEN_WORLD && !%BLENDLAYER // if we use world mapping, and blendlayer we want to keep model tangent space here, 
+	// world mapping needs neutral tangent space
+	vertPassPos.Tangent = float4(1, 0, 0, -1);
+	vertPassPos.Binormal = float4(0, -1, 0, 1);
+
+	worldTangentS = float3(1, 0, 0);
+	worldTangentT = float3(0, -1, 0);
+	//worldTangentN = float3(0, 0, 1); // [WH] RZ had to comment this out, to keep model normal for TS calculations in PS. In fact it this solved a lot of issues with POM. So maybe sometimes we can use world mapping without PS calculated TS, because this looks very similar.
+#endif
+
+	float4 baseTC = vertPassPos.baseTC;  
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output uv coordinates
+
+#if %_RT_DECAL_TEXGEN_2D 
+	float3 DistAtten;
+	_TCModifyDecal( vertPassPos, baseTC, DistAtten );
+#endif 
+	
+	_TCModifyWH(baseTC, OUT.baseTC, vertPassPos.Position, vertPassPos.WorldPos, vertPassPos.ObjToTangentSpace[2], TS_DIFFUSE);
+#if %DECAL && !%_TT_TEXCOORD_PROJ
+	OUT.baseTC.zw = baseTC.xy;
+#endif
+
+	// WH GM: world-space UVs
+#if %_TT_TEXCOORD_GEN_WORLD && !%BLENDLAYER
+	// WH [RZ] in case of world mapping, from absolute vertex position substract object world position rouned up to whole numbers. should make UVs look the same but suitable for TS calculations
+	OUT.baseTC.xy = OUT.baseTC.xy - ceil(mul(half4((vertPassPos.InstMatrix[0].w + g_VS_WorldViewPos.x), -(vertPassPos.InstMatrix[1].w + g_VS_WorldViewPos.y), 0, 0), CM_MatrixTCM).xy);
+#endif
+
+	#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+		OUT.baseTC.xy *= CM_SilPomDetailParams.xy;
+	#endif
+
+	float fAlphaTest = 0.0f;
+	#if %_RT_ALPHATEST	
+		fAlphaTest = Get_MaterialAlphaTest();
+		#if %LEAVES
+			fAlphaTest = ParallelOpacityFalloff(vertPassPos.WorldPos.xyz, worldTangentN.xyz, CapOpacityFalloff, fAlphaTest);
+		#endif
+	#endif
+	
+	OUT.vNormalWS.w = fAlphaTest;
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output tangents
+
+	OUT.vNormalWS.xyz = worldTangentN;
+
+	#if !%GRASS
+		OUT.vTangent = min16float4(worldTangentS, vertPassPos.Tangent.w); 
+		OUT.vBinormal.xyz = worldTangentT;
+	#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output color
+	
+	// WH[TBa]: output neutral vtx color by default also use the same expression as it was in the PS, KCD2-335646
+	OUT.Color = float4(0.5f, 0.5f, 0.5f, 1.f);
+	#if %VERTCOLORS && !%SNDUVS && !%BILLBOARD_ATLAS && !%TEMP_VEGETATION
+		OUT.Color = vertPassPos.Color;
+		// WH[Woody]: we no longer want to manually colorize vegetation by AO in vertex color (collides with SVOTI). Especially with compressed merged meshes
+	#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output blend with terrain color params
+	
+#if %BLENDTERRAIN
+	#if %TEMP_VEGETATION && %_RT_BLEND_WITH_TERRAIN_COLOR
+		float4 blendColInfo = Get_SPI_BlendWithTerrainColInfo();
+		blendColInfo.w *= 0.3333;
+		
+		float fCameraDistance = length(g_VS_WorldViewPos.xyz - vPos.xyz);
+		float fBlendFactor =  saturate( BlendTerrainCol + (fCameraDistance/ (blendColInfo.w-blendColInfo.w*BlendTerrainColDist)) );
+		fBlendFactor*=fBlendFactor;
+		OUT.terrainParams0.xyz = float3(blendColInfo.zz*vPos.yx+blendColInfo.xy, min(fBlendFactor, .75f));
+	#endif
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// WH[TB,TBa]: Output secondary UV coordinates
+
+	#if %SNDUVS
+	  	// decode UV baked into vertex color
+		float2 uvDecVals = float2(256.0 / 257.0, 1 / 257.0);
+		OUT.secondTC.x = dot(vertPassPos.Color.gr, uvDecVals);
+		OUT.secondTC.y = dot(vertPassPos.Color.ab, uvDecVals);
+
+		OUT.secondTC.xy *= half2(SndUVsTileU,SndUVsTileV);
+	#endif
+
+#if %BILLBOARD_ATLAS
+	OUT.vBillboardAtlasProps.xyz = g_VS_WorldViewPos.xyz - vPos.xyz;
+	OUT.vBillboardAtlasProps.w = -atan2(bbInstNorm.x, bbInstNorm.y);
+#endif
+
+#if HIDING_GROUPS
+	DiscardVertexIfHidden(OUT.HPosition, vertPassPos.Color);
+#endif
+
+#if MATERIAL_ATLAS
+	OUT.featureIndex = DecodeFeatureIndex(vertPassPos.Color);
+	DiscardHiddenMaterialAtlasVertex(OUT.HPosition, OUT.featureIndex);
+#endif
+
+#if MACRO_ATLAS
+	OUT.macroIndex = DecodeMacroAtlasIndex(vertPassPos.Color);
+#endif
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %OFFSET_BUMP_MAPPING || %_RT_ALPHABLEND || %TEMP_EYES || %LEAVES || %GRASS
+  OUT.viewTS = vPos.xyz - g_VS_WorldViewPos.xyz;
+#endif
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+	vert2geomZ OUT_ext = (vert2geomZ) 0;
+	OUT_ext.IN = OUT;
+
+	{
+		streamPos vertPassPosTmp = vertPassPos;
+		vertPassPosTmp.Position.xyz += SilPomDispl;
+
+		const float3 vPosExtr = mul(vertPassPosTmp.InstMatrix, vertPassPosTmp.Position).xyz;
+
+		OUT_ext.viewExtr = mul(float3x3(worldTangentS, worldTangentT, worldTangentN), vPosExtr.xyz);
+		OUT_ext.hPosExtr = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPosTmp);
+
+		OUT_ext.wsDirPos = vPos - g_VS_WorldViewPos.xyz;
+		OUT_ext.wsDirPosExtr = vPosExtr;
+	}
+
+	return OUT_ext;
+#else
+  return OUT;
+#endif
+}
+
+///////////////// geometry shaders //////////////////
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+[maxvertexcount(9)]
+void Common_ZPassGS(triangle vert2geomZ In[3], inout TriangleStream<geom2fragZ> OutStream)
+{
+	EmitPrismZ(In[0], In[1], In[2], OutStream);
+}
+#endif
+
+///////////////// pixel shaders //////////////////
+
+min16float GetBlendedHeight(float2 uv, min16float blendLayerFactor, in float blendLayer2Tiling)
+{
+#if !%SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+		min16float h = GetHeightTex(heightTex, uv);
+	#if %BLENDLAYER
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		min16float h2 = GetHeight2Tex(Height2Tex, uv * blendLayer2Tiling).x;
+		
+		h += blendLayerFactor * (h2 - h);
+	#endif
+#else
+	min16float h = GetHeightTexLod(heightTex, float4(uv, 0, 0)); // TODO: find way to compute lod without gradients as they cause pixel artifacts at fin / shell transition
+#endif
+	return h;
+}
+
+void ApplyDirtAndBlendLayer(vert2fragZ IN, min16float blendFac, inout min16float3 diffCol, inout min16float3 specCol)
+{
+#if %DIRTLAYER
+	// Deprecated. Dirt layer mostly used for tinting "cars"
+	min16float4 dirtMap = GetCustomTex(dirtTex, IN.baseTC.xy * min16float2(DirtTiling, DirtTiling));
+	min16float dirtBlendFac = DirtStrength * lerp(1.0h, dirtMap.a, DirtMapAlphaInfluence) * (1.0h - IN.Color.a);
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	diffCol = lerp(diffCol, dirtMap.rgb * DirtTint.rgb, dirtBlendFac);
+	specCol = lerp(specCol, specCol * DirtGlossFactor, dirtBlendFac);
+#elif %BLENDLAYER
+	// Deprecated. Should be unified and behave like a regular material post C3.
+	min16float4 diffuseMap2 = GetCustomTex(Diffuse2Tex, IN.baseTC.xy * BlendLayer2Tiling);
+	diffCol = lerp( diffCol, diffuseMap2.rgb, blendFac );
+	specCol = lerp( specCol, BlendLayer2Specular, blendFac );
+#elif %DIR_OVERLAY
+	// WH[TBa]: add dir overlay, unify with blendlayer, KCD2-130352
+	ApplyDirOverlayToAlbedo(diffCol, blendFac, IN.baseTC.xy);
+#endif
+}
+
+void ApplyVegetationTerrainColor(vert2fragZ IN, inout MaterialAttribsCommon attribs)
+{
+#if %BLENDTERRAIN
+	#if (%TEMP_VEGETATION && %_RT_BLEND_WITH_TERRAIN_COLOR)
+		const float3 TERRAIN_BASE_SPEC_COLOR = 0.001f;
+		const float TERRAIN_BASE_SMOOTHNESS = 0.1f;
+
+		min16float3 terrainCol = GetTerrainTex   (terrainBaseTex, IN.terrainParams0.xy).rgb;
+		half3 terrainNor = GetTerrainNormal(terrainNormTex, IN.terrainParams0.xy).xyz;
+
+		attribs.NormalWorld   = lerp(attribs.NormalWorld,   terrainNor,              IN.terrainParams0.z * BlendTerrainCol_Normal);
+		attribs.Albedo        = lerp(attribs.Albedo,        terrainCol,              IN.terrainParams0.z * BlendTerrainCol_Albedo);
+		attribs.Reflectance   = lerp(attribs.Reflectance,   TERRAIN_BASE_SPEC_COLOR, IN.terrainParams0.z * BlendTerrainCol_Reflectance);
+		attribs.Smoothness    = lerp(attribs.Smoothness,    TERRAIN_BASE_SMOOTHNESS, IN.terrainParams0.z * BlendTerrainCol_Smoothness);
+		attribs.Transmittance = lerp(attribs.Transmittance, 0,                       IN.terrainParams0.z * BlendTerrainCol_Transmittance);
+	#endif
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+pixout_gbuffer Common_ZPassPS(geom2fragZ IN_ext)
+#elif !MATERIAL_ATLAS && !HIDING_GROUPS
+CRY_EARLY_DEPTH_OR_RE_Z
+pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
+#else
+pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
+#endif
+{
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+  vert2fragZ IN = IN_ext.IN;
+#endif
+
+	pixout_gbuffer OUT = (pixout_gbuffer) 0;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Setup tangent to world basis
+
+	min16float fFlipNormal = 1.0f;
+	#if !%SILHOUETTE_PARALLAX_OCCLUSION_MAPPING && !%LEAVES //[WH:JH] skipping backface normal flipping for leaves as well... it makes for better tree lighting.
+		fFlipNormal *= (min16float)(IN.bIsFrontFace? 1.0 : -1.0);// Support for double sided lighting, invert face sign if front facing
+	#endif
+
+    min16float3x3 mTangentToWS = min16float3x3(min16float3(1, 0, 0), min16float3(0, 1, 0), min16float3(0, 0, 1));
+	#if !%GRASS
+		mTangentToWS = min16float3x3( IN.vTangent.xyz, IN.vBinormal.xyz, IN.vNormalWS.xyz * fFlipNormal);  
+	#endif
+		
+
+	// WH[Woody]: prepare all BB atlas attribs
+#if %BILLBOARD_ATLAS
+	half billboardAtlasIndex = GetBillboardAtlasIndex(IN.vBillboardAtlasProps.xyz, IN.vBillboardAtlasProps.w, IN.WPos.xy);
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// WH GM: Clothing system
+
+	#if MATERIAL_ATLAS
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		int featureIndex = GetFeatureIndex(IN.featureIndex, IN.baseTC.xy);
+
+		float3 materialAtlasTC[2];
+		GetMaterialAtlasTC(materialAtlasTC, IN.baseTC.xy, featureIndex);
+
+		half3 materialAtlasMask = GetMaterialAtlasMask(materialAtlasTC);
+	#endif //MATERIAL_ATLAS
+
+	#if MACRO_ATLAS
+		const int macroIndex = IN.macroIndex;
+	#else
+		const int macroIndex = 0;
+	#endif
+
+	#if DECAL_ATLAS
+		float3 decalAtlasTC;
+		half decalAtlasMask;
+		int decalAtlasIndex;
+		GetDecalAtlasTC(decalAtlasTC, decalAtlasMask, decalAtlasIndex, IN.baseTC.xy, macroIndex);
+	#endif //DECAL_ATLAS
+
+	#if CLS_BLOOD || CLS_GRIME || CLS_SCRATCH
+		#if MACRO_ATLAS
+			half3 macroMask = GetMacroAtlasBloodGrimeScratch(IN.baseTC.xy, macroIndex);
+		#else
+			// WH[TBa]: implicit truncation of vector type, KCD2-448804
+			half3 macroMask = BloodGrimeScratchTexture.Sample(ssMaterialTrilinear, IN.baseTC.xy).rgb;
+		#endif //MACRO_ATLAS
+
+		#if MATERIAL_ATLAS
+			const half materialAtlasBlendFactor = ComputeScratchIntensity(macroMask.b, featureIndex);
+		#else
+			const half materialAtlasBlendFactor = 0;
+		#endif //MATERIAL_ATLAS
+	#endif //CLS_BLOOD || CLS_GRIME || CLS_SCRATCH
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  // Handle POM
+
+  int mdQuality;
+  min16float mdDisplacement;
+  min16float mdHeightBias;
+  min16float mdSelfShadowStrength;
+  GetMicroDetailParams(mdQuality, mdDisplacement, mdHeightBias, mdSelfShadowStrength);
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING || %PARALLAX_OCCLUSION_MAPPING
+	min16float2 normalTexRes;
+	normalsTex.GetDimensions(normalTexRes.x, normalTexRes.y);
+	const min16float3 pomAdjustRayForNonSquareTexres = min16float3(rcp(normalTexRes.xy) * min(normalTexRes.x, normalTexRes.y), 1);
+#else
+    const min16float3 pomAdjustRayForNonSquareTexres = 1;
+#endif
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %OFFSET_BUMP_MAPPING || %TEMP_EYES
+	min16float3 vViewTS = normalize(mul((min16float3x3)mTangentToWS, IN.viewTS) * pomAdjustRayForNonSquareTexres);
+#endif
+
+	min16float blendFac = 0;
+    min16float blendLayer2Tiling = 0;
+#if %BLENDLAYER
+	blendLayer2Tiling = (min16float)BlendLayer2Tiling;
+	if (mdQuality != MICRO_DETAIL_QUALITY_SPM)
+	#if %SNDUVS
+		blendFac = GetLayerBlendingValue(SNDUVSDiffuseTex, IN.secondTC.xy, 0, 1.h, BlendFactor, BlendFalloff);
+	#else
+		blendFac = GetLayerBlendingValue(BlendTex, IN.baseTC.xy * BlendMaskTiling, 0, IN.Color.a, BlendFactor, BlendFalloff);
+	#endif
+#endif
+
+  if (mdQuality == MICRO_DETAIL_QUALITY_OBM)
+  {
+#if %OFFSET_BUMP_MAPPING // still needed to compile as we refer to IN.viewTS
+    IN.baseTC.xy = OffsetMap(IN.baseTC.xy, -vViewTS, 2, mdDisplacement, mdHeightBias, blendFac, blendLayer2Tiling);
+#endif
+  }
+  else if(mdQuality == MICRO_DETAIL_QUALITY_POM)
+  {
+#if %PARALLAX_OCCLUSION_MAPPING // still needed to compile as we refer to IN.viewTS
+  #if !%TEMP_VEGETATION
+    const float lod = ComputeTextureLOD(IN.baseTC.xy, normalTexRes.xy);
+
+    const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, 15, mdDisplacement, mdHeightBias, blendFac, blendLayer2Tiling);
+    IN.baseTC.xy = offsetBest.xy;
+  #endif
+#endif
+  }
+  else if(mdQuality == MICRO_DETAIL_QUALITY_SPM)
+  {
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING // still needed to compile as we refer to IN.viewTS
+	#if !%TEMP_VEGETATION
+		const float lod = ComputeTextureLOD(IN.baseTC.xy, normalTexRes.xy);
+
+		const float numStepsScale = 1 - pow(abs(vViewTS.z), SilPomStepSizeViewDep);
+		const float numSteps = numStepsScale * SilPomNumSteps + 1.0;
+		//const float numSteps = SilPomNumSteps;
+
+		const SilMapRes silmapRes = SilhouetteMap(IN_ext.wsTriPos, IN_ext.wsTriDispl, IN_ext.wsClipPlane, IN_ext.wsViewDir, IN_ext.texGenU, IN_ext.texGenV, lod, numSteps, mdDisplacement);
+		const CbcWsRes cbcRes = ComputeBarycentricCorrespondence(silmapRes.baryHitPos, IN_ext.wsTriPos, IN_ext.wsTriDispl);
+
+		const float3 norm = cbcRes.wsNorm * -IN.vTangent.w;
+		const float3 binorm = cross(IN.vTangent.xyz, norm);
+		const float3 tang = cross(norm, binorm);
+
+		IN.vTangent.xyz = tang;
+		IN.vBinormal.xyz = binorm;
+		IN.baseTC.xy = silmapRes.uvHitPos * CM_SilPomDetailParams.zw;
+
+		#if %BLENDLAYER
+			#if %SNDUVS
+				blendFac = GetLayerBlendingValue(SNDUVSDiffuseTex, IN.secondTC.xy, 0, 1.h, BlendFactor, BlendFalloff);
+			#else
+				blendFac = GetLayerBlendingValue(BlendTex, IN.baseTC.xy * BlendMaskTiling, 0, IN.Color.a, BlendFactor, BlendFalloff);
+			#endif
+		#endif
+		
+		#if !%_RT_SAMPLE0
+			#if !%_RT_DISSOLVE
+				const float fDepthLinear = dot(cbcRes.wsPos, -CV_CameraFrontVector.xyz) * CV_NearFarClipDist.w;
+				const float fDevDepth = (fDepthLinear * g_PS_ProjRatio.x + g_PS_ProjRatio.y) / fDepthLinear;
+		
+				OUT.fDepth = fDevDepth;
+			#endif
+		#endif
+	#endif
+#endif
+  }
+
+#if !%_RT_SAMPLE0 && WH_BILLBOARD_ATLAS_DEPTH_IN_PS
+	OUT.fDepth = ApplyBillboardAtlasToDepth(IN.WPos.z, IN.baseTC.xy, billboardAtlasIndex);
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Alpha testing
+
+#if MATERIAL_ATLAS
+	ClipMaterialAtlasAlpha(materialAtlasTC, featureIndex, materialAtlasBlendFactor);
+#endif
+
+#if %_RT_ALPHATEST
+	min16float diffuseMapAlpha = GetAlphaTex(diffuseTex, IN.baseTC.xy);
+
+	#if MACRO_ATLAS
+		diffuseMapAlpha = GetMacroAtlasAlpha(IN.baseTC, macroIndex);
+	#endif
+
+	#if %BILLBOARD_ATLAS
+		diffuseMapAlpha = GetBillboardAtlasDiffuseTex(IN.baseTC.xy, billboardAtlasIndex).a;
+	#endif
+
+	#if (%_RT_MSAA_QUALITY || %_RT_MSAA_QUALITY1) && %_RT_ALPHATEST
+		GetAlphaCoverageMask( diffuseTex, IN.baseTC.xy, IN.vNormalWS.w, diffuseMapAlpha, OUT.uCoverageMask);
+	#endif
+
+	clip(diffuseMapAlpha - IN.vNormalWS.w);
+#endif
+	
+	ApplyDissolve(Get_SPI_Dissolve(), (int2)IN.WPos.xy);
+
+#if %WEAPON
+	WeaponParams wpnParams;
+	GetWeaponParams(wpnParams, IN.baseTC.xy);
+#endif
+
+	// WH GM: Added option to set tiling and offset using texture modifiers #KCD2-512281
+#if %DECAL_MAP
+	float2 decalTc = (IN.baseTC.xy * CM_CustomTilingOffsetWH.xy) + CM_CustomTilingOffsetWH.zw;
+	min16float4 cDecalDiffuse = GetDecalTex(DecalDiffuseTex, decalTc);
+	float decalBlendFac = cDecalDiffuse.a;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Output normals
+
+  MaterialAttribsCommon attribs;
+	
+  min16float3 vNormalTS = min16float3(0,0,1);
+	#if MACRO_ATLAS
+		vNormalTS = GetMacroAtlasNormal(IN.baseTC.xy, macroIndex);
+	#elif !%GRASS
+		#if %NORMAL_MAP
+			vNormalTS = GetNormalMap(normalsTex, IN.baseTC.xy);
+		#endif
+	#else
+		attribs.NormalWorld = normalize(IN.vNormalWS.xyz);
+		attribs.NormalWorld = attribs.NormalWorld * fFlipNormal;
+	#endif
+
+	#if MATERIAL_ATLAS
+		ApplyMaterialAtlasNormal(vNormalTS, materialAtlasTC, featureIndex, materialAtlasBlendFactor);
+	#endif
+
+#if %BILLBOARD_ATLAS
+	ApplyBillboardAtlasToNormal(vNormalTS, IN.baseTC.xy, billboardAtlasIndex);
+#endif
+
+	#if %BLENDLAYER
+		min16float3 vNormal2 = GetNormalMap( Bump2Tex, IN.baseTC.xy * blendLayer2Tiling );
+		#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+			const float3 norm = vNormalTS;
+			const float3 binorm = cross(float3(1, 0, 0), norm);
+			const float3 tang = cross(norm, binorm);
+			const float3x3 matLocal = float3x3(tang, -binorm, norm);
+			vNormal2 = mul(vNormal2, matLocal);
+		#endif
+		vNormalTS = lerp( vNormalTS, vNormal2, blendFac );
+	#endif
+
+#if %DETAIL_MAPPING || %DETAIL_ATLAS
+	float worldDistance = IN.WPos.w * g_PS_ProjRatio.w;
+#endif
+
+	// WH[TBa]: unify blendFac between blend layer and dir overlay, KCD2-130352
+#if %DIR_OVERLAY
+	attribs.NormalWorld = normalize(mul(vNormalTS, mTangentToWS));
+	blendFac = GetDirOverlayBlendFactor(attribs.NormalWorld);
+
+	ApplyDirOverlayToNormal(vNormalTS, blendFac, IN.baseTC.xy);
+#endif
+
+	min16float4 vDetail = 0;
+	#if %DETAIL_MAPPING || %DETAIL_ATLAS
+		min16float3 vDetailScales = min16float3(DetailBumpScale, DetailDiffuseScale,DetailGlossScale);
+
+		ApplyDetailFadeoutWH(vDetailScales, worldDistance);
+
+		#if %SNDUVS && !%USE_FIRST_UV_DETMAP
+			const float2 tcDetail = IN.secondTC.xy * CM_DetailTilingAndAlphaRef.xy;
+		#else
+			const float2 tcDetail = IN.baseTC.xy * CM_DetailTilingAndAlphaRef.xy;
+		#endif
+
+		#if %DETAIL_ATLAS
+			vDetail = GetDetailAtlasTex(detailTex, tcDetail, IN.baseTC.xy) * vDetailScales.xxyz;
+		#else
+			vDetail = GetDetailTex(detailTex, tcDetail) * vDetailScales.xxyz;
+		#endif
+
+		// WH[TBa]: add detail map for secondary layer, KCD2-130352
+		#if %BLENDLAYER || %DIR_OVERLAY
+			min16float3 vDetail2Scales = min16float3(Detail2BumpScale, Detail2DiffuseScale, Detail2GlossScale);
+			min16float4 vDetail2 = 0;
+
+			ApplyDetailFadeoutWH(vDetail2Scales, worldDistance);
+
+			#if %SNDUVS && !%USE_FIRST_UV_DETMAP
+				const float2 tcDetail2 = IN.secondTC.xy * CM_CustomTilingOffsetWH.xy;
+			#else
+				const float2 tcDetail2 = IN.baseTC.xy * CM_CustomTilingOffsetWH.xy;
+			#endif
+
+			#if %DETAIL_ATLAS
+				vDetail2 = GetDetailAtlasTex(detail2Tex, tcDetail2, IN.baseTC.xy) * vDetail2Scales.xxyz;
+			#else
+				vDetail2 = GetDetailTex(detail2Tex, tcDetail2) * vDetail2Scales.xxyz;
+			#endif
+
+			vDetail = lerp(vDetail, vDetail2, blendFac);
+		#endif
+
+		#if %ALPHAMASK_DETAILMAP
+			vDetail *= GetAlphaTex(diffuseTex, IN.baseTC.xy);
+		#endif
+
+		#if %WEAPON
+			ApplyWeaponToDetail(vDetail, wpnParams);
+		#endif
+
+		vNormalTS.xy += vDetail.xy;
+	#endif
+
+#if %BILLBOARD
+		vNormalTS.xyz = GetNormalMap(normalsTex, IN.baseTC.xy).zyx;
+#endif
+
+	// WH GM: Added support for decal normals/smoothness #KCD2-528975
+	#if %DECAL_MAP
+		min16float3 vDecalNormal = GetNormalMap(DecalNormalsTex, decalTc);
+		vNormalTS = lerp(vNormalTS, vDecalNormal, decalBlendFac);
+	#endif
+
+	#if DECAL_ATLAS
+		ApplyDecalAtlasNormal(vNormalTS, decalAtlasTC, decalAtlasMask, decalAtlasIndex);
+	#endif
+
+	#if CLS_BLOOD
+		half bloodIntensity = ComputeBloodIntensity(macroMask.r, materialAtlasMask.r, IN.bloodSphereMask);
+	#endif
+
+	#if !%GRASS
+		attribs.NormalWorld = normalize(mTangentToWS[2]);
+		#if %NORMAL_MAP || %BLENDLAYER || %DETAIL_MAPPING || %DETAIL_ATLAS || %BILLBOARD_ATLAS
+			attribs.NormalWorld = normalize(mul(vNormalTS, mTangentToWS));
+		#endif
+	#endif
+	
+	#if %LEAVES || %GRASS
+		// Orient normal of vegetation planes towards viewer to reduce Fresnel gain and mimic some forward scattering 
+		attribs.NormalWorld = normalize(attribs.NormalWorld - normalize(IN.viewTS) * NormalViewDependency);
+	#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output smoothness
+
+	#if MACRO_ATLAS
+		min16float fSmoothness = GetMacroAtlasSmoothness(IN.baseTC.xy, macroIndex);
+	#else
+		min16float fSmoothness = MatSpecColor.w;
+		fSmoothness *= GetSmoothnessTex(smoothnessTex, IN.baseTC.xy);
+	#endif
+
+  #if %BLENDLAYER
+		min16float layer2Smoothness = GetSmoothness2Tex(smoothness2Tex, IN.baseTC.xy * blendLayer2Tiling);
+		fSmoothness = lerp(fSmoothness, layer2Smoothness, blendFac);
+	#endif
+
+	#if %DETAIL_MAPPING || %DETAIL_ATLAS
+		fSmoothness = fSmoothness + fSmoothness * vDetail.w;
+	#endif
+
+	#if MATERIAL_ATLAS
+		ApplyMaterialAtlasSmoothness(fSmoothness, materialAtlasTC, featureIndex, materialAtlasBlendFactor);
+	#endif
+
+	// WH GM: Added support for decal normals/smoothness #KCD2-528975
+	#if %DECAL_MAP
+		min16float fDecalSmoothness = GetSmoothnessTex(DecalSmoothnessTex, decalTc);
+		fSmoothness = lerp(fSmoothness, fDecalSmoothness, decalBlendFac);
+	#endif
+
+	#if DECAL_ATLAS
+		ApplyDecalAtlasSmoothness(fSmoothness, decalAtlasTC, decalAtlasMask);
+	#endif
+
+	#if CLS_GRIME
+		half grimeIntensity = ComputeGrimeIntensity(macroMask.g, materialAtlasMask.g, FeatureBuffer[featureIndex].grimeLevel);
+		ApplyGrimeSmoothness(fSmoothness, FeatureBuffer[featureIndex].grimeGloss, grimeIntensity);
+	#endif
+
+	#if CLS_BLOOD
+		ApplyBloodSmoothness(fSmoothness, bloodIntensity);
+	#endif
+	
+	attribs.Smoothness = fSmoothness;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Output albedo and reflectance
+	
+	#if MACRO_ATLAS
+		min16float4 diffuseMap = GetMacroAtlasDiffuse(IN.baseTC.xy, macroIndex);
+	#else
+		min16float4 diffuseMap = GetDiffuseTex(diffuseTex, IN.baseTC.xy);
+	#endif
+
+	min16float3 cAlbedo = diffuseMap.rgb;
+	min16float3 cReflectance = MatSpecColor.rgb;
+	
+	#if %DECAL && %_RT_DECAL_TEXGEN_2D
+		#if %_TT_TEXCOORD_PROJ
+			cAlbedo = GetDiffuseTexProj(diffuseTex, IN.baseTC.xyzw);
+		#else
+			cAlbedo = GetDiffuseTex(diffuseTex, IN.baseTC.xy);
+		#endif 
+	#endif
+
+	#if MATERIAL_ATLAS
+		ApplyMaterialAtlasAlbedo(cAlbedo, materialAtlasTC, featureIndex, materialAtlasBlendFactor);
+	#endif
+
+	// WH GM: Ported from HumanSkin shader to use for shield painting #KCD2-509266
+	#if %DECAL_MAP
+		cAlbedo = lerp(cAlbedo, cDecalDiffuse.rgb, decalBlendFac);
+	#endif
+
+	#if DECAL_ATLAS
+		float decalAlpha;
+		ApplyDecalAtlasAlbedo(cAlbedo, decalAlpha, decalAtlasTC, decalAtlasMask);
+	#endif
+
+	#if CLS_GRIME
+		ApplyGrimeAlbedo(cAlbedo, FeatureBuffer[featureIndex].grimeDiffuse, grimeIntensity);
+	#endif
+
+	#if CLS_BLOOD
+		ApplyBloodAlbedo(cAlbedo, bloodIntensity);
+	#endif
+
+#if %SPECULAR_MAP
+	#if MACRO_ATLAS
+		half3 specMap = GetMacroAtlasSpecular(IN.baseTC.xy, macroIndex);
+	#else
+		half3 specMap = GetSpecularTex(specularTex, IN.baseTC.xy).rgb;
+	#endif
+	
+	#if %COLORIZING_WITH_MASK //WH: bzapotocky
+		ApplyColorizingWithMask(cAlbedo, specMap);
+	#endif
+
+	cReflectance *= specMap;
+#endif
+
+#if MATERIAL_ATLAS
+	ApplyMaterialAtlasReflectance(cReflectance, materialAtlasTC, featureIndex, materialAtlasBlendFactor);
+#endif
+
+	// WH GM: Added support for decal specular #KCD2-529884
+#if %DECAL_MAP
+	min16float4 vDecalReflectance = GetSpecularTex(DecalSpecularTex, decalTc);
+	cReflectance = lerp(cReflectance, vDecalReflectance.rgb, decalBlendFac);
+#endif
+
+#if DECAL_ATLAS
+	ApplyDecalAtlasReflectance(cReflectance, decalAtlasTC, decalAlpha);
+#endif
+
+#if CLS_GRIME
+	ApplyGrimeReflectance(cReflectance, FeatureBuffer[featureIndex].grimeSpecular, grimeIntensity);
+#endif
+
+#if CLS_BLOOD
+	ApplyBloodReflectance(cReflectance, bloodIntensity);
+#endif
+
+#if %COLORIZING
+	ApplyColorizing(cAlbedo);
+#endif
+
+#if %WEAPON
+	ApplyWeaponToCommonParams(cAlbedo, cReflectance, attribs.Smoothness, wpnParams, IN.baseTC.xy);
+#endif
+
+#if %BILLBOARD_ATLAS
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	cAlbedo = GetBillboardAtlasDiffuseTex(IN.baseTC.xy, billboardAtlasIndex).rgb;
+#endif
+
+	ApplyDirtAndBlendLayer(IN, blendFac, cAlbedo, cReflectance);
+
+#if %SNDUVS
+	half4 detColor = GetSNDUVSDiffuseTex(IN.secondTC.xy);
+	cAlbedo *= 4.0 * detColor.xyz;
+#endif
+
+	// WH[Woody]: we no longer want to manually colorize vegetation by AO in vertex color (collides with SVOTI). Especially with compressed merged meshes
+	// WH[TBa]: removed ifdef to reduce number of PS combinations, KCD2-335646
+		cAlbedo *= 2 * IN.Color.rgb;
+
+	cAlbedo *= MatDifColor.rgb; 
+
+#if ROCK_DARKENING
+	ApplyRockDarkening(cAlbedo, 0);
+#endif
+
+#if %DETAIL_MAPPING || %DETAIL_ATLAS
+	cAlbedo = cAlbedo + cAlbedo * vDetail.z;
+#endif
+
+#if %DECAL	
+	cReflectance.xyz = GetLuminance(cReflectance.xyz);
+#endif
+
+#if ROCK_DARKENING
+	ApplyRockDarkening(cAlbedo, 1);
+#endif
+
+#if MATERIAL_ATLAS
+	#if %_RT_CLOTHING_SYSTEM_DEBUG
+		DrawClothingSystemDebug(cAlbedo, featureIndex, macroIndex, materialAtlasBlendFactor, grimeIntensity, bloodIntensity, IN.bloodSphereMask, materialAtlasTC, decalAtlasIndex, decalAtlasMask);
+	#endif //_RT_CLOTHING_SYSTEM_DEBUG
+#endif //MATERIAL_ATLAS
+	
+	attribs.Albedo = cAlbedo;
+	attribs.Reflectance = cReflectance;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output SSS
+	
+	attribs.LightingModel = LIGHTINGMODEL_STANDARD;
+	attribs.Transmittance = 0;
+	attribs.ScatteringIndex = 0;
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// WH[TB,TBa]: Transmittance
+	
+#if %TRANSMITTANCE
+	half fTranslucency = BackDiffuseMultiplier;
+	attribs.Transmittance = saturate(fTranslucency) * TransmittanceColor.rgb;
+	attribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+
+#if %SUBSURFACE_SCATTERING && !%DIRTLAYER && !%DECAL
+	attribs.LightingModel = SSSIndex != 0 ? LIGHTINGMODEL_TRANSMITTANCE : attribs.LightingModel;
+	attribs.ScatteringIndex = SSSIndex;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// WH[TB,TBa]: Three Point Lighting
+
+#if %CLOTHING_SYSTEM
+	attribs.ThreePointLighting = true;
+#else
+	attribs.ThreePointLighting = false;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output translucency and SSS
+	
+#if (%GRASS || %LEAVES) && !%_RT_ALPHABLEND
+	min16float fTranslucency = BackDiffuseMultiplier;
+	#if %LEAVES && %OPACITY_MAP
+		// WH[Woody]: art team many times doesn't set opacity map at all, so now it will be enabled if needed
+		fTranslucency *= GetOpacityTex(opacityTex, IN.baseTC.xy);
+	#endif
+	
+	attribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
+	attribs.Transmittance = saturate(fTranslucency) * TransmittanceColor.rgb;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output self-shadowing
+	
+	min16float fSelfShadowing = 0;
+
+	// WH GM: Enabled self shadowing on decals. We have solved the conflicting specular and self-shadowing buffers
+	// by compressing specular color into 2 channels instead of 3 by using EncodeColorYCC2CompressedWH. #KCD2-130666
+//#if !%DECAL	
+	if (mdQuality == MICRO_DETAIL_QUALITY_SPM || mdQuality == MICRO_DETAIL_QUALITY_POM || mdQuality == MICRO_DETAIL_QUALITY_OBM)
+	{
+	#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+		const float2 DetailTiling = CM_SilPomDetailParams.xy;
+		//const float2 DetailTiling = float2(1, 1);
+	#else
+		const float2 DetailTiling = float2(1, 1);
+	#endif
+
+		const float3 light = normalize(mul((float3x3)mTangentToWS, g_PS_SunLightDir.xyz) * pomAdjustRayForNonSquareTexres);
+		const float2 lightDelta = float2(light.x, light.y) * mdDisplacement * DetailTiling;
+
+		const float2 uv = IN.baseTC.xy * DetailTiling;
+		const float h0 = GetBlendedHeight(uv, blendFac, blendLayer2Tiling);
+		float h = h0;
+
+		if (mdQuality == MICRO_DETAIL_QUALITY_SPM || mdQuality == MICRO_DETAIL_QUALITY_POM)
+		{
+			h = max(0, GetBlendedHeight(uv + 1.000 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.875 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.750 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.625 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.500 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.375 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.250 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.125 * lightDelta, blendFac, blendLayer2Tiling));
+		}
+		else
+		{
+			h = max(h, GetBlendedHeight(uv + 1.000 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.666 * lightDelta, blendFac, blendLayer2Tiling));
+			h = max(h, GetBlendedHeight(uv + 0.333 * lightDelta, blendFac, blendLayer2Tiling));
+		}
+
+		fSelfShadowing = saturate((h - h0) * mdSelfShadowStrength);
+		
+		if (mdSelfShadowStrength > 0)
+			attribs.LightingModel = LIGHTINGMODEL_POM_SS;
+	}
+//#endif
+
+	attribs.SelfShadowingSun = fSelfShadowing;
+	
+	ApplyVegetationTerrainColor(IN, attribs);
+
+#if %BILLBOARD
+	attribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
+	attribs.Transmittance = .15;
+	attribs.Smoothness = .15;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output to GBuffer
+	
+#if %_RT_SAMPLE0
+	EncodeMicroGBuffer( attribs, OUT.GBufferA, IN.WPos.xy );
+#else
+	EncodeGBuffer( attribs, OUT.GBufferA, OUT.GBufferB, OUT.GBufferC );
+#endif
+
+#if %_RT_SPRITE
+	OUT.GBufferB.w = diffuseMap.a * 2.0;
+	OUT.GBufferB.xyz *= OUT.GBufferB.xyz;
+#endif
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Velocity
+	
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	float2 ScreenTCPrev = IN.HPosPrev.xy / IN.HPosPrev.z;
+	ScreenTCPrev = MapViewportToRaster(ScreenTCPrev);
+	OUT.VelocityRT = OutputVelocityRT(IN.WPos.xy * (CV_ScreenSize.zw * 2), ScreenTCPrev);
+#endif
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+	// WH[TomK]: SuperResolution reactive mask, KCD2-502564
+	
+#if !%_RT_SAMPLE0 && %_RT_SAMPLE1
+	OUT.ReactiveMaskRT = saturate(5 / IN.WPos.w); // Gradually decrement reactive mask from 5m further.
+#endif
+
+  ////////////////////////////////////////////////////////////////////////////////////////////////
+  // Alpha
+
+  #if %_RT_ALPHABLEND      
+    min16float fAlpha;
+		
+		fAlpha = GetAlphaTex(diffuseTex, IN.baseTC.xy) * MatDifColor.a;
+		// WH[TBa]: removed ifdef to reduce number of PS combinations, KCD2-335646
+			fAlpha *= IN.Color.a;
+
+		#if %DECAL
+			#if !%_TT_TEXCOORD_PROJ
+				//fAlpha *= GetOpacityTex(DecalOpacityTex, IN.baseTC.zw); WH[Woody]: we never use it
+			#else
+				//fAlpha *= GetOpacityTex(DecalOpacityTex, IN.baseTC.xy); WH[Woody]: we never use it
+			#endif
+			#if !%DIRTLAYER
+				fAlpha = saturate(pow(fAlpha * DecalAlphaMult, DecalFalloff));
+			#endif
+		#endif
+		
+		fAlpha = saturate( fAlpha );
+		min16float fAlphaDiffuse = fAlpha;
+		min16float fAlphaNormal = fAlpha;
+		min16float fAlphaSpecular = fAlpha;
+
+		#if %DECAL && !%DIRTLAYER
+			fAlphaDiffuse *= DecalDiffuseOpacity;
+			fAlphaNormal *= DecalNormalOpacity;
+			fAlphaSpecular *= DecalSpecularOpacity;
+		#endif
+		
+		#if %_RT_SAMPLE0
+			OUT.GBufferA.w = fAlpha;
+		#else
+			SetGBufferBlending( OUT.GBufferA, OUT.GBufferB, OUT.GBufferC, fAlphaNormal, fAlphaDiffuse, fAlphaSpecular);
+		#endif
+  #endif
+
+	return OUT;
+}
+
+#include "CommonZPassTess.cfi"
+
+//////////////////////////////// technique ////////////////
+
+technique ZPass
+{
+	pass p0
+	{
+		VertexShader = Common_ZPassVS() ZVS;
+#if ENABLE_TESSELLATION
+		HullShader   = Common_ZPassHS() GeneralHS;
+		DomainShader = Common_ZPassDS() GeneralDS;
+#endif
+
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+		GeometryShader = Common_ZPassGS() ZGS;
+#endif
+
+		PixelShader = Common_ZPassPS() ZPS;
+
+		ZEnable = true;
+		ZWriteEnable = true;
+		CullMode = Back;
+
+#if %GRASS || %LEAVES || %HAIR_PASS
+		CullMode = None;
+#endif
+	}
+}

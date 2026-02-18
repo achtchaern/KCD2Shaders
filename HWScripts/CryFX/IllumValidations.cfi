@@ -1,0 +1,210 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+//===========================================================================
+// Validations
+// Removing of redundant and mutually exclusive flags to prevent generating
+// of the vertex/pixel shaders
+// TODO: make special validations for PS.1.1 only support
+
+#if %SPECULAR_NCM && %VIEWVEC_NCM
+    #undefine %VIEWVEC_NCM
+    #warning Parameter _VIEWVEC_NCM was ignored
+#endif
+
+#if %DIFFUSE_PERPIXEL
+  #if %DIFFUSE_NCM
+    #undefine %DIFFUSE_NCM
+    #warning Parameter _DIFFUSE_NCM was ignored
+  #endif
+#endif
+
+#if %PARALLAX_OCCLUSION_MAPPING || %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+#if %PHONG_TESSELLATION
+	#undefine %PHONG_TESSELLATION
+#endif
+#if %PN_TESSELLATION
+	#undefine %PN_TESSELLATION
+#endif
+#if %DISPLACEMENT_MAPPING
+	#undefine %DISPLACEMENT_MAPPING
+#endif
+#endif
+
+#ifdef FEATURE_MESH_TESSELLATION
+	#if %PHONG_TESSELLATION || %PN_TESSELLATION || %DISPLACEMENT_MAPPING
+		#define ENABLE_TESSELLATION 1
+	#endif
+#endif
+
+#ifndef ENABLE_TESSELLATION
+	#if %PHONG_TESSELLATION
+		#undefine %PHONG_TESSELLATION
+	#endif
+	#if %PN_TESSELLATION
+		#undefine %PN_TESSELLATION
+	#endif
+	#if %DISPLACEMENT_MAPPING
+		#undefine %DISPLACEMENT_MAPPING
+	#endif
+#endif
+
+#if %BLENDLAYER
+	#if !FEATURE_BLEND_LAYER
+		#undefine %BLENDLAYER
+	#else
+		#if %DIRTLAYER	
+			#undefine %DIRTLAYER
+		#endif
+		#if %DECAL
+			#undefine %DECAL
+		#endif
+	#endif
+#endif
+
+#if %DECAL || !FEATURE_GEOMETRY_SHADERS
+#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+	#undefine %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+#endif
+#endif
+
+#if %DECAL
+	#if %SUBSURFACE_SCATTERING
+		#undefine %SUBSURFACE_SCATTERING
+	#endif
+#endif
+
+#if %DIR_OVERLAY
+	#if %DECAL
+		#undefine %DECAL
+	#endif
+	#if %BLENDLAYER
+		#undefine %BLENDLAYER
+	#endif
+	#if %COLORIZING
+		#undefine %COLORIZING
+	#endif
+	#if %COLORIZING_WITH_MASK
+		#undefine %COLORIZING_WITH_MASK
+	#endif
+	#if %WEAPON
+		#undefine %WEAPON
+	#endif
+#endif
+
+#if %SNDUVS
+	#if %VERTCOLORS
+		#undefine %VERTCOLORS
+	#endif
+#endif
+
+#if %COLORIZING
+	#if %SUBSURFACE_SCATTERING
+		#undefine %SUBSURFACE_SCATTERING
+	#endif
+#endif
+
+#if %COLORIZING_WITH_MASK
+	#if %COLORIZING
+		#undefine %COLORIZING
+	#endif
+	#if %SUBSURFACE_SCATTERING
+		#undefine %SUBSURFACE_SCATTERING
+	#endif
+#endif
+
+#if %WEAPON
+	// reusing texture slots
+	#if %BLENDLAYER
+		#undefine %BLENDLAYER
+	#endif
+	// reusing registers
+	#if %COLORIZING
+		#undefine %COLORIZING
+	#endif
+	#if %COLORIZING_WITH_MASK
+		#undefine %COLORIZING_WITH_MASK
+	#endif
+	// reusing texture slots
+	#if %SUBSURFACE_SCATTERING
+		#undefine %SUBSURFACE_SCATTERING
+	#endif
+	#if %DIR_OVERLAY
+		#undefine %DIR_OVERLAY
+	#endif
+#endif
+
+#if %CLOTHING_SYSTEM
+	// disable unsupported features
+	#if %COLORIZING
+		#undefine %COLORIZING
+	#endif
+	#if %COLORIZING_WITH_MASK
+		#undefine %COLORIZING_WITH_MASK
+	#endif
+	#if %DETAIL_MAPPING
+		#undefine %DETAIL_MAPPING
+	#endif
+	#if %DETAIL_ATLAS
+		#undefine %DETAIL_ATLAS
+	#endif
+	#if %WEAPON
+		#undefine %WEAPON
+	#endif
+	#if %BLENDLAYER
+		#undefine %BLENDLAYER
+	#endif
+	#if %DIRTLAYER
+		#undefine %DIRTLAYER
+	#endif
+	#if %DECAL
+		#undefine %DECAL
+	#endif
+	#if %OFFSET_BUMP_MAPPING
+		#undefine %OFFSET_BUMP_MAPPING
+	#endif
+	#if %PARALLAX_OCCLUSION_MAPPING
+		#undefine %PARALLAX_OCCLUSION_MAPPING
+	#endif
+	#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+		#undefine %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+	#endif
+	#if %VERTCOLORS
+		#undefine %VERTCOLORS
+	#endif
+	#if %SNDUVS
+		#undefine %SNDUVS
+	#endif
+	#if %DIR_OVERLAY
+		#undefine %DIR_OVERLAY
+	#endif
+	// register reuse
+	#if %TRANSMITTANCE
+		#undefine %TRANSMITTANCE
+	#endif
+
+	// enable required subsystems
+	#define HIDING_GROUPS
+
+	#define MACRO_ATLAS
+	#define MACRO_ATLAS_SIZE 7
+
+	#define MATERIAL_ATLAS
+	#define FEATURE_COUNT 27
+
+	#define DECAL_ATLAS
+	#define DECAL_ATLAS_SIZE 8
+
+	#define CLS_BLOOD
+	#define CLS_GRIME
+	#define CLS_SCRATCH
+#endif
+
+#if !%WEAPON && !%CLOTHING_SYSTEM
+  #define ROCK_DARKENING
+#endif
+
+// WH[TBa]: fadeout requires additional PM registers, support only for illum, KCD2-130352
+#if %DETAIL_MAPPING || %DETAIL_ATLAS
+	#define DETAIL_MAPPING_FADEOUT
+#endif

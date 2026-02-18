@@ -1,0 +1,423 @@
+﻿// Copyright 2001-2022 Crytek GmbH / Crytek Group. All rights reserved.
+
+#define HALF_MAX 65504.f
+
+// The lowest value in the ACEScc transfer function, representing 0 in a linear color space
+#define ACESCC_MIN (-0.35828683f)
+
+// The largest value in the ACEScc transfer function, representing the horizontal asymptote 
+// where values trend to infinity
+#define ACESCC_MAX ( 1.4679964f )
+
+// Our content is authored and graded to DX12 spec where a floating point value of 1.0f
+// is equivalent to 80 nits. When this normalization factor is used, we're reducing a range
+// of values from 10,000 nits to a 0-1 range. With 80 nits being equivalent to 1.0f, 10,000
+// nits are equivalent to 125.0f. That's where this number is from. 125.0f = (10,000 / 80)
+#define HDR_NORMALIZATION_FACTOR 125.0f
+
+// D3D12's `paper white` is 80nits. Converting between our linear color space where 1.0f = 80 nits
+// requires constants to be multiplied or divided by this constant. 
+#define HDR_WHITE_VALUE 80.0f
+
+// WH[DH]: HDR parameters
+#define MID_GRAY 0.18f
+
+////////////////// Constants /////////////////////
+
+// Color rotation matrix to rotate Rec.709 color primaries into ACES AP1
+static const float3x3 from709toAP1 =
+{
+	0.61319, 0.33951, 0.04737,
+	0.07021, 0.91634, 0.01345,
+	0.02062, 0.10957, 0.86961
+};
+
+// Color rotation matrix to rotate ACES AP1 color primaries into Rec.709
+static const float3x3 fromAP1to709 =
+{
+	1.70505, -0.62179, -0.08326,
+	-0.13026, 1.14080, -0.01055,
+	-0.02400, -0.12897, 1.15297,
+};
+
+// Color rotation matrix to rotate Rec.2020 color primaries into Rec.709
+static const float3x3 from2020to709 =
+{
+	1.660496, -0.587656, -0.072840,
+	-0.124547, 1.132895, -0.008348,
+	-0.018154, -0.100597, 1.118751
+};
+
+// Color rotation matrix to rotate Rec.709 color primaries into Rec.2020
+static const float3x3 from709to2020 =
+{
+	0.627402, 0.329292, 0.043306,
+	0.069095, 0.919544, 0.011360,
+	0.016394, 0.088028, 0.895578
+};
+
+// Color rotation matrix to rotate Rec.709 color primaries into P3-D65
+static const float3x3 from709toP3D65 =
+{
+	{ 0.822461969f, 0.1775380f, 0.0000000f },
+	{ 0.033194199f, 0.9668058f, 0.0000000f },
+	{ 0.017082631f, 0.0723974f, 0.9105199f }
+};
+
+// Color rotation matrix to rotate P3-D65 color primaries into Rec.709
+static const float3x3 fromP3D65to709 =
+{
+	{ 1.224940176f, -0.224940176f, 0.0000000f },
+	{ -0.042056955f, 1.042056955f, 0.0000000f },
+	{ -0.019637555f, -0.078636046f, 1.098273600f }
+};
+
+// REC.709
+static const float2 Primaries709[4] =
+{
+	float2(0.6400f, 0.3300f), // R
+	float2(0.3000f, 0.6000f), // G
+	float2(0.1500f, 0.0600f), // B
+	float2(0.3127f, 0.3290f)  // White
+};
+// REC.2020
+static const float2 Primaries2020[4] =
+{
+	float2(0.7080f, 0.2920f), // R
+	float2(0.1700f, 0.7970f), // G
+	float2(0.1310f, 0.0460f), // B
+	float2(0.3127f, 0.3290f)  // White
+};
+// ACEScg/cc (AP1)
+static const float2 PrimariesAP1[4] =
+{
+	float2(0.71300f, 0.29300f), // R
+	float2(0.16500f, 0.83000f), // G
+	float2(0.12800f, 0.04400f), // B
+	float2(0.32168f, 0.33767f)  // White
+};
+// DCI-P3
+static const float2 PrimariesDCIP3[4] =
+{
+	float2(0.6800f, 0.3200f), // R
+	float2(0.2650f, 0.6900f), // G
+	float2(0.1500f, 0.0600f), // B
+	float2(0.3127f, 0.3290f)  // White
+};
+
+// From the XBox HDR10 sample. This function can expand bright values into a wider DCI-P3 color gamut, giving the
+// illusion of higher dynamic range for pure hues around the limits of Rec.709
+// Location: \GDKSamples\Graphics\HDR10\HDR10.sln
+float3 ExpandColorGamut(float3 color, float start, float stop)
+{
+	// The original Rec.709 color, but rotated into the P3-D65 color space
+	float3 Rec709 = mul(from709toP3D65, color);
+
+	// Treat the color as if it was originally mastered in the P3 color space
+	float3 P3 = color;
+
+	// Interpolate between Rec.709 and P3-D65, but only for bright HDR values, we don't want to change the overall look of the image
+	float lum = max(max(color.r, color.g), color.b);
+	float lerp = saturate((lum - start) / (stop - start));
+	float3 expandedColorInP3 = ((1.0f - lerp) * Rec709) + (lerp * P3);
+
+	// Back to Rec.709 color
+	return mul(fromP3D65to709, expandedColorInP3);
+}
+
+// Given a point in CIE X,Y coordinate space, approximate if it's within the visible light spectrum (the spectral locus)
+// Returns 0 if it is not and 1 if it is. This is intended to be used for debugging purposes only. !! This is just an approximation !!
+float IsVisibleLightRange(float2 p)
+{
+	// Transform the coordinates into rotated and scaled coordinate space
+	float2 transformedP = float2(
+		(p.x * 1.23f) *  0.90556881693f - (p.y * 1.24f) * -0.42419938448f + -0.165f,
+		(p.x * 1.23f) * -0.42419938448f + (p.y * 1.24f) *  0.90556881693f +  0.092f
+	);
+
+	if (transformedP.x < 0.0f) return 0.0f;
+	
+	// Functions that are below the curve
+	float isBelow = 1.0f;
+	
+	if (transformedP.x > 0.335f)
+	{
+		isBelow = step(transformedP.y, 1.0f - (sqrt(pow(abs((transformedP.x - 0.335f) / 0.4f), 2.3f) + 0.04f) - 0.2f));
+	}
+	else
+	{
+		isBelow = step(transformedP.y, lerp(
+			0.84f * sqrt(transformedP.x / 0.3f) + 0.13f,
+			1.0f - pow(abs((transformedP.x - 0.335f) / 0.38f), 2.0f), 
+			transformedP.x / 0.335f));
+	}
+	
+	// Functions that are above the curve
+	float isAbove = step(0.0f, transformedP.y) * step(0.13f - (sqrt(transformedP.x) / 1.3f), transformedP.y);
+	
+	return isBelow * isAbove;
+}
+
+////////////////// Transfer Functions /////////////////////
+
+// Including the normalization within the Rec.2020 capabilities
+float3 LinearToST2084(float3 color)
+{
+	const float m1 = 2610.0 / 4096.0 / 4;
+	const float m2 = 2523.0 / 4096.0 * 128;
+	const float c1 = 3424.0 / 4096.0;
+	const float c2 = 2413.0 / 4096.0 * 32;
+	const float c3 = 2392.0 / 4096.0 * 32;
+
+	float3 cp = pow(abs(color / 10000.0f), m1);
+	return pow((c1 + c2 * cp) / (1 + c3 * cp), m2);
+}
+
+// Including the inverse normalization from the Rec.2020 capabilities
+float3 ST2084ToLinear(float3 color)
+{
+	float m1 = 2610.0 / 4096.0 / 4;
+	float m2 = 2523.0 / 4096.0 * 128;
+	float c1 = 3424.0 / 4096.0;
+	float c2 = 2413.0 / 4096.0 * 32;
+	float c3 = 2392.0 / 4096.0 * 32;
+
+	float3 cp = pow(color, 1 / m2);
+	float3 num = cp - c1;
+	num = max(num, 0.0f);
+	return pow(num / (c2 - c3 * cp), 1 / m1) * 10000.0f;
+}
+
+float Split_ACES_to_ACEScc(float x)
+{
+	if (x <= 0.0f)
+		return ACESCC_MIN; //(log2(pow(2.0, -15.0) * 0.5) + 9.72) / 17.52;
+	else if (x < pow(2.0f, -15.0f))
+		return (log2(pow(2.0f, -16.0f) + x * 0.5f) + 9.72f) / 17.52f;
+	else // (x >= pow(2.0f, -15.0f))
+		return (log2(x) + 9.72f) / 17.52f;
+}
+
+float Split_ACEScc_to_ACES(float x)
+{
+	if (x < (9.72f - 15.0f) / 17.52f)
+		return (pow(2.0f, x * 17.52f - 9.72f) - pow(2.0f, -16.0f)) * 2.0f;
+	else if (x < (log2(HALF_MAX) + 9.72f) / 17.52f)
+		return pow(2.0f, x * 17.52f - 9.72f);
+	else // (x >= (log2(HALF_MAX) + 9.72f) / 17.52f)
+		return HALF_MAX;
+}
+
+float3 Linear_to_ACEScc(float3 x)
+{
+	x = mul(from709toAP1, x);
+	return float3(Split_ACES_to_ACEScc(x.r), Split_ACES_to_ACEScc(x.g), Split_ACES_to_ACEScc(x.b));
+}
+
+float3 ACEScc_to_Linear(float3 x)
+{
+	x = float3(Split_ACEScc_to_ACES(x.r), Split_ACEScc_to_ACES(x.g), Split_ACEScc_to_ACES(x.b));
+	return mul(fromAP1to709, x);
+}
+
+////////////////// Colorspace Transformations /////////////////////
+
+// Converts Rec 709 (Linear, with sRGB primaries) to Rec 2020 (Linear, with 2020 primaries)
+float3 Rec709ToRec2020(float3 color)
+{
+	return mul(from709to2020, color);
+}
+
+// Converts Rec 2020 (Linear, with 2020 primaries) to Rec 709 (Linear, with sRGB primaries)
+float3 Rec2020ToRec709(float3 color)
+{
+	return mul(from2020to709, color);
+}
+
+// Transformations between CIE XYZ tristimulus values and CIE x,y 
+// chromaticity coordinates and back
+float3 XYZ2xyY(float3 XYZ)
+{
+	const float d = max((XYZ.x + XYZ.y + XYZ.z), 1e-7);
+	return XYZ.xyy / float3(d.xx, 1.f);
+}
+
+float3 xyY2XYZ(float3 xyY)
+{
+	const float d = max(xyY.y, 1e-7);
+	return float3(
+	xyY.x * xyY.z / d,
+	xyY.z,
+	(1.0 - xyY.x - xyY.y) * xyY.z / d);
+}
+
+float3 Rec709ToxyY(const float3 rgb)
+{
+	static const float3x3 RGBtoXYZ =
+	{
+		0.4124564, 0.3575761, 0.1804375,
+		0.2126729, 0.7151522, 0.0721750,
+		0.0193339, 0.1191920, 0.9503041
+	};
+	const float3 XYZ = mul(RGBtoXYZ, rgb);
+	return XYZ2xyY(XYZ);
+}
+
+float3 xyYToRec709(float2 xy, float Y = 1.0)
+{
+	static const float3x3 XYZtoRGB =
+	{
+		3.2409699419, -1.5373831776, -0.4986107603,
+		-0.9692436363, 1.8759675015, 0.0415550574,
+		0.0556300797, -0.2039769589, 1.0569715142
+	};
+	float3 XYZ = xyY2XYZ(float3(xy, Y));
+	float3 RGB = mul(XYZtoRGB, XYZ);
+	float maxChannel = max(RGB.r, max(RGB.g, RGB.b));
+	return RGB / max(maxChannel, 1.0);
+}
+
+float3 xyYToRec2020(float2 xy, float Y = 1.0)
+{
+	static const float3x3 XYZtoRGB =
+	{
+		1.7166511880, -0.3556707838, -0.2533662814,
+		-0.6666843518, 1.6164812366, 0.0157685458,
+		 0.0176398574, -0.0427706133, 0.9421031212
+	};
+	float3 XYZ = xyY2XYZ(float3(xy, Y));
+	float3 RGB = mul(XYZtoRGB, XYZ);
+	float maxChannel = max(RGB.r, max(RGB.g, RGB.b));
+	return RGB / max(maxChannel, 1.0);
+}
+
+////////////////// Tonemappers /////////////////////
+
+// WH[DH]: Modified values for our HDR pipeline
+#define ToneMapper_ShoulderStrength (0.22f)
+#define ToneMapper_LinearStrength   (0.3f)
+#define ToneMapper_LinearAngle      (0.1f)
+#define ToneMapper_ToeStrength      (0.2f)
+#define ToneMapper_ToeNumerator     (0.01f)
+#define ToneMapper_ToeDenominator   (0.3f)
+
+// The Colorist pipeline for LDR color grading uses CE_Tonemapping.dctl, and depends on it matching this 
+// curve. Please ensure future changes to this tonemapping curve reach the corresponding *.dctl files
+min16float3 ToneMap_FilmMapping(in min16float3 cColor)
+{
+	const float w1 = HDRFilmCurve.w;
+
+	// Filmic response curve as proposed by J. Hable, tweaked to reduce contrast with a higher white point
+	min16float4 c = min16float4(max(cColor, 0), w1);
+
+	const min16float s1 = ToneMapper_ShoulderStrength * HDRFilmCurve.x;
+	const min16float l1 = ToneMapper_LinearStrength * HDRFilmCurve.y;
+	const min16float l2 = ToneMapper_LinearAngle;
+	const min16float t1 = ToneMapper_ToeStrength;
+	const min16float t2 = ToneMapper_ToeNumerator * HDRFilmCurve.z;
+	const min16float t3 = ToneMapper_ToeDenominator;
+
+	min16float4 compressedCol =
+		((c * (s1 * c + l2 * l1) + t1 * t2) /
+		 (c * (s1 * c + l1) + t1 * t3)) - (t2 / t3);
+
+	return saturate(compressedCol.rgb / compressedCol.w);
+}
+
+// The inverse derived with the help of wolfram alpha, and simplified into its quadratic formula notation.
+// If this function uses the same constants as the filmic tonemapper above, it will remain the inverse always.
+// This should be used sparingly. LinearTonemap/InverseLinearTonemap are faster when this exact tonemapper isn't required.
+min16float3 Inverse_ToneMap_FilmMapping(in min16float3 cColor)
+{
+	cColor = saturate(cColor);
+
+	const float w1 = HDRFilmCurve.w;
+
+	const min16float s1 = ToneMapper_ShoulderStrength * HDRFilmCurve.x;
+	const min16float l1 = ToneMapper_LinearStrength * HDRFilmCurve.y;
+	const min16float l2 = ToneMapper_LinearAngle;
+	const min16float t1 = ToneMapper_ToeStrength;
+	const min16float t2 = ToneMapper_ToeNumerator * HDRFilmCurve.z;
+	const min16float t3 = ToneMapper_ToeDenominator;
+	
+	const min16float s1sqr = s1 * s1;
+	const min16float l1sqr = l1 * l1;
+	const min16float t3sqr = t3 * t3;
+	const min16float w1sqr = w1 * w1;
+
+	const min16float3 a = (s1sqr * t2 * w1sqr * cColor - s1sqr * t2 * w1sqr - s1sqr * t3 * w1sqr * cColor + 
+		s1sqr * t3 * w1sqr - s1 * l2 * l1 * t3 * w1 * cColor +  s1 * l1 * t2 * w1 * cColor - s1 * l1 * t2 * w1 + 
+		s1 * l1 * t3 * w1 - s1 * t1 * t2 * t3 + s1 * t1 * t3sqr);
+
+	const min16float3 b = (s1 * l2 * l1 * t3 * w1sqr + s1 * l1 * t2 * w1sqr * cColor - 
+		s1 * l1 * t2 * w1sqr - s1 * l1 * t3 * w1sqr * cColor - l2 * l1sqr * t3 * w1 * cColor + 
+		l2 * l1sqr * t3 * w1 + l2 * t1 * l1 * t3sqr + l1sqr * t2 * w1 * cColor - 
+		l1sqr * t2 * w1 - l1 * t1 * t2 * t3);
+
+	const min16float3 c = (s1 * t1 * t2 * t3 * w1sqr * cColor - s1 * t1 * t3sqr * w1sqr * cColor - 
+		l2 * t1 * l1 * t3sqr * w1 * cColor + l1 * t1 * t2 * t3 * w1 * cColor);
+
+	return (-b + sqrt(b * b - 4.0f * a * c)) / (2.0f * a);
+}
+
+// WH[DH]: HDR Tonemapping curve based on Uchimura 2017
+// https://www.desmos.com/calculator/mbkwnuihbd
+float3 ToneMap_HDR(in float3 cColor, in float fBrightness, in float fContrast, in float fLinearStart, in float fLinearLength, in float fShadow)
+{
+	const float3 x = cColor;
+	const float P = fBrightness;
+	const float a = fContrast;
+	const float m = fLinearStart;
+	const float l = fLinearLength;
+	const float c = fShadow;
+
+	const float l0 = ((P - m) * l) / a;
+	const float S0 = m + l0;
+	const float S1 = m + a * l0;
+	const float C2 = (a * P) / (P - S1);
+
+	const float3 w0 = 1.0f - smoothstep(0.0f, m, x);
+	const float3 w2 = step(m + l0, x);
+	const float3 w1 = 1.0f - w0 - w2;
+
+	const float3 T = m * pow(x / m, c);
+	const float3 S = P - (P - S1) * exp((-C2 / P) * (x - S0));
+	const float3 L = m + a * (x - m);
+
+	return T * w0 + L * w1 + S * w2;
+}
+
+// https://community.acescentral.com/t/output-transform-tone-scale/3498/14
+float3 HDRCompressionCurve(in float3 cColor, float ExposureFactor, float ShadowToeCompensation, float SurroundContrast, float PeakNitsWithOvershoot)
+{
+	const float normalizedWhite = HDR_WHITE_VALUE;
+	
+	float peakLuminance = PeakNitsWithOvershoot;
+	
+	float m = peakLuminance / normalizedWhite;
+	float s1 = ExposureFactor * pow(m, 1.0f / SurroundContrast);
+	
+	return max(0.0f, pow(pow(max(0.0f, cColor) / (cColor + s1), SurroundContrast) * m, 2.0f) / 
+		((pow(max(0.0f, cColor) / (cColor + s1), SurroundContrast) * m) + ShadowToeCompensation));
+}
+
+// The 3 functions below are from AMD:
+// https://gpuopen.com/learn/optimized-reversible-tonemapper-for-resolve/
+float max3(float3 v)
+{
+	return max(v.x, max(v.y, v.z));
+}
+
+// Apply this to tonemap linear HDR color "c" after a sample is fetched in the resolve.
+// Note "c" 1.0 maps to the expected limit of low-dynamic-range monitor output.
+float3 LinearTonemap(float3 c)
+{
+	return c * rcp(max3(c.rgb) + 1.0f);
+}
+
+// Apply this to tonemap linear HDR color "c" after a sample is fetched in the resolve.
+// Note "c" 1.0 maps to the expected limit of low-dynamic-range monitor output.
+float3 InverseLinearTonemap(float3 c)
+{
+	return c * rcp(1.0f - min(max3(c.rgb), 1.0f - G_EPSILON));
+}

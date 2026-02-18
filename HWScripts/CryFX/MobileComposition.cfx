@@ -1,0 +1,311 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "PostEffectsLib.cfi"
+#include "imageLib.cfi"
+#include "TiledShading.cfi"
+
+SamplerState ssTrilinearClamp : register(s0);
+
+Texture2D<float4>	DepthTex : register(t0);
+Texture2D<float4>	GBufferA : register(t1);
+Texture2D<float4>	GBufferB : register(t2);
+Texture2D<float4>	GBufferC : register(t3);
+
+Texture2DArray<float4> ShadowMaskRT : register(t4);
+
+TextureCube<float4> EnvProbeDiffuse  : register(t7);
+TextureCube<float4> EnvProbeSpecular : register(t8);
+
+Buffer<uint>                           TileLightMask : register(t16);
+StructuredBuffer<STiledLightShadeInfo> TiledLightsShadeInfo : register(t17);
+Texture2DArray<min16float4>            SpotTexArray : register(t18);
+
+
+vtxOutWPOS LightingMobileVS(vtxInWPOS IN)
+{
+  vtxOutWPOS OUT = (vtxOutWPOS)0; 
+
+	OUT.HPosition = float4(IN.Position.x * 2 - 1, (1 - IN.Position.y) * 2 - 1, IN.Position.z, 1.0);
+  OUT.baseTC.xy = IN.baseTC.xy;
+  OUT.CamVec.xyz = IN.CamVec;
+
+  return OUT;
+}
+
+pixout LightingMobilePS(vtxOutWPOS IN)
+{
+	pixout OUT = (pixout)0;
+	
+	int2 pixCoord = int2(IN.baseTC.xy * CV_ScreenSize.xy);
+	float devDepth = DepthTex[pixCoord];
+	
+	// Skybox
+	[branch] if (devDepth == 0)
+	{
+		OUT.Color.xyz = float3(0, 0, 0);
+		return OUT;
+	}
+	
+	float linearDepth = CV_ProjRatio.y / (devDepth - CV_ProjRatio.x);
+	float3 worldPos = IN.CamVec.xyz * linearDepth;
+	
+	MaterialAttribsCommon attribs;
+	
+#if !%_RT_MOBILE_PIPELINE	
+	attribs = DecodeGBuffer(GBufferA[pixCoord], GBufferB[pixCoord], GBufferC[pixCoord]);
+#else
+	attribs = DecodeMicroGBuffer(GBufferA, IN.WPos, pixCoord);
+#endif
+	
+	float3 viewVec = normalize(-worldPos);
+	float3 diffuseAcc = 0;
+	float3 specularAcc = 0;
+	
+	// Environment probe
+	{
+		diffuseAcc = GetTextureCubeLod(EnvProbeDiffuse, ssTrilinearClamp, float4(attribs.NormalWorld, 0));
+		float NdotV = saturate(dot(viewVec, attribs.NormalWorld));
+		specularAcc = GetEnvironmentCMap(EnvProbeSpecular, ssTrilinearClamp, reflect(normalize(worldPos), attribs.NormalWorld), attribs.Smoothness) * GetEnvmapFresnel(attribs.Reflectance, attribs.Smoothness, NdotV);
+	}
+
+	// Sun
+	{
+		int3 sampleCoords = int3(pixCoord, 0);
+		float shadowTerm = 1 - ShadowMaskRT[sampleCoords];
+					
+		float NdotL = saturate(dot(attribs.NormalWorld, CV_SunLightDir.xyz));
+		diffuseAcc += NdotL * CV_SunColor.xyz * shadowTerm;
+		specularAcc += SpecularBRDF(attribs.NormalWorld, viewVec, CV_SunLightDir.xyz, attribs.Smoothness, attribs.Reflectance) * NdotL * CV_SunColor.xyz * CV_SunColor.w * shadowTerm;
+	}
+	
+	// Tiled shading
+	uint2 numTiles = ceil(CV_ScreenSize.xy / float2(TILED_SHADING_TILE_SIZE_X, TILED_SHADING_TILE_SIZE_Y));
+	uint2 tileIdx = uint2(IN.baseTC.x * numTiles.x, IN.baseTC.y * numTiles.y);
+	uint bufferIdx = (tileIdx.y * numTiles.x + tileIdx.x) * TILED_SHADING_BITMASK_COUNT;
+	
+	int lightIndex = -1;
+	uint curMask = TileLightMask[bufferIdx];
+	
+	[loop] for (;;)
+	{
+		lightIndex = GetNextTileLightIndex(curMask, lightIndex);
+		[branch] if (lightIndex < 0) break;
+			
+		if (TiledLightsShadeInfo[lightIndex].lightType >= LIGHT_TYPE_REGULAR_POINT)
+		{
+			STiledLightShadeInfo light = TiledLightsShadeInfo[lightIndex];
+			
+			float3 lightVec = (light.posRad.xyz - GetWorldViewPos()) - worldPos;
+			float3 illuminance = light.color.rgb;
+			
+			float attenuation = GetPhysicalBulbLightAttenuationWH(light, length(lightVec));
+			float clipping = GetLightClippingWH(light, length(lightVec));
+			illuminance *= attenuation;
+			illuminance *= clipping;
+			
+			if (light.lightType == LIGHT_TYPE_REGULAR_PROJECTOR)
+			{
+				float4 projTC = mul(light.projectorMatrix, float4(worldPos + GetWorldViewPos(), 1.0f));  
+				projTC.xy /= projTC.w;
+				if (projTC.w < 0 || min(projTC.x, projTC.y) < 0 || max(projTC.x, projTC.y) > 1)  // Avoid back-projection
+					illuminance = 0;
+				else
+				{
+					uint4 resIndexClamps = GetResourceIndexAndMipClamps(light.resIndex);
+					illuminance *= SpotTexArray.SampleLevel(ssTrilinearClamp, float3(projTC.xy, resIndexClamps.x), resIndexClamps.y).xxx;
+				}
+			}
+			
+			lightVec = normalize(lightVec);
+			float NdotL = saturate(dot(attribs.NormalWorld, lightVec));
+			
+			diffuseAcc += NdotL * illuminance;
+			specularAcc += SpecularBRDF(attribs.NormalWorld, viewVec, lightVec.xyz, attribs.Smoothness, attribs.Reflectance) * NdotL * illuminance * light.color.a;
+		}
+	}
+	
+	OUT.Color = float4(specularAcc + diffuseAcc * attribs.Albedo, 1);
+	
+	return OUT;
+}
+
+technique LightingMobile
+{
+  pass p0
+  {
+    VertexShader = LightingMobileVS();
+    PixelShader  = LightingMobilePS();  
+  }
+}
+
+////////////////////Screen fading runtime flags for TonemappingMobilePS()///////////////////////////////////
+// <default>                      -> No screen fading effect
+// _RT_QUALITY1                   -> Enable screen fade effect
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D texSceneTarget                : register(t0);
+Texture2D<min16float4> luminanceTex     : register(t1);
+Texture2D<min16float4> colorChartTex    : register(t2);
+
+SamplerState pointClampSS               : register(s0);
+SamplerState linearClampSS              : register(s1);
+
+float4 HDREyeAdaptation;
+float4 HDRFilmCurve;
+float4 HDRAvgLuminance;
+float4 FadeParams; // rgb - fade colour, a-fade strength
+
+vtxOut TonemappingMobileVS(vtxIn IN)
+{
+  vtxOut OUT = (vtxOut)0; 
+
+  OUT.HPosition = float4(IN.Position.x * 2 - 1, (1 - IN.Position.y) * 2 - 1, IN.Position.z, 1.0);
+  OUT.baseTC.xy = IN.baseTC.xy;
+
+  return OUT;
+}
+
+pixout TonemappingMobilePS(vtxOut IN)
+{
+	pixout OUT = (pixout)0;
+	
+	min16float3 col = GetTexture2D(texSceneTarget, pointClampSS, IN.baseTC.xy).rgb;
+
+#if !%_RT_SAMPLE1
+	
+#if %_RT_SAMPLE5
+	min16float4 vAdaptedLum = HDRAvgLuminance;
+#else
+	min16float4 vAdaptedLum = GetTexture2D(luminanceTex, linearClampSS, IN.baseTC.xy);
+#endif
+
+#if %_RT_SAMPLE6
+	min16float fExposure = ComputeExposureFromLuminance(vAdaptedLum.x, HDREyeAdaptation);
+#else
+	min16float fExposure = ComputeExposure(vAdaptedLum.y, HDREyeAdaptation);
+	
+#endif
+	
+#if %_RT_SAMPLE4
+	// Legacy exposure mode
+	// Krawczyk scene key estimation adjusted to better fit our range - low (0.05) to high key (0.8) interpolation based on avg scene luminance
+	const min16float fSceneKey = 1.03h - 2.0h / (2.0h + log2(vAdaptedLum.x + 1.0));
+	fExposure = clamp(fSceneKey / vAdaptedLum.x, HDREyeAdaptation.y, HDREyeAdaptation.z);
+#endif
+
+	//fExposure = 1.0f;
+#else
+	min16float fExposure = 1.0f; // WH[TBa]: revert back to original value (overexposed models in character tool KCD2-61309)
+#endif
+	
+	// Apply exposure
+	col *= fExposure;
+	
+#if %_RT_SAMPLE2
+	// Filmic response curve as proposed by J. Hable
+	min16float4 c = min16float4(max(col, 0), HDRFilmCurve.w);
+	
+	const min16float 
+		ShoStren  = 0.22 * HDRFilmCurve.x,
+		LinStren  = 0.3  * HDRFilmCurve.y,
+		LinAngle  = 0.1, 
+		ToeStren  = 0.2,
+		ToeNum    = 0.01 * HDRFilmCurve.z,
+		ToeDenom  = 0.3;
+		
+	min16float4 compressedCol = 
+		(
+			(c * (ShoStren * c + LinAngle*LinStren) + ToeStren*ToeNum) / 
+			(c * (ShoStren * c + LinStren)          + ToeStren*ToeDenom)
+		) -                                          (ToeNum/ToeDenom);
+		
+	OUT.Color.rgb = saturate(compressedCol / compressedCol.w);
+#else
+	// Tonemap (ACES Filmic Curve, fitted by K. Narkowicz)
+	OUT.Color.rgb = saturate((col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14));
+#endif
+
+#if %_RT_QUALITY1
+    // Perform screen fading
+    float3 fadeCol = FadeParams.xyz;
+    float3 colTo = lerp(OUT.Color.rgb,  fadeCol, FadeParams.w);
+    OUT.Color.rgb = colTo;
+#endif
+	
+	// Apply gamma correction
+	OUT.Color.rgb = LinearToREC709(OUT.Color.rgb);
+
+#if %_RT_SAMPLE3
+	TexColorChart2D(colorChartTex, linearClampSS, OUT.Color.rgb);
+#endif
+
+	// Apply dithering to remove banding (in non-linear space)
+	ApplyRandomDithering(OUT.Color.rgb, IN.WPos.xy);
+
+	return OUT;
+}
+
+technique TonemappingMobile
+{
+  pass p0
+  {
+    VertexShader = TonemappingMobileVS();
+    PixelShader  = TonemappingMobilePS() TonemappingMobilePS;  
+  }
+}
+
+RWBuffer<int> LuminanceValues : register(u0);
+
+struct SampleLuminanceVtxOut
+{
+#if %_PS															
+		sample float4 WPos            : SV_POSITION;							
+		nointerpolation uint sampleID : SAMPLEID ;
+#else																
+		float4 HPosition : SV_POSITION;								
+		uint sampleID    : SAMPLEID ;
+#endif
+
+	float4 baseTC  : TEXCOORDN; 
+	
+#if VULKAN
+	[[vk::builtin("PointSize")]] float PointSize : PSIZE;
+#endif
+};
+
+
+SampleLuminanceVtxOut SampleLuminanceVS(float4 Position  : POSITION, uint VertexID : SV_VertexID)
+{
+  SampleLuminanceVtxOut OUT = (SampleLuminanceVtxOut)0; 
+
+  OUT.HPosition = float4(Position.xy, 0.0f, 1.0f);
+  OUT.baseTC    = Position * 0.5f + 0.5f;
+  OUT.sampleID  = VertexID;  
+
+#if VULKAN
+  OUT.PointSize = 1.0f;
+#endif
+  
+  return OUT;
+} 	
+
+
+void SampleLuminancePS( SampleLuminanceVtxOut IN )
+{
+	float4 col = GetTexture2D(texSceneTarget, linearClampSS, IN.baseTC.xy); 
+	int old;
+	float val = all(isfinite(col)) ? GetLuminance(col) : 0;
+	val = log(val + 1e-6);
+	InterlockedExchange(LuminanceValues[IN.sampleID], asint(val), old);
+}
+
+technique SampleLuminance
+{
+  pass p0
+  {
+    VertexShader = SampleLuminanceVS();
+    PixelShader  = SampleLuminancePS() TonemappingMobilePS;  
+  }
+}

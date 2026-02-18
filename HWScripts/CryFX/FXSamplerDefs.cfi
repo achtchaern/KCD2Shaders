@@ -1,0 +1,58 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+//=== Shared samplers =========================================================
+
+// Material textures. TODO: remove sRGBLookup as it cannot work with resource sets
+#define DIFFUSEMAP            Texture2D<min16float4>   diffuseTex          : register(t0)       = TM_Diffuse;
+#define NORMALMAP             Texture2D<min16float4>   normalsTex          : register(t1)       = TM_Normals;
+#define SPECULARMAP           Texture2D<min16float4>   specularTex         : register(t2)                                    = TM_Specular;
+#define ENVIRONMENTCUBEMAP    TextureCube<min16float4> envCubeTex          : register(t3)                                    = TM_Env;
+#define DETAILMAP             Texture2D<min16float4>   detailTex           : register(t4)       = TM_Detail;
+#define SMOOTHNESSMAP         Texture2D<min16float4>   smoothnessTex       : register(t5)                                    = TM_Smoothness;
+#define HEIGHTMAP             Texture2D<min16float4>   heightTex           : register(t6)                                    = TM_Height;
+#define DECALMAP              Texture2D<min16float4>   decalTex            : register(t7)                                    = TM_DecalOverlay;
+#define SUBSURFACEMAP         Texture2D<min16float4>   subsurfaceTex       : register(t8)       = TM_SubSurface;
+#define CUSTOMMAP             Texture2D<min16float4>   customTex           : register(t9)                                    = TM_Custom;
+#define CUSTOMSECONDARYMAP    Texture2D<min16float4>   customSecondaryTex  : register(t10)                                   = TM_CustomSecondary;
+#define OPACITYMAP            Texture2D<min16float4>   opacityTex          : register(t11)                                   = TM_Opacity;
+#define TRANSLUCENCYMAP       Texture2D<min16float4>   translucencyTex     : register(t12)                                   = TM_Translucency;
+#define EMITTANCEMAP          Texture2D<min16float4>   emittanceTex        : register(t13)                                   = TM_Emittance;
+#define flowTex               detailTex  
+
+// GBuffer per pass textures.
+#define PERLIN_NOISE_MAP      Texture2D<min16float4>   perlinNoiseTex      : register(t25)                                   = "%ENGINE%/EngineAssets/Textures/perlinNoise2D.dds";
+#define WIND_GRID_MAP         Texture2D<min16float4>   windGridTex         : register(t26)                                   = TS_WindGrid;  
+#define TERRAIN_ELEV_MAP      Texture2D<min16float4>   terrainElevTex      : register(t27)                                   = TS_TerrainElevMap;
+#define TERRAIN_NORM_MAP      Texture2D<min16float4>   terrainNormTex      : register(t28)                                   = TS_TerrainNormMap;
+#define TERRAIN_BASE_MAP      Texture2D<min16float4>   terrainBaseTex      : register(t29)                                   = TS_TerrainBaseMap;
+#define NORMALS_FITTING_MAP   Texture2D<min16float4>   normalsFittingTex   : register(t30)                                   = "%ENGINE%/EngineAssets/ScreenSpace/NormalsFitting.dds";
+
+// Forward/Custom per-pass textures
+#define SCENE_DEPTH_MAP       Texture2D<min16float4>   linearDepthTex      : register(t32)                                   = TS_ZTarget;
+#define NOISE_3D_MAP          Texture3D<min16float4>   noise3DTex          : register(t39)                                   = "%ENGINE%/EngineAssets/Textures/noise3d.dds";
+
+// Forward etc
+#define SCENE_NORMALS_MAP     Texture2D<min16float4>   sceneNormalsTex                                                       = TS_SceneNormals;
+#define SCENE_NORMALS_BENT    Texture2D<min16float4>   sceneNormalsBentTex                                                   = TS_SceneNormalsBent;
+
+// Material sampler states
+SamplerState ssMaterialAnisoHigh       : register(s0) = SS_MaterialAnisoHighWrap;
+SamplerState ssMaterialAnisoLow        : register(s1) = SS_MaterialAnisoLowWrap;
+SamplerState ssMaterialTrilinear       : register(s2) = SS_MaterialTrilinearWrap;
+SamplerState ssMaterialBilinear        : register(s3) = SS_MaterialBilinearWrap; 
+
+SamplerState ssMaterialTrilinearClamp  : register(s4) = SS_MaterialTrilinearClamp;
+SamplerState ssMaterialBilinearClamp   : register(s5) = SS_MaterialBilinearClamp;
+
+SamplerState ssMaterialAnisoHighBorder : register(s6) = SS_MaterialAnisoHighBorder; 
+SamplerState ssMaterialTrilinearBorder : register(s7) = SS_MaterialTrilinearBorder; 
+
+// Generic sampler states
+SamplerState ssPointWrap               : register(s8) = SS_PointWrap;
+SamplerState ssPointClamp              : register(s9) = SS_PointClamp;
+
+SamplerState TrilinearWrapSamplerState                = SS_TrilinearWrap;
+SamplerState TrilinearClampSamplerState               = SS_TrilinearClamp;
+
+#define SCENEDEPTHMAP         Texture2D   sceneLinearDepthTex                                                   = $ZTarget;
+#define SCENEDEPTHMAP_HSCALED Texture2D   sceneLinearDepthTexHalfRes                                            = $ZTargetScaled;

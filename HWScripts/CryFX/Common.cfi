@@ -1,0 +1,719 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//  Description: Common include file for ALL shaders 
+//	 - only add when really necessary, this will propagate to ALL shaders
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define PI 3.1415
+#define PI_X2 6.2831
+#define PI_X4 12.5663
+
+//=== Project specific definitions ==============================================
+
+//=== WH[TBa]: move macromap specific CTSW to a separate file, KCD2-113541 ======
+#include "WHMacromapBakingDefines.cfi"
+
+//=== Render targets custom ID's ================================================
+
+#define _RT2D_WATER_ID 0
+#define _RT2D_DEPTH_ID 1
+#define _RT2D_SCREEN_ID 2
+#define _RT2D_REFRACT_ID 3
+#define _RT2D_TRANSLUCENCE_ID 4
+
+// === HDR fake definitions =====================================================
+
+#define HDR_OVERBRIGHT 8
+#define HDR_FAKE_MAXOVERBRIGHT 16
+#define HDR_EXP_OFFSET 128
+#define HDR_EXP_BASE   1.06
+
+// === Lights definitions ========================================================
+
+#define LIGHT_TYPE_PROBE              1
+#define LIGHT_TYPE_AMBIENT_POINT      2
+#define LIGHT_TYPE_AMBIENT_PROJECTOR  3
+#define LIGHT_TYPE_AMBIENT_AREA       4
+#define LIGHT_TYPE_REGULAR_POINT      5
+#define LIGHT_TYPE_REGULAR_PROJECTOR  6
+#define LIGHT_TYPE_REGULAR_POINTFACE  7
+// WH[Woody,TBa]: add support for spot-like shadows
+#define LIGHT_TYPE_REGULAR_POINT_WITH_SPOT_SHADOW 8
+#define LIGHT_TYPE_REGULAR_AREA       9
+#define LIGHT_TYPE_REGULAR_AREAFACE   10
+#define LIGHT_TYPE_SUN                11
+
+//=== Common definitions =========================================================
+
+#include "FXStreamDefs.cfi"
+#include "FXConstantDefs.cfi"
+#include "FXSamplerDefs.cfi"
+
+#include "CommonMath.cfi"
+
+//==== DeferredShading============================================================
+#define CLIPVOLUME_CONNECTED_TO_OUTDOOR (1<<0)
+#define CLIPVOLUME_IGNORE_GI            (1<<1)
+#define CLIPVOLUME_AFFECTED_BY_SUN      (1<<2)
+#define AFFECTS_EVERYTHING_STENCILREF	0xFF
+#define MAX_CLIPVOLUMES 63
+#define CLIPVOLUME_BLEND                (1<<3)
+
+float CalcClipVolumeBlendWeight(uint nClipVolumeID, uint nClipVolumeData, float fClipVolumeBlendFactor, uint nLightStencilID)
+{
+	const uint nLightStencilID0 = nLightStencilID & 0xFF;
+	const uint nLightStencilID1 = nLightStencilID >> 16;
+	
+		// 'affects_this_area_only' turned OFF
+	if(nLightStencilID0 == AFFECTS_EVERYTHING_STENCILREF) 
+		return 1.0f;
+	else
+	{
+		if(nClipVolumeData & CLIPVOLUME_BLEND)
+		{
+			uint nClipVolumeID0 = (nClipVolumeData >> 24);
+			uint nClipVolumeID1 = (nClipVolumeData >> 16) & 0xFF;
+		
+			if(nLightStencilID0 == nClipVolumeID0)
+				return fClipVolumeBlendFactor;
+			else if(nLightStencilID0 == nClipVolumeID1)
+				return 1.0-fClipVolumeBlendFactor;
+				
+			// fall through: test for vis area itself
+		}
+
+		return (nClipVolumeID == nLightStencilID0 || nClipVolumeID == nLightStencilID1) ? 1.0f : 0.0f;
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void ComputeGlobalFogPS(inout min16float3 cOut, float fDist)
+{
+#if %_RT_FOG
+  cOut.xyz = lerp(g_PS_FogColor.xyz, cOut.xyz, fDist);
+#endif  
+}
+
+float3 TangNormalUnnormalized(float4 Tangent, float4 Binormal)
+{
+  return cross(Tangent.xyz, Binormal.xyz) * Tangent.w;
+}
+
+float3 TangNormal(float4 Tangent, float4 Binormal)
+{
+  return normalize(TangNormalUnnormalized(Tangent, Binormal));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Depth conversion
+float GetLinearDepth(float fDevDepth, bool bScaled = false)
+{
+	return fDevDepth * (bScaled ? PS_NearFarClipDist.y : 1.0f);
+}
+
+float GetDeviceDepth(float fLinearDepth)
+{
+	return fLinearDepth;
+}
+
+#if FEATURE_RELAXED_PRECISION
+min16float GetLinearDepth(min16float fDevDepth, bool bScaled = false)
+{
+	return fDevDepth * (bScaled ? PS_NearFarClipDist.y : 1.0f);
+}
+
+min16float GetDeviceDepth(min16float fLinearDepth)
+{
+	return fLinearDepth;
+}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Texture lookup functions
+#include "textureLib.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Motion vector
+
+float2 OutputVelocityRT(float2 vCurrPos, float2 vPrevPos, float fAlpha = 1.0f)
+{
+	float2 vVelocity = (vPrevPos - vCurrPos) * fAlpha;
+	return vVelocity;
+}
+
+// When changing this: there are fast paths in PackVelocitiesCS() inside MotionBlur.cfx that depend on this behavior and have to be adjusted as wel.
+float2 CombineObjectAndCameraVelocity(float2 velocityObject, float2 velocityCamera)
+{
+	// WH[DH]: Removed motion blur fast path, it does not work well with dynamic objects that do not support motion vectors
+	return any(velocityObject) ? velocityObject : velocityCamera;
+}
+
+float2 GetCameraVelocity(in float3 vPosWS, in float4x4 currViewProj, in float4x4 prevViewProj)
+{
+	float3 vPosHCurr = currViewProj[0].xyw * vPosWS.x + (currViewProj[1].xyw * vPosWS.y + (currViewProj[2].xyw * vPosWS.z + currViewProj[3].xyw));
+	float3 vPosHPrev = prevViewProj[0].xyw * vPosWS.x + (prevViewProj[1].xyw * vPosWS.y + (prevViewProj[2].xyw * vPosWS.z + prevViewProj[3].xyw));
+	vPosHCurr.xy /= vPosHCurr.z;
+	vPosHPrev.xy /= vPosHPrev.z;
+	return (vPosHPrev.xy - vPosHCurr.xy);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// get 2d homogeneous position
+float4 Get2dHPos(float4 pos)
+{
+	float4 hPos;
+	hPos.zw = pos.zw;
+	hPos.xy = (pos.xy * float2(2.0,-2.0)) - float2(1.0,-1.0);
+	return hPos;
+}
+
+int2 GetScaledWPos(float2 WPos)
+{
+	return (int2)floor(WPos * CV_HPosScale).xy;
+}
+
+float2 GetScaledScreenTC(float2 TC)
+{
+	return TC * CV_HPosScale.xy;
+}
+
+float4 HPosToScreenTC(float4 HPos, bool scaled = true)
+{
+  float4 ScrTC = HPos;
+  ScrTC.xy = (HPos.xy * float2(1,-1) + HPos.ww) * 0.5;
+	
+  if(scaled)
+  {
+    ScrTC.xy = GetScaledScreenTC(ScrTC.xy);
+  }
+
+  return ScrTC;
+}
+
+float3 ReconstructWorldPos(int2 WPos, float linearDepth, bool bRelativeToCamera = false)
+{
+	float4 wposScaled = float4(WPos * linearDepth, linearDepth, bRelativeToCamera ? 0.0 : 1.0);
+	return mul(CV_ScreenToWorldBasis, wposScaled);
+}
+
+float3 ReconstructWorldPos(int2 WPos, Texture2D sceneDepthTex, bool bRelativeToCamera = false)
+{
+	float linearDepth = sceneDepthTex.Load(int3(WPos, 0)).x;
+	return ReconstructWorldPos(WPos, linearDepth, bRelativeToCamera);
+}
+
+float3 GetWorldViewPos()
+{
+	return float3(CV_ScreenToWorldBasis[0][3], CV_ScreenToWorldBasis[1][3], CV_ScreenToWorldBasis[2][3]);
+}
+
+float2 ClampScreenTC(float2 TC, float2 maxTC)
+{
+	return clamp(TC, 0, maxTC.xy);
+}
+
+float2 ClampScreenTC(float2 TC)
+{
+	return clamp(TC, 0, CV_HPosScale.xy);
+}
+
+NORMALS_FITTING_MAP
+
+void CompressUnsignedNormalToNormalsBuffer(inout min16float4 vNormal)
+{
+	#if !%DETAIL_MAPPING && !%DETAIL_ATLAS && !%TEMP_VEGETATION && !%_RT_ALPHABLEND && !%_RT_ALPHATEST && !%TEMP_TERRAIN
+		// expand from unsigned
+		vNormal.rgb = vNormal.rgb * 2.h - 1.h;
+
+		// renormalize (needed if any blending or interpolation happened before)
+		vNormal.rgb = normalize(vNormal.rgb);
+		// get unsigned normal for cubemap lookup (note the full float presision is required)
+		min16float3 vNormalUns = abs(vNormal.rgb);
+		// get the main axis for cubemap lookup
+		min16float maxNAbs = max(vNormalUns.z, max(vNormalUns.x, vNormalUns.y));
+		// get texture coordinates in a collapsed cubemap
+		float2 vTexCoord = vNormalUns.z < maxNAbs ? (vNormalUns.y < maxNAbs?vNormalUns.yz : vNormalUns.xz) : vNormalUns.xy;
+		vTexCoord = vTexCoord.x < vTexCoord.y ? vTexCoord.yx : vTexCoord.xy;
+		vTexCoord.y /= vTexCoord.x;
+		// fit normal into the edge of unit cube
+		vNormal.rgb /= maxNAbs;
+
+		// look-up fitting length and scale the normal to get the best fit
+		#if %_RT_QUALITY || %_RT_QUALITY1
+			float fFittingScale = GetTexture2DLod(normalsFittingTex, ssPointClamp, float4(vTexCoord, 0, 0)).a;
+		#else
+			float fFittingScale = GetTexture2D(normalsFittingTex, ssPointClamp, vTexCoord).a;
+		#endif
+
+		// scale the normal to get the best fit
+		vNormal.rgb *= fFittingScale;
+
+		// squeeze back to unsigned
+		vNormal.rgb = vNormal.rgb * .5h + .5h;
+	#endif
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Deferred Shading Common
+
+#define LIGHTINGMODEL_STANDARD       0
+#define LIGHTINGMODEL_TRANSMITTANCE  1
+#define LIGHTINGMODEL_POM_SS         2
+
+struct MaterialAttribsCommon
+{
+	min16float3  NormalWorld;
+	min16float3  Albedo;
+	min16float3  Reflectance;
+	min16float3  Transmittance;
+	min16float   Smoothness;
+	min16float   ScatteringIndex;
+	min16float   SelfShadowingSun;
+	min12int     LightingModel;
+	bool         ThreePointLighting; // WH:Woody - Extended for cutscene three-point lighting (Key, Fill, Rim)
+};
+
+
+MaterialAttribsCommon MaterialAttribsDefault()
+{
+	MaterialAttribsCommon attribs = (MaterialAttribsCommon) 0;
+	return attribs;
+}
+
+min16float DecodeSunSelfShadowing(min16float4 bufferA, min16float4 bufferB, min16float4 bufferC )
+{
+	min16float lightingModel = floor(bufferA.w * TWO_BITS_EXTRACTION_FACTOR);
+	return lightingModel == LIGHTINGMODEL_POM_SS ? saturate(bufferC.z / MIDPOINT_8_BIT - 1) : 0;
+}
+
+void EncodeGBuffer( MaterialAttribsCommon attribs, out float4 bufferA, out float4 bufferB, out float4 bufferC )
+{
+	bufferA.xyz = attribs.NormalWorld * 0.5 + 0.5;
+	bufferA.w = 0;
+	CompressUnsignedNormalToNormalsBuffer( bufferA );
+
+#if %CLOTHING_SYSTEM // WH GM: this is included before IllumValidations.cfi so we can't use macros
+	//material atlas already uses linear color
+	bufferB.xyz = attribs.Albedo;
+#else
+	bufferB.xyz = sqrt(attribs.Albedo);
+#endif
+	bufferB.w = 0;
+	
+	bufferC.x = attribs.Smoothness;
+
+	// WH GM: Enabled self shadowing on decals. #KCD2-130666
+	if (attribs.ThreePointLighting)
+	{
+		// WH GM: Characters and clothing items don't interfere with POM self-shadowing because
+		// they are masked using stencil buffer. Therefore we can use three channel specular.
+		bufferC.yzw = EncodeColorYCC(attribs.Reflectance);
+	}
+	else
+	{
+		// WH GM: To make colored reflectance compatible with POM self-shadowing on roads,
+		// we encode it in two channels and leave bufferC.z free for POM self-shadowing.
+		bufferC.yw = EncodeColorYCCCompressedWH(attribs.Reflectance);
+		bufferC.z = 0;
+	}
+	
+	if (attribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
+	{
+		// Encoding for SSS: integer part is profile, frac is amount
+		float scatteringAmount = frac( attribs.ScatteringIndex );
+		bufferB.w = scatteringAmount > 0.01 ? attribs.ScatteringIndex / TWO_BITS_EXTRACTION_FACTOR : 0;
+		
+		attribs.Transmittance = EncodeColorYCC( attribs.Transmittance );
+		bufferA.w = attribs.Transmittance.x;
+		bufferC.zw = attribs.Transmittance.yz;
+	}
+	else if (attribs.LightingModel == LIGHTINGMODEL_POM_SS)
+	{
+		// Remap range so that chrominance of gray (0.5) and zero POM SS map to the same value
+		bufferC.z = attribs.SelfShadowingSun * MIDPOINT_8_BIT + MIDPOINT_8_BIT;
+	}
+	else
+	{
+		// standard model with possible 3PL
+		if (attribs.ThreePointLighting)
+		{
+			bufferB.w = 1.0;
+		}
+	}
+	
+	bufferA.w = ((float)attribs.LightingModel + (bufferA.w * MAX_FRACTIONAL_8_BIT)) / TWO_BITS_EXTRACTION_FACTOR;
+}
+
+void EncodeMicroGBuffer(MaterialAttribsCommon attribs, inout min16float4 bufferA, int2 WPos)
+{
+	float3 normalView = mul((float3x3)CV_ViewMatr, attribs.NormalWorld);
+	float2 normalEnc = normalView.xy * rsqrt(8 * normalView.z + 8) + 0.5;
+	
+	bool bChecker0 = (WPos.x & 1) == (WPos.y & 1);
+	float3 baseColorYCC = EncodeColorYCC(attribs.Albedo);
+	bufferA.xy = bChecker0 ? baseColorYCC.xy : baseColorYCC.xz;
+	bufferA.z = bChecker0 ? attribs.Smoothness : normalEnc.x;
+	bufferA.w = bChecker0 ? GetLuminance(attribs.Reflectance) : normalEnc.y;
+}
+
+void SetGBufferBlending( inout min16float4 bufferA, inout min16float4 bufferB, inout min16float4 bufferC,
+                         min16float alphaNormals, min16float alphaDiffuse, min16float alphaSpecular )
+{
+	bufferA.w = alphaNormals;
+	bufferB.w = alphaDiffuse;
+	bufferC.w = alphaSpecular;
+}
+
+MaterialAttribsCommon DecodeGBuffer( min16float4 bufferA, min16float4 bufferB, min16float4 bufferC )
+{
+	MaterialAttribsCommon attribs;
+	
+	attribs.LightingModel = (int)floor(bufferA.w * TWO_BITS_EXTRACTION_FACTOR);
+	
+	attribs.NormalWorld = normalize( bufferA.xyz * 2 - 1 );
+	attribs.Albedo = bufferB.xyz * bufferB.xyz;
+	bool standardModelLighting = (attribs.LightingModel == LIGHTINGMODEL_STANDARD);
+
+	attribs.Smoothness = bufferC.x;
+	attribs.ScatteringIndex = bufferB.w * TWO_BITS_EXTRACTION_FACTOR;
+
+	// WH[TB,TBa]: 3pl
+	attribs.ThreePointLighting = (attribs.ScatteringIndex >= 1.0) ? true : false; // for both SKIN and STANDARD+3PL
+
+	// WH GM: See comment in EncodeGBuffer
+	if (attribs.ThreePointLighting)
+	{
+		attribs.Reflectance = DecodeColorYCC(bufferC.yzw, standardModelLighting);
+	}
+	else
+	{
+		bool useChrominance = (attribs.LightingModel != LIGHTINGMODEL_TRANSMITTANCE);
+		attribs.Reflectance = DecodeColorYCCCompressedWH( bufferC.yw, useChrominance );
+	}
+
+	if (standardModelLighting)
+	{
+		// in standard model lighting, the scattering index was just a marker for 3PL pixels and would cause some issue further in the pipeline
+		attribs.ScatteringIndex = 0;
+	}
+
+	attribs.Transmittance = min16float3( 0, 0, 0 );
+	if (attribs.LightingModel == LIGHTINGMODEL_TRANSMITTANCE)
+	{
+		attribs.Transmittance = DecodeColorYCC( min16float3( frac(bufferA.w * TWO_BITS_EXTRACTION_FACTOR), bufferC.z, bufferC.w ) );
+	}
+	
+	attribs.SelfShadowingSun = 0;
+	if (attribs.LightingModel == LIGHTINGMODEL_POM_SS)
+	{
+		attribs.SelfShadowingSun = saturate(bufferC.z / MIDPOINT_8_BIT - 1);
+	}
+	
+	return attribs;
+}
+
+MaterialAttribsCommon DecodeMicroGBuffer( Texture2D GBufferTex, float2 WPos, int2 pixCoord )
+{
+	MaterialAttribsCommon attribs = (MaterialAttribsCommon)0;
+	
+	float4 uGBuf  = GBufferTex[pixCoord];
+	float4 uGBuf1 = GBufferTex[pixCoord + int2( 1,  0)];
+	float4 uGBuf2 = GBufferTex[pixCoord + int2(-1,  0)];
+	float4 uGBuf3 = GBufferTex[pixCoord + int2( 0,  1)];
+	float4 uGBuf4 = GBufferTex[pixCoord + int2( 0, -1)];
+	
+	// Edge-directed reconstruction filter
+	const float edgeThreshold = 0.1;
+	float4 lum = float4(uGBuf1.x, uGBuf2.x, uGBuf3.x, uGBuf4.x);
+	float4 weights = 1 - step(edgeThreshold, abs(lum - uGBuf.x));
+	float weightSum = dot(weights, 1);
+	weights.x = (weightSum == 0) ? 1 : weights.x;
+	float invWeightSum = (weightSum == 0) ? 1 : rcp(weightSum);
+	
+	// Reconstruct missing components
+	float yy = dot(weights, float4(uGBuf1.y, uGBuf2.y, uGBuf3.y, uGBuf4.y)) * invWeightSum;
+	float zz = dot(weights, float4(uGBuf1.z, uGBuf2.z, uGBuf3.z, uGBuf4.z)) * invWeightSum;
+	float ww = dot(weights, float4(uGBuf1.w, uGBuf2.w, uGBuf3.w, uGBuf4.w)) * invWeightSum;
+	
+	bool bChecker0 = ((int)WPos.x & 1) == ((int)WPos.y & 1);
+	
+	attribs.Smoothness = bChecker0 ? uGBuf.z : zz;
+	attribs.Reflectance = bChecker0 ? uGBuf.w : ww;
+	attribs.Albedo = DecodeColorYCC(float3(uGBuf.x, bChecker0 ? uGBuf.y : yy, bChecker0 ? yy : uGBuf.y));
+	
+	
+	// Decode normal
+	float2 normEnc = float2(bChecker0 ? zz : uGBuf.z, bChecker0 ? ww : uGBuf.w) * 4 - 2;
+	float f = dot(normEnc, normEnc);
+	attribs.NormalWorld.xy = normEnc * sqrt(1 - f / 4);
+	attribs.NormalWorld.z = 1 - f / 2;
+	attribs.NormalWorld = mul(attribs.NormalWorld, (float3x3)CV_ViewMatr);	
+	
+	return attribs;
+}
+
+min16float3 DecodeGBufferNormal( min16float4 bufferA )
+{
+	return normalize( bufferA.xyz * 2 - 1 );
+}
+
+min16float4 DecodeGBufferAlbedoAndScattering( min16float4 bufferB )
+{
+	return min16float4( bufferB.xyz * bufferB.xyz, bufferB.w * TWO_BITS_EXTRACTION_FACTOR );
+}
+
+min16float DecodeGBufferTransmittanceLum( min16float4 bufferA )
+{
+	min16float lightingModel = floor( bufferA.w * TWO_BITS_EXTRACTION_FACTOR );
+	return (lightingModel == LIGHTINGMODEL_TRANSMITTANCE) ? frac( bufferA.w * TWO_BITS_EXTRACTION_FACTOR ) : 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float  NumInstructions		: PI_NumInstructions;
+
+Texture2D DebugMipColorsDiffuse = $MipColors_Diffuse;
+Texture2D DebugMipColorsBump = $MipColors_Bump;
+
+SamplerState DebugMipColorsSamplerState = SS_TrilinearClamp;
+
+float4 DVColor(float2 d)
+{ 
+  float Reso = 512;
+  float TargetDeriv = 1.0f/Reso;
+  float HalfTD = (TargetDeriv*0.5);
+  float TwoTD = (TargetDeriv*2.0);
+
+
+  float4 dd = float4(0,0,0,1);
+  if (d.x > TwoTD) { dd.x = 1.0;}
+  if (d.y > TwoTD) { dd.y = 1.0;}
+  if (d.x < HalfTD) { dd.z = 1.0;}
+  return(dd);
+}
+
+
+void DebugOutput(out min16float4 Color, in float4 baseTC)
+{
+  Color = 0;
+ #if %_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // 1000
+  float2 dd = 64.0 * (abs(ddx(baseTC.xy)) + abs(ddy(baseTC.xy)));
+  Color = float4(dd, 0, 1);
+ #elif !%_RT_DEBUG0 && %_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // 0100
+  float4 dd = baseTC;
+  Color = dd;
+ #elif %_RT_DEBUG0 && %_RT_DEBUG1 && !%_RT_DEBUG2 && !%_RT_DEBUG3 // 1100
+  Color = DVColor(abs(ddx(baseTC.xy)));
+ #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // 0010
+  Color = DVColor(abs(ddy(baseTC.xy)));
+ #elif %_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3 // 1011
+  Color = DVColor(abs(ddy(baseTC.xy)));
+ #elif !%_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // 0110
+  float Reso = 512;
+  float TargetDeriv = 1.0/Reso;
+  float Diagonal = sqrt(2.0*TargetDeriv*TargetDeriv);
+  float HalfDiag = (Diagonal*0.5);
+  float TwoDiag = (Diagonal*2.0);
+  float2 dx = ddx(baseTC.xy);
+  float2 dy = ddy(baseTC.xy);
+  float d = sqrt(dot(dx,dx) + dot(dy,dy));
+  float4 dd = float4(0,0,0,1);
+  if (d > TwoDiag) { dd.x = 1.0;}
+  if (d > TwoDiag) { dd.y = 1.0;}
+  if (d < HalfDiag) { dd.z = 1.0;}
+  Color = dd;
+ #elif %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && !%_RT_DEBUG3 // 1110
+  float4 mipColor = GetTexture2D(DebugMipColorsDiffuse, DebugMipColorsSamplerState, baseTC.xy);
+  Color = mipColor;
+ #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && !%_RT_DEBUG2 && %_RT_DEBUG3 // 0001
+  float4 mipColor = GetTexture2D(DebugMipColorsBump, DebugMipColorsSamplerState, baseTC.xy);
+  Color = mipColor;
+ #elif %_RT_DEBUG0 && %_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3 // 1111
+  Color.xyz = NumInstructions;	// Measure overdraw
+ #elif !%_RT_DEBUG0 && !%_RT_DEBUG1 && %_RT_DEBUG2 && %_RT_DEBUG3 // 0011
+  float x = frac(baseTC.x);
+  float y = frac(baseTC.y);
+  if((x < 0.5 && y < 0.5) || (x > 0.5 && y > 0.5))
+	Color = float4(3, 3, 0, 1);
+  else
+	Color = float4(0, 0, 3, 1);
+ #endif
+ // free:
+  // 1010
+  // 1001
+  // 0101
+  // 0111
+  // 1101
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float4 GetInputColor(in float4 Color)
+{
+  return Color.zyxw;
+}
+
+#define QUALITY_LOW      0
+#define QUALITY_MEDIUM   1
+#define QUALITY_HIGH   	 2
+#define QUALITY_VERYHIGH 3
+
+int GetShaderQuality()
+{
+  int nQuality;
+#if !%_RT_QUALITY && !%_RT_QUALITY1
+   nQuality = QUALITY_LOW;
+#elif %_RT_QUALITY && !%_RT_QUALITY1
+   nQuality = QUALITY_MEDIUM;
+#elif !%_RT_QUALITY && %_RT_QUALITY1
+   nQuality = QUALITY_HIGH;
+#else
+   // #warning Unknown shader quality mode
+   nQuality = QUALITY_VERYHIGH;
+#endif  
+  return nQuality;
+}
+
+int GetMSAASampleNum()
+{
+  int nSamplesNum = 0;
+#if %_RT_MSAA_QUALITY && %_RT_MSAA_QUALITY1
+   nSamplesNum = 8;
+#elif %_RT_MSAA_QUALITY && !%_RT_MSAA_QUALITY1
+   nSamplesNum = 4;
+#elif !%_RT_MSAA_QUALITY && %_RT_MSAA_QUALITY1
+   nSamplesNum = 2;
+#endif  
+  return nSamplesNum;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float ComputeTextureLOD(in float2 uv, in float2 texDim)
+{
+	uv *= texDim;
+	
+	float2 ddx_ = ddx(uv);
+	float2 ddy_ = ddy(uv);
+	//float2 mag = ddx_ * ddx_ + ddy_ * ddy_;
+	float2 mag = abs(ddx_) + abs(ddy_);
+	
+	//float lod = max(0.5 * log2(max(mag.x, mag.y)), 0);
+	float lod = log2(max(mag.x, mag.y));
+	return lod;
+}
+
+float ComputeTextureLOD(in float2 uv, in float2 texDim, out float2 ddx_uv, out float2 ddy_uv)
+{
+	//float2 uvScaled = uv * texDim;
+	//float2 ddx_, ddy_;
+		
+	//float4(ddx_, ddx_uv) = ddx(float4(uvScaled, uv));
+	//float4(ddy_, ddy_uv) = ddy(float4(uvScaled, uv));	
+	
+	////float2 mag = ddx_ * ddx_ + ddy_ * ddy_;
+	//float2 mag = abs(ddx_uv) + abs(ddy_uv);
+
+	ddx_uv = ddx(uv);
+	ddy_uv = ddy(uv);
+	//float2 mag = (ddx_uv * ddx_uv + ddy_uv * ddy_uv) * texDim * texDim;
+	float2 mag = (abs(ddx_uv) + abs(ddy_uv)) * texDim;
+	
+	//float lod = max(0.5 * log2(max(mag.x, mag.y)), 0);
+	float lod = log2(max(mag.x, mag.y));
+	return lod;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Checks normalized sun light direction from level and applies it to the UV for the Cloud Shadows.
+float2 ComputeCloudShadowMapUV(in float3 worldPos, in float3 sunDirNormalized)
+{
+	const float t = -worldPos.z / sunDirNormalized.z;
+	return worldPos.xy + t * sunDirNormalized.xy;
+}
+
+float2 ComputeCloudShadowMapUV(in float3 worldPos)
+{
+#if %_PS
+	const float3 sunDir = g_PS_SunLightDir.xyz;
+#elif %_VS
+	const float3 sunDir = g_VS_SunLightDir.xyz;
+#elif %_CS
+	const float3 sunDir = g_VS_SunLightDir.xyz;
+#else
+	const float3 sunDir = normalize(float3(0.1, 0.1, 1.0));
+#endif
+	return ComputeCloudShadowMapUV(worldPos, sunDir);
+}
+
+//////////////////////////// ///////////////////////////////////////////////////
+// Helper functions for remapping between coordinate spaces:
+//
+// Raster Space:   Normalized rasterizer output coordinate system, i.e. output rendertarget
+//                 top left      = ( 0,  0)    and     bottom right     = (1, 1)
+// Viewport Space: Normalized main render viewport coordinate system (full screen viewport for multires shading)
+//                  top left     = ( 0,  0)    and     bottom right     = (1, 1)
+// Clip Space:     Main render camera clip space
+//                 top left near = (-1,  1, 0) and     bottom right far = (1,-1, 1)
+//
+// Unless otherwise noted, coordinates are assumed to be normalized to (0, 1) range [(-1, 1) for clip space x and y axis]
+// Unnormalized coordinates are in assumed to be in pixels.
+
+float2 MapRasterToViewport(float2 normalizedRasterPos)
+{
+		return normalizedRasterPos;
+}
+
+float2 MapViewportToRaster(float2 normalizedViewportPos, bool bOtherEye = false)
+{
+		return normalizedViewportPos;
+}
+
+float2 MapViewportToUnnormalizedRaster(float2 normalizedViewportPos)
+{
+		return normalizedViewportPos;
+}
+
+float4 MapUnnormalizedRasterToClip(float2 unnormalizedRasterPos, float depth, bool bPerformPerspectiveDivision = true)
+{
+		return float4(unnormalizedRasterPos, depth, 1.0);
+}
+
+float2 MapUnnormalizedRasterToViewport(float2 unnormalizedRasterPos)
+{
+		return unnormalizedRasterPos;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Full screen triangle creation from vertexID.
+
+min16float4 GetHPos_FromTriVertexID(uint vertexID)
+{
+    return min16float4(min16float2(((vertexID << 1) & 2) * 2.0, (vertexID == 0) ? -4.0 : 0.0) + min16float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+min16float2 GetBaseTC_FromTriVertexID(uint vertexID)
+{
+    return min16float2((vertexID << 1) & 2, (vertexID == 0) ? 2.0 : 0.0);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint GetStencilValueFromTexel(uint2 stencilTexel)
+{
+	// Which channel to load the stencil value from is platform dependent.
+	// On some platforms stencil is bound separately as a one channel texture.
+	// On others stencil is bound with depth in red and stencil in green channel.
+#if HERCULES
+	return stencilTexel.r;
+#else
+	return stencilTexel.g;
+#endif
+}
+
+#include "WHCommon.cfi"

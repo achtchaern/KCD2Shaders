@@ -1,0 +1,36 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+
+//===========================================================================
+// Validations
+// Removing of redundant and mutually exclusive flags to prevent generating
+// of the vertex/pixel shaders
+
+#ifdef FEATURE_MESH_TESSELLATION
+	#if %PHONG_TESSELLATION || %PN_TESSELLATION || %DISPLACEMENT_MAPPING
+		#define ENABLE_TESSELLATION 1
+	#endif
+#endif
+
+#ifndef ENABLE_TESSELLATION
+	#if %PHONG_TESSELLATION
+		#undefine %PHONG_TESSELLATION
+	#endif
+	#if %PN_TESSELLATION
+		#undefine %PN_TESSELLATION
+	#endif
+	#if %DISPLACEMENT_MAPPING
+		#undefine %DISPLACEMENT_MAPPING
+	#endif
+#endif
+
+// WH GM: Enable hiding groups and decals for all skin shaders
+#define HIDING_GROUPS
+
+#define MACRO_ATLAS_SIZE 0
+
+#define DECAL_ATLAS
+#define DECAL_ATLAS_SIZE 8
+
+#define CLS_BLOOD
+#define CLS_GRIME

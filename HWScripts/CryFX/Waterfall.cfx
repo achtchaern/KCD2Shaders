@@ -1,0 +1,444 @@
+// Copyright 2001-2019 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "ShadowCommon.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+	string Script =
+		"Public;"
+		"NoPreview;"
+		"ShaderDrawType = General;"
+		"ShaderType = Water;"
+		"AlphaBlendShadows;"
+		"VertexColors;"
+#if %DEPTH_FOG
+		"ForceRefractionUpdate;"
+#else
+		"Refractive;"
+#endif
+>;
+
+struct CustomForwardShadingAttribs
+{
+};
+
+#include "ShadeLib.cfi"
+#include "VertexLib.cfi"
+
+// Tweakables /////////////////
+
+float TillingLayer0
+<
+	register = REG_PM_PARAM_0.x;
+
+	string UIName = "Layer0 tilling";
+	string UIWidget = "slider";
+	float UIMin = 0;
+	float UIMax = 10.0;
+	float UIStep = 0.005;
+> = 1.0;
+
+float TillingLayer1
+<
+	register = REG_PM_PARAM_0.y;
+
+	string UIName = "Layer1 tilling";
+	string UIWidget = "slider";
+	float UIMin = 0;
+	float UIMax = 10.0;
+	float UIStep = 0.005;
+> = 2.0;
+
+float SpeedLayer0
+<
+	register = REG_PM_PARAM_0.z;
+
+	string UIName = "Layer0 speed";
+	string UIWidget = "slider";
+	float UIMin = -2.0;
+	float UIMax = 50.0;
+	float UIStep = 0.005;
+> = 1.0;
+
+float SpeedLayer1
+<
+	register = REG_PM_PARAM_0.w;
+
+	string UIName = "Layer1 speed";
+	string UIWidget = "slider";
+	float UIMin = -2.0;
+	float UIMax = 50.0;
+	float UIStep = 0.005;
+> = 2.0;
+
+float BumpScaleLayer0
+<
+	register = REG_PM_PARAM_2.x;
+
+	string UIName = "Layer0 bump scale";
+	string UIWidget = "slider";
+	float UIMin = 0;
+	float UIMax = 4.0;
+	float UIStep = 0.005;
+> = 2.0;
+
+float BumpScaleLayer1
+<
+	register = REG_PM_PARAM_2.y;
+	string UIName = "Layer1 bump scale";
+
+	string UIWidget = "slider";
+	float UIMin = 0;
+	float UIMax = 4.0;
+	float UIStep = 0.005;
+> = 1.0;
+
+float FresnelBias
+<
+	register = REG_PM_PARAM_3.y;
+	string UIHelp = "Set how much reflective material is";
+	string UIName = "Fresnel bias";
+
+	string UIWidget = "slider";
+	float UIMin = 0;
+	float UIMax = 1.0;
+	float UIStep = 0.001;
+> = 0.25;
+
+float RefractionBumpScale
+<
+	register = REG_PM_PARAM_3.z;
+	string UIWidget = "slider";
+	string UIName = "Refraction bump scale";
+	float UIMin = 0.0;
+	float UIMax = 0.025; // clamp maximum to prevent misusage
+	float UIStep = 0.01;
+> = 0.01;
+
+#if %SUN_SHADING
+float SunMultiplier
+<
+	register = REG_PM_PARAM_3.w;
+	string UIName = "Sun multiplier";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.001;
+> = 1.0;
+#endif
+
+float AlphaBlendMul
+<
+	register = REG_PM_PARAM_4.x;
+	string UIName = "Alpha blend multiplier";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 10.0;
+	float UIStep = 0.001;
+> = 1.0;
+
+#if %FOAM
+float FoamDeform
+<
+	register = REG_PM_PARAM_4.y;
+	string UIName = "Foam deform";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 0.25;
+	float UIStep = 0.001;
+> = 0.025;
+
+float FoamMultiplier
+<
+	register = REG_PM_PARAM_4.z;
+	string UIName = "Foam multiplier";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 4.0;
+	float UIStep = 0.001;
+> = 1.0;
+#endif
+
+#if %DEPTH_FOG
+float FogDensity
+<
+	register = REG_PM_PARAM_5.y;
+	string UIName = "Fog density";
+	string UIWidget = "slider";
+	float UIMin = 0.0f;
+	float UIMax = 10.0f;
+	float UIStep = 0.001f;
+> = 1.0;
+
+float FogCutoffEnd
+<
+	register = REG_PM_PARAM_5.z;
+	string UIName = "Fog cutoff end depth";
+	string UIHelp = "After this many meters, fog does not get any stronger";
+	string UIWidget = "slider";
+	float UIMin = 0.0f;
+	float UIMax = 1000.0f;
+	float UIStep = 0.001f;
+> = 20.0f;
+
+float4 FogColor
+<
+	register = REG_PM_PARAM_6;
+	string UIName = "Fog color";
+	string UIHelp = "Set fog color";
+	string UIWidget = "color";
+> = {1.0, 1.0, 1.0, 1.0};
+#endif // %DEPTH_FOG
+
+////////////////////////////////////////////////////////////////
+
+ENVIRONMENTCUBEMAP
+
+///////////////// vertex shader //////////////////
+vert2FragGeneral WaterfallVS(app2vertGeneral IN)
+{
+	vert2FragGeneral OUT = (vert2FragGeneral)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	vs_shared_output( IN, OUT, vertPassPos, false );
+
+	// Output bump layers texture coordinates
+	float2 vTranslation = float2(g_VS_AnimGenParams.w, 0 );
+	float2 vTranslationMul = float2(SpeedLayer0, SpeedLayer1);
+
+	float2 vTranslation0 = vTranslation;
+	float2 vTranslation1 = vTranslation;
+
+	float4 vTex = float4( vertPassPos.baseTC.xy, 0, 1 );
+
+	// Scale texture coordinates to get mix of low/high frequency details
+	OUT.baseTC.xy = vTex.xy * TillingLayer0 + vTranslation0.xy * vTranslationMul.x;
+	OUT.baseTC.wz = vTex.xy * TillingLayer1 + vTranslation1.xy * vTranslationMul.y;
+
+	return OUT;
+}
+
+///////////////// pixel shader //////////////////
+
+void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightParams light, out float3 diffuseAcc, out float3 specularAcc)
+{
+	float3 viewVec = normalize(-attribs.worldPos);
+	float NdotL = saturate(dot(attribs.normal, light.lightVec));
+
+#if %_RT_AREA_LIGHT
+	if (light.type == LIGHT_TYPE_REGULAR_AREA)
+	{
+		// WH[TBa]: pass directly areaAttribs, KCD2-73606
+		AreaLightLTC_GGX(attribs.normal, -normalize(attribs.areaAttribs.position), attribs.smoothness, attribs.reflectance, attribs.areaAttribs, Fwd_SpotTexArray, diffuseAcc, specularAcc);
+	}
+	else
+#endif
+	if (light.type == LIGHT_TYPE_SUN)
+	{
+		const float3 discLightVec = ComputeNearestLightOnSunWH(attribs.normal, viewVec, light.lightVec);
+		diffuseAcc.x = DiffuseBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, NdotL);
+		specularAcc = SpecularBRDF(attribs.normal, viewVec, discLightVec, attribs.smoothness, attribs.reflectance) * NdotL;
+	}
+	else
+	{
+		diffuseAcc.x = DiffuseBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, NdotL);
+		specularAcc = SpecularBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, attribs.reflectance) * NdotL;
+
+		diffuseAcc.x *= light.illuminanceWH.inverseSquareAttenuation;
+		specularAcc *= light.illuminanceWH.inverseSquareAttenuation;
+	}
+
+	diffuseAcc = diffuseAcc.x * light.illuminanceWH.color * light.illuminanceWH.clipping;
+	specularAcc = specularAcc * light.illuminanceWH.color * light.illuminanceWH.clipping;
+}
+
+#include "ForwardShading.cfi"
+
+float ComputeDepthFog(in float fDepth, in float fZBuffer, in float fFogDensity)
+{
+	// Sample background depth
+	float fBackgroundZ = fZBuffer;
+
+	// Background depth is in camera depth, correct to be in object depth
+	//	- Clamp depth to enable fade-out against far away objects
+	fBackgroundZ -= fDepth;
+	fBackgroundZ = min(fBackgroundZ, FogCutoffEnd);
+	float fFogLevel = saturate( exp2( -fBackgroundZ * fFogDensity ) );
+
+	return fFogLevel;
+}
+
+#if %DEPTH_FOG
+half3 GetDepthFogColor()
+{
+	return FogColor.rgb * CV_SunColor.rgb * CV_HDRMultiplier_CloudShadow_CLSDebugWH.r;
+}
+#endif
+
+pixout WaterfallPS(vert2FragGeneral IN)
+{
+	pixout OUT = (pixout)0;
+
+	ForwardShadingAttribs attribs;
+	attribs.screenUV = IN.screenProj.xy / IN.screenProj.w;
+	attribs.worldPos = IN.vView.xyz;
+
+	attribs.reflectance = MatSpecColor.xyz;
+	attribs.smoothness = MatSpecColor.w;
+
+	half fA = IN.Color.w * AlphaBlendMul;
+
+	/////////////////////////////////////////////////////////////////////
+	// Generate normal from 2 normal map layers
+
+	half3 vNormal = cross(IN.vTangent.xyz, IN.vBinormal.xyz) * IN.vTangent.w;                  // 4 alu
+	half3 vNormalWS = vNormal;
+	float3x3 mTangentToWS = float3x3(IN.vTangent.xyz, IN.vBinormal.xyz, vNormal.xyz);
+
+	half3 bumpNormal = half3(0,0,1);
+	// merge bump layers
+	bumpNormal = GetNormalMap(normalsTex, IN.baseTC.xy); // 1st bump layer
+	bumpNormal.xy *= BumpScaleLayer0;
+
+	bumpNormal.xy += GetXYNormalMap(normalsTex, IN.baseTC.wz) * BumpScaleLayer1; // 2nd bump layer
+
+	// just assume bump normal z is 1 and renormalize
+	vNormal = normalize( bumpNormal.xyz );
+	vNormalWS = normalize( mul( vNormal.xyz, mTangentToWS) );
+	attribs.normal = vNormalWS;
+	attribs.normalSpecProbe = attribs.normal;
+
+#if %FOAM
+	// Add diffuse (foam) contribution
+	half4 cDiffuseMap = GetDiffuseTex(diffuseTex, IN.baseTC.xy + FoamDeform * vNormal.xy );
+	cDiffuseMap += GetDiffuseTex(diffuseTex, IN.baseTC.wz + FoamDeform * vNormal.xy );
+	cDiffuseMap *= 0.5h;
+	cDiffuseMap *= FoamMultiplier;
+	cDiffuseMap *= MatDifColor;
+	cDiffuseMap.rgb *= IN.Color.rgb;
+
+	attribs.albedo = cDiffuseMap.rgb;
+	fA *= cDiffuseMap.a;
+#else
+	attribs.albedo = MatDifColor.rgb; // WH[TBa]: implicit truncation of vector type, KCD2-448804
+#endif
+
+	half3 vView= normalize( -IN.vView.xyz );
+	half3 vn= vNormalWS;
+	half3 vReflect = (2*dot(vView,vn)*vn - vView);
+
+	/////////////////////////////////////////////////////////////////////
+	// Start light accumulation
+
+	half3 diffuseAcc = 0;
+	half3 specularAcc = 0;
+
+	/////////////////////////////////////////////////////////////////////
+	// Get reflection
+
+#if %SUN_SHADING
+	float sunShadow = 1 - Fwd_SampleSunShadowMaps(attribs.worldPos + GetWorldViewPos());
+
+	ForwardLightParams lightParams = CreateForwardLightParamsWH(LIGHT_TYPE_SUN);
+	lightParams.lightVec = CV_SunLightDir.xyz;
+	lightParams.illuminanceWH.color = CV_SunColor.xyz * sunShadow * SunMultiplier;
+
+	Callback_ShadingDirect(attribs, lightParams, diffuseAcc, specularAcc);
+#endif
+
+#if %_RT_TILED_SHADING
+	TiledForwardShadingParams shadingParams;
+
+	shadingParams.applyProbes = true;
+	shadingParams.applyNonProbes = true;
+	shadingParams.skipSpecularProbes = false;
+
+	shadingParams.applyThreePointLighting = false; // WH[Woody]
+
+	shadingParams.localLightShadowsMode = Mode_Forward;
+	shadingParams.highQualityShadowFiltering = true;
+
+	shadingParams.ssdoMode = Mode_Disabled;
+	shadingParams.svogiMode = Mode_Disabled;
+
+	shadingParams.ssTrilinearClamp = ssFwdBilinearWrap;
+	shadingParams.ssComparison = ssFwdComparison;
+
+	TiledForwardShading(shadingParams, attribs, diffuseAcc, specularAcc);
+#endif
+
+	/////////////////////////////////////////////////////////////////////
+	// Get refraction
+
+	const half2 refractionNormScale = 0.1h * CV_HPosScale.xy;
+	half2 tcRefractionOffset = vNormal.xy * refractionNormScale; // WH[TBa]: implicit truncation of vector type, KCD2-448804
+
+	// Get current pixel screen space coordinates
+	float2 tcProj = (IN.screenProj.xy / IN.screenProj.w);
+
+	float fFarPlaneScale = CV_NearFarClipDist.y;
+#if %_RT_NEAREST
+	fFarPlaneScale /= CV_NearFarClipDist.z;
+#endif
+
+	float2 screenCoords = floor(IN.WPos.xy);
+	float fZBufferRefrac = Fwd_SceneDepth[screenCoords].x * fFarPlaneScale;
+	tcProj += tcRefractionOffset * saturate(fZBufferRefrac - IN.screenProj.w);
+
+	half3 cRefraction = Fwd_SceneTarget.Sample(ssMaterialBilinearClamp, tcProj).rgb;
+
+	/////////////////////////////////////////////////////////////////////
+	// Compute coeficients
+
+	half NdotI= dot(vView, vNormalWS.xyz);
+	half fFresnel = GetFresnel(NdotI, FresnelBias, 5.0h);
+
+#if %DEPTH_FOG
+	// Get depth buffer
+	float fFogLevel = ComputeDepthFog(IN.screenProj.w, fZBufferRefrac, FogDensity);	// Compute fog
+	cRefraction = lerp(GetDepthFogColor(), cRefraction, fFogLevel);	// Colorize fog and mix it with backbuffer
+#endif
+
+	// Compute final water color
+	half3 final = diffuseAcc * attribs.albedo + lerp(cRefraction, specularAcc.xyz, fFresnel);
+
+	Fwd_ApplyFog(attribs.worldPos + GetWorldViewPos(), attribs.worldPos, IN.WPos, final.xyz);
+
+	OUT.Color = half4(final, fA);
+
+	return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique General
+<
+	string Script =
+		"TechniqueMotionBlur=MotionBlurPass;"
+#ifndef %DEPTH_FOG
+		"TechniqueShadowGen=ShadowGen;"
+#endif
+>
+{
+	pass p0
+	{
+		VertexShader = WaterfallVS() WaterfallVS;
+		PixelShader = WaterfallPS() WaterfallPS;
+
+		ZEnable = true;
+		ZWriteEnable = false;
+		CullMode = Back;
+
+		SrcBlend = SRC_ALPHA;
+		DestBlend = ONE_MINUS_SRC_ALPHA;
+		AlphaBlendEnable = true;
+	}
+}
+
+//////////////////////////////// Common techniques ////////////////
+#include "CommonMotionBlurPass.cfi"
+#ifndef %DEPTH_FOG
+#include "CommonShadowGenPass.cfi"
+#endif

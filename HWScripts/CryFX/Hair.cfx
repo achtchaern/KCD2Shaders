@@ -1,0 +1,1084 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "ShadowCommon.cfi"
+
+//=========================================================================
+// WH GM: Hair has no HairValidations.cfi so we enable it here
+#define HIDING_GROUPS
+//=========================================================================
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =           
+           "Public;"    
+         #if !%THIN_HAIR
+					 "ForceZpass;"
+				 #else
+				   "DepthFixup;"
+         #endif
+					 "AlphaBlendShadows;"
+           "Hair;"
+           "NoPreview;"           
+           "SupportsAttrInstancing;"
+					#if %WIND_BENDING
+					 "VT_WindBending;"
+					#endif
+           "ShaderDrawType = Light;"
+           "ShaderType = General;"
+           "Cull = NONE;"  
+					#if HIDING_GROUPS
+						"SupportsHidingGroupsWH"
+					#endif
+>;
+
+// enable shadow receiving for thin hair
+#define THIN_HAIR_SHADOWS	
+
+// calculate shadowing in vertex shader (much faster, but works only on relatively small quads)
+// disabled for now as quad size is just too large
+// #define THIN_HAIR_VS_SHADOWS
+
+//////////////////////////////// Common vertex shader ////////////////
+
+#include "VertexLib.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// Custom shading pass structure /////////////////////////////////////
+
+struct CustomForwardShadingAttribs
+{
+	bool      bOpaquePass;
+	float3    vertexNormal;
+	float3    tangent;
+	float3    tangentSec;
+	float4    dirOcc;
+};
+
+#include "ShadeLib.cfi"
+
+//=========================================================================
+#include "WH_HLSL_CPP_Shared.cfi"
+
+StructuredBuffer<S_ClothingMaterialInstance> MaterialInstanceBuffer : register(t72);
+
+#include "WHHidingGroups.cfi"
+#include "WHClothingSystem.cfi"
+//=========================================================================
+
+//////////////////////////////// Samplers ////////////////
+
+SUBSURFACEMAP
+DECALMAP
+OPACITYMAP
+ENVIRONMENTCUBEMAP
+
+sampler2D avgLumSampler = sampler_state
+{
+ Texture = $HDR_AverageLuminance;
+ MinFilter = LINEAR;
+ MagFilter = LINEAR;
+ MipFilter = LINEAR;
+ AddressU = Clamp;
+ AddressV = Clamp;
+};
+
+Texture2DArray<float4> sunShadowMask = TS_ShadowMask;
+
+Texture2D DirectionTex : register(t4)
+<
+  UIName = "Direction Map";
+  UIDescription = "Tangent space map for defining hair direction";
+> = TM_Detail;
+
+// Tweakables /////////////////
+
+float SoftIntersection
+<
+	register = REG_PM_PARAM_0.x;
+	string UIName = "Soft Intersection";
+	string UIHelp = "Reduce alpha where hair is close to other geometry";
+	string UIWidget = "slider";
+	float UIMin = 0.0;
+	float UIMax = 2.0;
+	float UIStep = 0.01;
+> = 0.0;
+
+float AlphaBlendMultiplier
+<
+	register = REG_PM_PARAM_0.y;
+	string UIName = "Alpha Blend Multiplier";
+	string UIHelp = "Multiplier for transparency";
+	string UIWidget = "slider";
+	float UIMin = 1.0;
+	float UIMax = 4.0;
+	float UIStep = 0.1;
+> = 1.0;
+
+float SecondaryHighlightWidth
+<
+	register = REG_PM_PARAM_0.z;
+	string UIHelp = "Set width of the secondary highlight";                   
+	string UIName = "Secondary Width";    
+	string UIWidget = "slider";
+	float UIMin = 1;
+	float UIMax = 4;
+	float UIStep = 0.01;  
+> = 1.5;
+
+float4 SecondaryHighlightShiftAmount
+<
+	register = REG_PM_PARAM_0.w;
+	string UIHelp = "Set shift of the secondary highlight";                   
+	string UIName = "Secondary Shift";    
+	string UIWidget = "slider";
+	float UIMin = -0.5;
+	float UIMax = 0.5;
+	float UIStep = 0.01;  
+> = 0.1;
+
+float4 SecondaryHighlightColor
+<
+	register = REG_PM_PARAM_1;
+	string UIHelp = "Set filter color for secondary highlight";                   
+	string UIName = "Secondary Color"; 
+	string UIGroup = "Highlights";
+	string UIOrder = "4";      
+
+	string UIWidget = "color";
+> = {0.7, 0.7, 0.7, 1.0};
+
+min16float ShiftVariation
+<  
+  register = REG_PM_PARAM_2.x;
+  string UIHelp = "Set highlight shifting variation based on the direction map";                     
+  string UIName = "Shift Variation";    
+  string UIGroup = "Highlights.Shift";
+  string UIOrder = "2";          
+
+  string UIWidget = "slider";
+  float UIMin = 0;
+  float UIMax = 4.0;
+  float UIStep = 0.001;
+> = 0.0;
+
+min16float DiffuseWrap
+<
+  register = REG_PM_PARAM_2.y;
+  string UIHelp = "Set diffuse wrapping to reduce harsh lighting";                   
+  string UIName = "Diffuse Wrap";    
+  
+  string UIWidget = "slider";
+  float UIMin = 0.0;
+  float UIMax = 1;
+  float UIStep = 0.001;
+> = 0.5;
+
+#if %VIEW_ALIGNED_STRANDS
+	float StrandWidth
+	<
+		register = REG_PM_PARAM_2.z;
+		string UIName = "Strand Width";
+		string UIWidget = "slider";
+		float UIMin = 0.0;
+		float UIMax = 0.04;
+		float UIStep = 0.001;
+	> = 0.01;
+#endif
+
+#if %THIN_HAIR
+	float ThinHairThreshold
+	<
+	  register = REG_PM_PARAM_2.w;
+	  string UIName = "Thin Hair Threshold";  
+	  string UIWidget = "slider";
+	  float UIMin = 0.0;
+	  float UIMax = 1.0;
+	  float UIStep = 0.001;
+	> = 0.05;
+#endif
+
+struct vert2FragHair
+{
+	vert2FragGeneral Common;
+
+#if %THIN_HAIR && THIN_HAIR_SHADOWS && THIN_HAIR_VS_SHADOWS
+	float SunShadow : TEXCOORDN;
+#endif
+};
+
+float3 GetViewAlignmentDelta(streamPos vertPassPos, float3 worldTangentT)
+{
+	float3 expansionDir = normalize( cross( worldTangentT, vertPassPos.WorldPos.xyz - g_VS_WorldViewPos.xyz ) );
+	return expansionDir * ((vertPassPos.baseTC.x - 0.5) * StrandWidth);
+}
+
+////////////////////////////////////////////////////////
+//                GENERAL PASS
+////////////////////////////////////////////////////////
+
+vert2FragHair HairVS(app2vertGeneral IN)
+{
+  vert2FragHair OUT = (vert2FragHair)0;
+  
+	streamPos vertPassPos = (streamPos)0;
+  vs_shared_output( IN, OUT.Common, vertPassPos, false );
+    
+  float3 worldTangentS = OUT.Common.vTangent.xyz;
+  float3 worldTangentT = OUT.Common.vBinormal.xyz;
+  float3 worldTangentN = normalize(cross(worldTangentS, worldTangentT)) * OUT.Common.vTangent.w;
+	
+#if %VIEW_ALIGNED_STRANDS
+	vertPassPos.WorldPos.xyz += GetViewAlignmentDelta(vertPassPos, worldTangentT);
+	OUT.Common.HPosition = mul( g_VS_ViewProjZeroMatr, float4( vertPassPos.WorldPos.xyz - g_VS_WorldViewPos.xyz, 1) );
+#endif
+    
+  // Support for double sided lighting    
+  float3 vEye = normalize( -OUT.Common.vView.xyz );        
+  float eyeTangentDot = dot(vEye.xyz, worldTangentN.xyz)*0.8 + 0.2;
+  OUT.Common.vTangent.w *= eyeTangentDot;// * OUT.vTangent.w;
+ 
+  OUT.Common.vBinormal.w = 1.0 / 0.5;// AlphaTest.w;
+
+#if %THIN_HAIR && THIN_HAIR_SHADOWS && THIN_HAIR_VS_SHADOWS
+	OUT.SunShadow = 1 - Fwd_SampleSunShadowMaps(vertPassPos.WorldPos);
+#endif
+
+	// WH[MMatous]: Tint (decode from RGB565)
+#if %VERTCOLORS
+	int rgb565 = (int(vertPassPos.Color.b * 255) << 8) + (vertPassPos.Color.g * 255); // 0 - 65535
+	OUT.Common.Color.rgb = RGB565ToRGB8(rgb565);
+
+	// VertexColors Debug
+#if 0
+ 	OUT.Common.Color.r = 0 * DecodeMovementStrength(vertPassPos.Color);		// VertexAnim Strength
+ 	OUT.Common.Color.g = 0 * vertPassPos.Color.a;													// Hiding groups
+ 	OUT.Common.Color.b = 0 * DecodeDelay(vertPassPos.Color);							// VertexAnim Delay
+#endif
+
+#endif // %VERTCOLORS
+
+#if HIDING_GROUPS
+	DiscardVertexIfHidden(OUT.Common.HPosition, vertPassPos.Color);
+#endif
+
+  return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightParams light, out float3 diffuseAcc, out float3 specularAcc)
+{
+	min16float3 vHalf = normalize(-normalize(attribs.worldPos) + light.lightVec);
+                          
+	min16float NdotL = dot(attribs.normal, light.lightVec);
+	min16float NdotLVertex = dot(attribs.custom.vertexNormal, light.lightVec);
+	
+	// Wrapped diffuse, using normalization factor of (1 + DiffuseWrap) to be energy-conserving
+	min16float wrapDenom = 1 + DiffuseWrap;
+	min16float fNdotLDiffuse = saturate(((NdotL + NdotLVertex) * 0.5 + DiffuseWrap) / (wrapDenom * wrapDenom));
+
+	// Diffuse term - wrapped diffuse
+	min16float3 cDiffuse = fNdotLDiffuse;
+	
+	min16float3 specCol = min(attribs.reflectance, 0.045);
+	
+	// Primary highlight (specular surface reflection) 
+	min16float3 cSpecular = KajiyaKayAnisotropic(attribs.custom.tangent, vHalf, exp2(10.0 * attribs.smoothness + 1.0)) * specCol;
+
+	// Secondary highlight (reflected back after entering underneath surface)   
+	cSpecular.xyz += KajiyaKayAnisotropic(attribs.custom.tangentSec.xyz, vHalf.xyz, exp2(10.0 * max(attribs.smoothness / SecondaryHighlightWidth, 0.4) + 1.0)) * SecondaryHighlightColor.xyz * attribs.albedo;
+	cSpecular.xyz *= saturate(NdotL);
+
+	// WH[TBa]: apply attenuation here as we may later try to combine the result with the area light model
+	cDiffuse *= light.illuminanceWH.inverseSquareAttenuation;
+	cSpecular *= light.illuminanceWH.inverseSquareAttenuation;
+
+#if %_RT_AREA_LIGHT
+	// WH[TBa]: partially merged code from cryengine 5.10 that fixes area light hair influence, KCD2-89019
+	if (light.type == LIGHT_TYPE_REGULAR_AREA || light.type == LIGHT_TYPE_REGULAR_AREAFACE)
+	{
+		float3 areaDiff = 0;
+		float3 areaSpec = 0;
+		AreaLightLTC_GGX(attribs.normal, -normalize(attribs.areaAttribs.position), attribs.smoothness, specCol, attribs.areaAttribs, Fwd_SpotTexArray, areaDiff, areaSpec);
+
+		// Empirically fitted againt ggx in terms of energy loss over area
+		// WH[TBa]: changed the way how we combine those two together to geometric mean as it looks slightly better
+		cDiffuse = sqrt(max(cDiffuse * areaDiff, 0));
+		cSpecular = sqrt(max(cSpecular * areaSpec, 0));
+	}
+#endif
+
+	if (attribs.custom.bOpaquePass)
+	{
+		min16float fOcclusion = max( 1.0 - saturate( dot( float4( light.lightVec, 0 ), attribs.custom.dirOcc ) ), 0.3 );
+		cDiffuse.xyz *= fOcclusion;
+		cSpecular.xyz *= fOcclusion;
+	}
+
+	diffuseAcc = cDiffuse.xyz * light.illuminanceWH.color * light.illuminanceWH.clipping;
+	specularAcc = cSpecular.xyz * light.illuminanceWH.color * light.illuminanceWH.clipping;
+}
+
+#include "ForwardShading.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct pixoutHair
+{
+  min16float4 Color  : SV_Target0;
+};
+
+struct pixoutHair2
+{
+  min16float4 Color  : SV_Target0;
+#if %THIN_HAIR
+	// WH GM: This is never used and causes Agc Validation Error 16737: 
+	//        "Render Target at slot 1 has a null color buffer address." #KCD2-108580
+  //min16float4 BlendFactors : SV_Target1;
+#endif
+};
+
+float4 HairShading(vert2FragHair IN, bool bOpaquePass)
+{
+	min16float4 diffuseMap =  GetDiffuseTex(diffuseTex, IN.Common.baseTC.xy);
+	
+	min16float fAlpha = saturate(diffuseMap.w * AlphaBlendMultiplier);
+#if !%THIN_HAIR
+	if (!bOpaquePass)
+		clip(fAlpha - 0.05);
+#endif
+	
+	min16float3 vNormal = cross(IN.Common.vTangent.xyz, IN.Common.vBinormal.xyz) * IN.Common.vTangent.w;
+	half3x3 matTangentToWS = float3x3(IN.Common.vTangent.xyz, IN.Common.vBinormal.xyz, vNormal);
+
+	ForwardShadingAttribs attribs;
+	attribs.screenUV = IN.Common.screenProj.xy / IN.Common.screenProj.w;
+	attribs.worldPos = IN.Common.vView.xyz;
+	attribs.custom.bOpaquePass = bOpaquePass;
+	attribs.custom.vertexNormal = vNormal.xyz;
+	attribs.custom.dirOcc = 0;
+
+	attribs.albedo = diffuseMap.rgb * MatDifColor.xyz;
+	attribs.albedo *= MaterialInstanceBuffer[CD_MaterialInstanceIdWH].hairDiffuse;
+
+#if %VERTCOLORS
+	attribs.albedo *= IN.Common.Color.rgb;  // Vertex alpha is reserved for wind bending
+#endif
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	attribs.reflectance = GetSpecularTex(specularTex, IN.Common.baseTC.xy).rgb * MatSpecColor.xyz;
+	attribs.smoothness = clamp(MatSpecColor.w, 0.5, 0.9);
+
+	min16float3 normalMap = GetNormalMap(normalsTex, IN.Common.baseTC.xy);
+	attribs.normal = normalize(mul(normalMap.xyz, matTangentToWS));
+	attribs.normalSpecProbe = attribs.normal;
+	
+	min16float shiftAmount = 0;
+	min16float3 hairDir = IN.Common.vBinormal.xyz;
+#if %DIRECTION_MAP
+	min16float3 vDirection = GetNormalMap(DirectionTex, IN.Common.baseTC.xy);
+	hairDir = mul(vDirection.xyz, matTangentToWS);
+	shiftAmount = vDirection.z * ShiftVariation;
+#endif
+
+	const min16float PrimarySpecShift = 0;
+	attribs.custom.tangent = ShiftVector(hairDir.xyz, attribs.normal.xyz * IN.Common.vTangent.w, shiftAmount + PrimarySpecShift);
+	attribs.custom.tangentSec = ShiftVector(hairDir.xyz, attribs.normal.xyz * IN.Common.vTangent.w, shiftAmount + SecondaryHighlightShiftAmount);
+	
+	// Soft intersection
+	if (SoftIntersection > 0)
+	{
+		float2 tcProj = (IN.Common.screenProj.xy / IN.Common.screenProj.w);
+		int3 vPixCoord = int3(max(min(tcProj * CV_ScreenSize.xy, CV_ScreenSize.xy - float2(1.0f, 1.0f)), float2(0.0f, 0.0f)), 0);
+		float fDepth = Fwd_SceneDepth.Load(vPixCoord).x * CV_NearFarClipDist.y;
+		float depthDiff = abs(IN.Common.screenProj.w - fDepth);
+		fAlpha *= saturate(lerp(1, saturate(depthDiff * 100), SoftIntersection));
+	}
+	
+	min16float3 diffuseAcc = 0;
+	min16float3 specularAcc = 0;
+	// WH[TBa]: TiledForwardShading() can replace both diffuse and specular accumulated values, when svoti is in mode 1 or 2, KCD2-116447
+	min16float3 sunDiffuse = 0;
+	min16float3 sunSpecular = 0;
+	
+	// Handle direct lighting from sun
+	{
+		min16float shadowOccl = 0;
+
+	// WH[TBa]: hair opaque pass is wrongly considered transparent by the engine and Fwd_SunShadowMas is missing (the slot is reused for last scene target)
+	// So we always sample shadow maps (suboptimal workaround).
+	#if %THIN_HAIR && THIN_HAIR_SHADOWS && THIN_HAIR_VS_SHADOWS
+		if (!bOpaquePass)
+			shadowOccl = IN.SunShadow;
+	#else
+		shadowOccl = Fwd_SampleSunShadowMaps(IN.Common.vView.xyz + GetWorldViewPos());
+	#endif
+
+		ForwardLightParams lightParams = CreateForwardLightParamsWH(LIGHT_TYPE_SUN);
+		lightParams.lightVec = CV_SunLightDir.xyz;
+		lightParams.illuminanceWH.color = CV_SunColor.xyz * (1 - shadowOccl);
+		
+		Callback_ShadingDirect(attribs, lightParams, sunDiffuse, sunSpecular);
+	}
+
+#if %_RT_TILED_SHADING
+	TiledForwardShadingParams shadingParams;
+	
+	shadingParams.applyProbes = true;
+	shadingParams.applyNonProbes = false;
+	shadingParams.skipSpecularProbes = true;
+
+	shadingParams.applyThreePointLighting = true; // WH[Woody]
+	
+	shadingParams.localLightShadowsMode = Mode_Forward;
+	shadingParams.highQualityShadowFiltering = false;
+	
+	shadingParams.ssdoMode = Mode_Deferred;
+	shadingParams.svogiMode = Mode_Deferred;
+	
+	shadingParams.ssTrilinearClamp = SampStateTrilinearClamp;
+	shadingParams.ssComparison = ssFwdComparison;
+
+	// WH[TBa]: always use local lights, even on the lowest quality, KCD2-124767, KCD2-413343
+	shadingParams.applyNonProbes = true;
+
+#if %_RT_MOBILE_PIPELINE
+	shadingParams.localLightShadowsMode = Mode_Disabled;
+#endif	
+
+	TiledForwardShading(shadingParams, attribs, diffuseAcc, specularAcc);
+#endif
+
+	// WH[TBa]: TiledForwardShading() can replace both diffuse and specular accumulated values, when svoti is in mode 1 or 2, KCD2-116447
+	diffuseAcc += sunDiffuse;
+	specularAcc += sunSpecular;
+
+	// Final composition
+	min16float4 cFinal = min16float4(diffuseAcc * attribs.albedo.rgb + specularAcc, fAlpha);
+
+	Fwd_ApplyFog(IN.Common.vView.xyz + GetWorldViewPos(), IN.Common.vView.xyz, IN.Common.WPos, cFinal.xyz);
+
+	return cFinal;
+}
+
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if !HIDING_GROUPS
+CRY_EARLY_DEPTH
+#endif
+pixoutHair HairOpaquePS(vert2FragHair IN)
+{
+	pixoutHair OUT = (pixoutHair) 0;  
+  OUT.Color = HairShading(IN, true);
+  return OUT;  
+}
+
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if !HIDING_GROUPS
+CRY_EARLY_DEPTH
+#endif
+pixoutHair2 HairPS(vert2FragHair IN)
+{
+	pixoutHair2 OUT = (pixoutHair2) 0;
+  
+	OUT.Color = HairShading(IN, false);
+
+  return OUT;
+}
+
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if !HIDING_GROUPS
+CRY_EARLY_DEPTH
+#endif
+pixoutHair2 ThinHairDepthPS(vert2FragHair IN)
+{
+	pixoutHair2 OUT = (pixoutHair2)0;
+	
+	float fOpacity = saturate(GetAlphaTex(diffuseTex, IN.Common.baseTC) * AlphaBlendMultiplier);
+	clip(fOpacity - ThinHairThreshold);
+	
+	return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+// Hair rendering:
+// 1) technique ZPass outputs depth and normal to gbuffer (color is left to neutral gray), alpha testing is performed
+// 2) technique General runs in forward scene render pass and does the shading, it uses Equal depth func to cull the hair (as the depth is already set in the ZPass)
+//   a) only THIN_HAIR variant will do alpha blending, other variants will do alpha testing
+// 3) MULTIPASS_HAIR_WH will do another two alpha-blended passes
+
+technique General
+<
+  string Script =     
+        "TechniqueZ=ZPass;"      
+        "TechniqueZPrepass=ZPrePass;"      
+        "TechniqueMotionBlur=MotionBlurHair;"
+        "TechniqueCustomRender=CustomRenderHair;"
+        "TechniqueShadowGen=ShadowGenHair;"
+>
+{
+	
+#if !%THIN_HAIR
+	pass opaque_pass
+  {
+    VertexShader = HairVS() HairVS;
+    PixelShader = HairOpaquePS() HairPS;
+    
+    ZEnable = true;
+    ZWriteEnable = true;
+    ZFunc = Equal;
+
+    CullMode = None;
+   // IgnoreMaterialState = true;
+  }
+#endif
+
+#if %THIN_HAIR
+	// WH[MMatous]: Thin hair doesn't work properly because multiple passes are no longer supported.
+	//							However since some materials are still using this flag, I've replaced the depth_pass that used to be here
+	//							with the back_pass (which used to be the first pass when THIN_HAIR was enabled) to keep the same behavior.
+  pass back_pass
+  {
+    VertexShader = HairVS() HairVS;
+    PixelShader = HairPS() HairPS;
+    
+    ZEnable = true;
+    ZWriteEnable = false; 
+    ZFunc = Less;
+    CullMode = Back;
+
+		SrcBlend = SRC_ALPHA;
+		DestBlend = ONE_MINUS_SRC_ALPHA;
+		AlphaBlendEnable = true;
+		IgnoreMaterialState = true;
+  }
+#endif
+}
+
+#if %MULTIPASS_HAIR_WH
+technique HairFrontPass
+<
+	string Script = "ChainAfterWH=General;"
+>
+{
+	pass p0
+	{
+		VertexShader = HairVS() HairVS;
+		PixelShader = HairPS() HairPS;
+
+		ZEnable = true;
+		ZWriteEnable = false;
+		ZFunc = Less;
+		CullMode = Front;
+
+		SrcBlend = SRC_ALPHA;
+		DestBlend = ONE_MINUS_SRC_ALPHA;
+		AlphaBlendEnable = true;
+		IgnoreMaterialState = true;
+	}
+}
+
+technique HairBackPass
+<
+	string Script = "ChainAfterWH=HairFrontPass;"
+>
+{
+	pass p0
+	{
+		VertexShader = HairVS() HairVS;
+		PixelShader = HairPS() HairPS;
+
+		ZEnable = true;
+		ZWriteEnable = false; 
+		ZFunc = Less;
+		CullMode = Back;
+
+		SrcBlend = SRC_ALPHA;
+		DestBlend = ONE_MINUS_SRC_ALPHA;
+		AlphaBlendEnable = true;
+		IgnoreMaterialState = true;
+	}
+}
+#endif
+
+//////////////////////////////// Common techniques ////////////////
+
+//#include "CommonZPass.cfi"
+//#include "CommonZPrePass.cfi"
+
+//////////////////////////////////////////////////////////////////
+// Custom Zpass for Hair:
+//	- avoid poluting even further common zpass with yet aditional permutation
+
+///////////////// vertex input/output //////////////////
+
+struct vert2fragZPre_C
+{
+	precise OUT_HPOS_IN_WPOS
+
+	float4 baseTC    : TEXCOORDN;
+};
+
+struct vert2fragZ_C
+{
+	precise OUT_HPOS_IN_WPOS
+
+	float4 baseTC    : TEXCOORDN;
+	min16float4 vTangent   : TEXCOORDN;	
+	min16float4 vBinormal  : TEXCOORDN;
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	float3 HPosPrev  : TEXCOORDN;
+#endif
+};
+
+///////////////// vertex shaders //////////////////
+
+vert2fragZPre_C ZPrePassVS(app2vertZGeneral IN)
+{
+	vert2fragZPre_C OUT = (vert2fragZPre_C)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	streamPos_FromZ(IN, vertPassPos);
+
+	streamPos vertPassPosPrev = (streamPos) vertPassPos;
+
+	OUT.HPosition = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPos);
+	
+#if %_RT_ALPHATEST || %VIEW_ALIGNED_STRANDS
+	// Note: Normalization required for normal diffuse map in world space in case scale used - Do not remove
+	float3 worldTangentS = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]) );
+	float3 worldTangentT = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+	float3 worldTangentN = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2]) );
+	
+#if %VIEW_ALIGNED_STRANDS
+	// Use exactly the same math as for the the General pass, otherwise there will be precision issues
+	vertPassPos.WorldPos.xyz += g_VS_WorldViewPos.xyz;
+	vertPassPos.WorldPos.xyz += GetViewAlignmentDelta(vertPassPos, worldTangentT);
+	OUT.HPosition = mul( g_VS_ViewProjZeroMatr, float4( vertPassPos.WorldPos.xyz - g_VS_WorldViewPos.xyz, 1) );
+	vertPassPos.WorldPos.xyz -= g_VS_WorldViewPos.xyz;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output uv coordinates
+ 
+	float4 baseTC = vertPassPos.baseTC;
+
+	_TCModify(baseTC, OUT.baseTC, vertPassPos.Position, vertPassPos.ObjToTangentSpace[2], TS_DIFFUSE);
+
+	#if %_RT_ALPHATEST || %_RT_DISSOLVE
+		OUT.baseTC.wz = float2(Get_MaterialAlphaTest(),Get_SPI_Dissolve());
+	#endif
+#endif
+
+	return OUT; 
+}
+
+vert2fragZ_C ZPassVS(app2vertGBuffer IN)
+{
+	vert2fragZ_C OUT = (vert2fragZ_C)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	streamPos_FromGBuffer(IN, vertPassPos);
+
+	streamPos vertPassPosPrev = (streamPos) vertPassPos;
+
+	OUT.HPosition = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPos);
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	vertPassPosPrev.PositionCurr = vertPassPos.Position;
+	OUT.HPosPrev.xyz = HPosToScreenTC( Pos_Prev_VS_General(g_VS_ViewProjZeroMatr, vertPassPosPrev) ).xyw;
+#endif
+
+	// Note: Normalization required for normal diffuse map in world space in case scale used - Do not remove
+	float3 worldTangentS = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]) );
+	float3 worldTangentT = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+	float3 worldTangentN = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[2]) );
+	
+#if %VIEW_ALIGNED_STRANDS
+	// Use exactly the same math as for the the General pass, otherwise there will be precision issues
+	vertPassPos.WorldPos.xyz += g_VS_WorldViewPos.xyz;
+	vertPassPos.WorldPos.xyz += GetViewAlignmentDelta(vertPassPos, worldTangentT);
+	OUT.HPosition = mul( g_VS_ViewProjZeroMatr, float4( vertPassPos.WorldPos.xyz - g_VS_WorldViewPos.xyz, 1) );
+	vertPassPos.WorldPos.xyz -= g_VS_WorldViewPos.xyz;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output tangents
+
+	float3 viewVector = normalize(-vertPassPos.WorldPos.xyz );
+	float fFlipNormal = min( dot(viewVector, worldTangentN) +0.1,1.f);
+	vertPassPos.Tangent.w *= fFlipNormal;
+
+	OUT.vTangent = float4(worldTangentS, vertPassPos.Tangent.w); 
+	OUT.vBinormal.xyz = worldTangentT;
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output uv coordinates
+ 
+	float4 baseTC = vertPassPos.baseTC;
+
+	_TCModify(baseTC, OUT.baseTC, vertPassPos.Position, vertPassPos.ObjToTangentSpace[2], TS_DIFFUSE);
+
+	#if %_RT_ALPHATEST || %_RT_DISSOLVE
+		OUT.baseTC.wz = float2(Get_MaterialAlphaTest(),Get_SPI_Dissolve());
+	#endif
+
+#if HIDING_GROUPS
+	DiscardVertexIfHidden(OUT.HPosition, vertPassPos.Color);
+#endif
+
+	return OUT; 
+}
+
+///////////////// pixel shaders //////////////////
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if !HIDING_GROUPS
+CRY_EARLY_DEPTH_OR_RE_Z
+#endif
+pixout_zpre ZPrePassPS(vert2fragZPre_C IN)
+{
+	pixout_zpre OUT = (pixout_zpre) 0;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Depth and alpha test processing
+
+#if %_RT_ALPHATEST	
+	half fDiffuseAlpha = GetAlphaTex(diffuseTex, IN.baseTC.xy);
+	#if %_RT_MSAA_QUALITY || %_RT_MSAA_QUALITY1
+		GetAlphaCoverageMask(diffuseTex, IN.baseTC.xy, IN.baseTC.w, fDiffuseAlpha, OUT.uCoverageMask);
+	#endif
+	clip(fDiffuseAlpha - IN.baseTC.w);
+#endif
+
+	ApplyDissolve(IN.baseTC.z, (int2)IN.WPos.xy);
+
+	return OUT;
+}
+
+pixout_gbuffer ZPassPS(vert2fragZ_C IN)
+{
+	pixout_gbuffer OUT = (pixout_gbuffer) 0;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Depth and alpha test processing
+
+#if %_RT_ALPHATEST	
+	min16float fDiffuseAlpha = GetAlphaTex(diffuseTex, IN.baseTC.xy);
+	#if %_RT_MSAA_QUALITY || %_RT_MSAA_QUALITY1
+		GetAlphaCoverageMask(diffuseTex, IN.baseTC.xy, IN.baseTC.w, fDiffuseAlpha, OUT.uCoverageMask);
+	#endif
+	clip(fDiffuseAlpha - IN.baseTC.w);
+#endif
+
+	ApplyDissolve(IN.baseTC.z, (int2)IN.WPos.xy);
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Normals processing
+
+	MaterialAttribsCommon attribs = MaterialAttribsDefault();
+	
+	min16float4 cOutNormal = 0;
+	min16float3 vNormalTS = half3(0,0,1);
+
+	half3x3 mTangentToWS = half3x3(IN.vTangent.xyz, IN.vBinormal.xyz, cross(IN.vTangent.xyz, IN.vBinormal.xyz)*IN.vTangent.w);  
+	min16float3 vNormal = normalize(mTangentToWS[2]);
+	#if %NORMAL_MAP
+		vNormalTS = GetNormalMap(normalsTex, IN.baseTC.xy);
+		vNormal = normalize(mul( vNormalTS, mTangentToWS )); 
+	#endif
+	
+	attribs.NormalWorld = vNormal;
+	attribs.Smoothness = MatSpecColor.w;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output to GBuffer
+	
+	attribs.Albedo = min16float3(0.5, 0.5, 0.5);
+
+#if %_RT_SAMPLE0
+	EncodeMicroGBuffer(attribs, OUT.GBufferA, IN.WPos.xy);
+#else		
+	EncodeGBuffer( attribs, OUT.GBufferA, OUT.GBufferB, OUT.GBufferC );
+#endif
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	OUT.VelocityRT = OutputVelocityRT(IN.WPos.xy * (CV_ScreenSize.zw * 2), IN.HPosPrev.xy/IN.HPosPrev.z);
+#endif
+
+	return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique ZPrePass
+{
+	pass p0
+	{
+		VertexShader = ZPrePassVS() ZVS;
+		PixelShader = ZPrePassPS() ZPS;
+
+		ZEnable = true;
+		ZWriteEnable = true;
+
+		CullMode = None;
+	}
+}
+
+technique ZPass
+{
+	pass p0
+	{
+		VertexShader = ZPassVS() ZVS;
+		PixelShader = ZPassPS() ZPS;
+
+		ZEnable = true;
+		ZWriteEnable = true;
+
+		CullMode = None;
+	}
+}
+
+///////////////// Shadow gen //////////////////////
+#include "CommonShadowGenPass.cfi"
+
+v2f_sh HairSG_VS(app2vertGeneral IN)
+{
+	v2f_sh OUT = (v2f_sh)0; 
+	streamPos vertPassPos = (streamPos)0;
+	vert2FragGeneral common = (vert2FragGeneral)0;
+	
+	vs_shared_output( IN, common, vertPassPos, false, false );
+  
+	float3 worldTangentS = common.vTangent.xyz;
+	float3 worldTangentT = common.vBinormal.xyz;
+	float3 worldTangentN = (cross(worldTangentS, worldTangentT)) * common.vTangent.w;
+
+	vertPassPos.WorldPos = mul( vertPassPos.InstMatrix, vertPassPos.Position );
+	
+#if %VIEW_ALIGNED_STRANDS
+	vertPassPos.WorldPos.xyz += GetViewAlignmentDelta(vertPassPos, worldTangentT);
+#endif
+
+	float4 HPosition = mul(g_VS_ViewProjMatr, vertPassPos.WorldPos);
+	float3 HPositionLin = HPosition.xyz;
+	HPositionLin.z /= CP_ShadowGen_FrustumInfo.y;
+
+	float3 HPositionPrevLin = Pos_Prev_VS_Shadow(vertPassPos, false).xyz; // WH[TomK]: Add object motion bias, KCD2-462064
+	HPositionPrevLin.z /= CP_ShadowGen_FrustumInfo.y;
+	
+#if %_RT_SHADOW_DEPTH_OUTPUT_LINEAR
+	#if !%_RT_CUBEMAP0 
+		#if !%_RT_NEAREST
+			HPosition.z = HPositionLin.z;
+		#endif
+
+		#if %_RT_SAMPLE0
+			OUT.Depth = HPosition.z + CP_ShadowGen_DepthTestBias.x;
+		#endif
+	
+		// WH[TomK]: KCD2-462064
+		#if (!%_RT_HW_PCF_COMPARE || %_RT_SAMPLE0)
+			OUT.Depth += ShadowMotionBias(HPositionPrevLin - HPositionLin);
+		#endif
+
+		#if !%_RT_NEAREST
+			HPosition.z *= HPosition.w;
+		#endif
+	#else 
+		OUT.Depth = HPositionLin.z;
+		OUT.Depth += CP_ShadowGen_DepthTestBias.x;
+		OUT.Depth += ShadowMotionBias(HPositionLin - HPositionPrevLin); // WH[TomK]: KCD2-462064
+		
+		// WH[TBa]: add second bias for materials without front face culling, KCD2-123979
+		#if %_RT_SAMPLE3
+			OUT.Depth += CP_ShadowGen_FrustumInfo.w;
+		#endif
+	#endif
+#endif
+
+#if %_RT_ALPHATEST || %_RT_ALPHABLEND
+	OUT.baseTC.xy = vertPassPos.baseTC.xy;
+#endif
+
+#if %_DS || %_PS || !ENABLE_TESSELLATION || %_RT_NO_TESSELLATION
+	OUT.HPosition = HPosition;
+#endif  
+
+#if HIDING_GROUPS
+	DiscardVertexIfHidden(OUT.HPosition, vertPassPos.Color, true);
+#endif 
+
+  return OUT;
+}
+
+technique ShadowGenHair
+{
+	pass p0
+	{
+		VertexShader = HairSG_VS() ShadowGenVS;
+
+		ZEnable = true;
+		ZWriteEnable = true;
+		CullMode = Back;
+
+		PixelShader = Common_SG_PS() ShadowGenPS;
+
+#if %GRASS || %LEAVES || %HAIR_PASS || %SKIN_PASS
+		CullMode = None;
+#endif
+	}
+}
+
+#include "CommonMotionBlurPass.cfi"
+
+vert2fragMotionBlur Hair_MotionBlurPassVS(app2vertMotionBlur IN)
+{
+	vert2fragMotionBlur OUT = (vert2fragMotionBlur)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	streamPos_FromMotionBlur(IN, vertPassPos);
+	streamPos vertPassPosPrev = (streamPos) vertPassPos;
+
+	float4 HPosition = 0;
+
+	HPosition = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPos);
+	OUT.vVelocity = HPosToScreenTC( HPosition );
+#if %VIEW_ALIGNED_STRANDS
+		float3 worldTangentT = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+		vertPassPos.WorldPos.xyz += g_VS_WorldViewPos.xyz;
+		vertPassPos.WorldPos.xyz += GetViewAlignmentDelta(vertPassPos, worldTangentT);
+		HPosition = mul( g_VS_ViewProjZeroMatr, float4( vertPassPos.WorldPos.xyz - g_VS_WorldViewPos.xyz, 1) );
+		vertPassPos.WorldPos.xyz -= g_VS_WorldViewPos.xyz;
+#endif
+	vertPassPosPrev.PositionCurr = vertPassPos.Position;
+
+	float4x4 matInstPrev;
+	float4 HPositionPrev = Pos_Prev_VS_General(g_VS_ViewProjZeroMatr, vertPassPosPrev);
+	OUT.vVelocityPrev = HPosToScreenTC( HPositionPrev );
+
+	OUT.HPosition = HPosition;
+
+	float4 baseTC = vertPassPos.baseTC;
+	_TCModify(baseTC, OUT.baseTC, vertPassPos.Position, vertPassPos.ObjToTangentSpace[2], TS_DIFFUSE);
+
+	OUT.baseTC.w = 0;
+	OUT.baseTC.z = 0;
+
+	return OUT;
+}
+
+pixout_motion Hair_MotionBlurPassPS(vert2fragMotionBlur IN)
+{
+	pixout_motion OUT = (pixout_motion)1;
+
+	float fOpacity = saturate(GetAlphaTex(diffuseTex, IN.baseTC) * AlphaBlendMultiplier);
+
+	#if !%THIN_HAIR
+		clip(fOpacity - Get_MaterialAlphaTest());
+	#else
+		clip(fOpacity - ThinHairThreshold);
+	#endif
+
+	min16float fAlpha = 1;
+#if %_RT_ALPHABLEND || %THIN_HAIR
+	// In case alpha blended scale values
+	fAlpha = fOpacity;
+#endif
+
+	OUT.VelocityRT = OutputVelocityRT(IN.vVelocity.xy/IN.vVelocity.w, IN.vVelocityPrev.xy/IN.vVelocityPrev.w, fAlpha);
+
+	return OUT;
+}
+
+technique MotionBlurHair
+{
+pass p0
+	{
+		VertexShader = Hair_MotionBlurPassVS() MotionBlurVS;
+		PixelShader = Hair_MotionBlurPassPS() MotionBlurPS;
+
+		ZEnable = true;
+		ZWriteEnable = false;
+		CullMode = None;
+
+		ZFunc = LEqual;
+		IgnoreMaterialState = true;
+	}
+}
+
+#include "CommonViewsPass.cfi"
+
+///////////////// vertex shaders //////////////////
+vert2fragCustomRender Hair_CustomRenderPassVS(app2vertCustomViews IN)
+{
+	vert2fragCustomRender OUT = (vert2fragCustomRender)0;
+
+	streamPos vertPassPos = (streamPos)0;
+	streamPos_FromCustomViews(IN, vertPassPos);
+	
+#if !%_RT_ENVIRONMENT_CUBEMAP
+	// WH GM: Packed SilhouetteColor into CD_CustomData2.z to free up CD_CustomData1 for our purposes
+	//OUT.cVision = CD_CustomData1;
+	OUT.cVision = D3DX_A8B8G8R8_UNORM_TO_FLOAT4(asuint(CD_CustomData2.z));
+#else
+	OUT.cVision = 0.0f;
+#endif
+
+	OUT.HPosition = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPos);
+	OUT.vView.xyz = vertPassPos.WorldPos.xyz;
+
+	// reminder for Andrey, texture modifiers should work on all cases
+	_TCModify(vertPassPos.baseTC, OUT.baseTC, vertPassPos.Position, vertPassPos.ObjToTangentSpace[2], TS_DIFFUSE);
+
+	OUT.baseTC.z = OUT.HPosition.w;
+
+	float3 worldPos = float3(vertPassPos.InstMatrix[0].w, vertPassPos.InstMatrix[1].w, vertPassPos.InstMatrix[2].w);
+	OUT.baseTC.w = frac( length( worldPos.xyz + g_VS_WorldViewPos.xyz) ) + 0.01;
+
+	// Output the screen-space texture coordinates - for shadows and general projections
+	OUT.screenProj = HPosToScreenTC(OUT.HPosition);
+
+#if %VIEW_ALIGNED_STRANDS
+	float3 worldTangentT = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+#endif
+
+/*
+#if %_RT_SAMPLE1
+	// Note: Normalization required for normal diffuse map in world space in case scale used - Do not remove
+	float3 worldTangentS = normalize( mul((const float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]) );
+	float3 worldTangentN = (cross(worldTangentS, worldTangentT)) * vertPassPos.Tangent.w;
+
+	OUT.vTangent = float4(worldTangentS, vertPassPos.Tangent.w); 
+	OUT.vBinormal.xyz = worldTangentT;
+#endif
+*/
+
+#if %VIEW_ALIGNED_STRANDS
+	vertPassPos.WorldPos.xyz += g_VS_WorldViewPos.xyz;
+	vertPassPos.WorldPos.xyz += GetViewAlignmentDelta(vertPassPos, worldTangentT);
+	OUT.HPosition = mul( g_VS_ViewProjZeroMatr, float4( vertPassPos.WorldPos.xyz - g_VS_WorldViewPos.xyz, 1) );
+	vertPassPos.WorldPos.xyz -= g_VS_WorldViewPos.xyz;
+#endif
+
+	return OUT;
+}
+
+technique CustomRenderHair
+{
+pass p0
+	{
+		VertexShader = Hair_CustomRenderPassVS() CustomRenderVS;
+		PixelShader = Common_CustomRenderPassPS() CustomRenderPS;
+
+		ZEnable = true;
+		ZWriteEnable = false;
+		CullMode = None;
+
+		ZFunc = LEqual;
+		IgnoreMaterialState = true;
+	}
+}
+

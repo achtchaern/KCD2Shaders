@@ -1,0 +1,80 @@
+// Copyright (c) 2021 WarhorseStudios
+// Author: Lukas Hosek
+
+struct pixout
+{
+	float4 Color : SV_Target0;
+};
+
+struct vtxOut
+{
+	float4 HPosition : SV_POSITION;
+	float4 baseTC : TEXCOORD0;
+};
+
+cbuffer CBYCrCbDecode : register(b3)
+{
+	struct
+	{
+		float4x4	colorTransform;
+		float			gamma;
+		float2			texCropMultiplier;
+
+	} YCrCbParams;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////
+
+float4 GetHPos_FromTriVertexID(uint vertexID)
+{
+	return float4(float2(((vertexID << 1) & 2) * 2.0, (vertexID == 0) ? -4.0 : 0.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float2 GetBaseTC_FromTriVertexID(uint vertexID)
+{
+	return float2((vertexID << 1) & 2, (vertexID == 0) ? 2.0 : 0.0) * YCrCbParams.texCropMultiplier;
+}
+
+vtxOut FullscreenTriVS(uint VertexID : SV_VertexID)
+{
+	vtxOut OUT = (vtxOut)0;
+	OUT.HPosition = GetHPos_FromTriVertexID(VertexID);
+	OUT.baseTC.xy = GetBaseTC_FromTriVertexID(VertexID);
+	return OUT;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float4> TexY : register(t0);
+Texture2D<float4> TexCr : register(t1);
+Texture2D<float4> TexCb : register(t2);
+
+SamplerState SampStateWrap : register(s0);
+
+pixout BinkYCrCbPS(vtxOut vtx_in)
+{
+	float Y = TexY.Sample(SampStateWrap, vtx_in.baseTC.xy).r;
+	float Cr = TexCr.Sample(SampStateWrap, vtx_in.baseTC.xy).r;
+	float Cb = TexCb.Sample(SampStateWrap, vtx_in.baseTC.xy).r;
+	float4 YCrCb = {Y, Cr, Cb, 1};
+	float4 RGBA = mul(YCrCbParams.colorTransform, YCrCb);
+
+#if !%_RT_SAMPLE0
+	// Gamma correction
+	RGBA.rgb = pow(RGBA.rgb, YCrCbParams.gamma);
+#endif
+
+	pixout result;
+	result.Color = float4(RGBA.rgb , 1.0);//WH ocg.polischuk: changed alpha from 0 for correct blending from separate UI target
+	return result;
+}
+
+
+technique BinkYCrCb
+{
+	pass p0
+	{
+		VertexShader = FullscreenTriVS();
+		PixelShader = BinkYCrCbPS();
+	}
+}

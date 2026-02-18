@@ -1,0 +1,686 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "HumanSkinValidations.cfi"
+#include "ShadowCommon.cfi"
+
+// Shader global descriptions
+float Script : STANDARDSGLOBAL
+<
+	string Script =
+		"Public;"
+	#if ENABLE_TESSELLATION
+		"HWTessellation;"
+	#endif
+	#if %WRINKLE_BLENDING
+		"WrinkleBlending"
+	#endif
+		"SupportsAttrInstancing;"
+		"SupportsDeferredShading;"
+		"SupportsFullDeferredShading;"
+		"ShaderDrawType = Light;"
+		"ShaderType = General;"
+	#if HIDING_GROUPS
+		"SupportsHidingGroupsWH"
+	#endif
+	#if CLS_BLOOD
+		"SupportsBloodWH"
+	#endif
+	#if CLS_GRIME
+		"SupportsGrimeWH"
+	#endif
+>;
+
+//////////////////////////////// Common vertex shader ////////////////
+
+#include "vertexLib.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////// Custom shading pass structure /////////////////////////////////////
+
+struct CustomForwardShadingAttribs
+{
+};
+
+#include "ShadeLib.cfi"
+
+//=========================================================================
+#include "WH_HLSL_CPP_Shared.cfi"
+
+#if CLS_BLOOD || CLS_GRIME
+Texture2D BloodGrimeScratchTexture : register(t13)
+<
+	UIName = "BG Mask";
+	UIDescription = "R � blood, G � grime, B � unused";
+> = TM_Emittance;
+#endif
+
+StructuredBuffer<S_ClothingMaterialInstance> MaterialInstanceBuffer : register(t72);
+
+#include "WHHidingGroups.cfi"
+#include "WHPerMaterialCB.cfi"
+#include "WHDecalAtlas.cfi"
+#include "WHBlood.cfi"
+#include "WHGrime.cfi"
+#include "WHClothingSystem.cfi"
+//=========================================================================
+
+//////////////////////////////// Samplers ////////////////
+
+SUBSURFACEMAP
+DECALMAP
+OPACITYMAP
+ENVIRONMENTCUBEMAP
+
+CUSTOMMAP;
+CUSTOMSECONDARYMAP; 
+
+/// Tweakables //////////////////////
+
+float Melanin
+<
+  register = REG_PM_PARAM_0.x;
+  string UIWidget = "slider";
+  float UIMin = 0;
+  float UIMax = 1.0;
+  float UIStep = 0.05;
+> = 0.0;
+
+float SSSIndex
+< 
+  register = REG_PM_PARAM_0.y;  
+  string UIHelp = "Change the index of subsurface scattering";
+  string UIName = "SSS Index";
+  string UIWidget = "slider";
+  float UIMin = 1.0;
+  float UIMax = 1.995;
+  float UIStep = 0.005;
+> = 1.2;
+
+float TranslucencyMultiplier
+< 
+  register = REG_PM_PARAM_0.z;
+  string UIHelp = "Multiplier applied to translucency map.";                     
+  string UIName = "Translucency Multiplier";        
+  string UIWidget = "slider";
+  float UIMin = 0;
+  float UIMax = 4.0;
+  float UIStep = 0.001;
+> = 0.0;
+
+#if %DETAIL_MAPPING
+	min16float DetailBumpScale
+	<
+	  register = REG_PM_PARAM_1.x;
+	  string UIHelp = "Set detail bump scale";                     
+	  string UIName = "Detail bump scale";    	  
+	  string UIWidget = "slider";
+	  float UIMin = 0.0;
+	  float UIMax = 10.0;
+	  float UIStep = 0.1;
+	> = 0.5;
+#endif
+
+struct vert2fragZ_C
+{
+#if %_GS || %_DS || %_PS || !ENABLE_TESSELLATION || %_RT_NO_TESSELLATION
+  OUT_HPOS_IN_WPOS
+#endif
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+	float4 vView     : TEXCOORDN;
+	float4 vNormal   : TEXCOORDN;
+#endif
+
+	float4 baseTC    : TEXCOORDN;
+	float4 vTangent   : TEXCOORDN;
+	min16float4 vBinormal  : TEXCOORDN;
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	float3 HPosPrev : TEXCOORDN;
+#endif
+
+#if CLS_BLOOD
+	float bloodSphereMask : BLOOD_MASK;
+#endif
+};
+
+#if %WRINKLE_BLENDING
+
+float WrinklesBlend
+<
+  register = REG_PM_PARAM_1.y;
+  string UIName = "Wrinkles blend";
+  string UIWidget = "slider";
+  float UIMin = -1.0;
+  float UIMax = 1.0;
+  float UIStep = 0.01;
+> = 1.0;
+
+float4 PI_WrinklesMask0 : PI_WrinklesMask0;
+float4 PI_WrinklesMask1 : PI_WrinklesMask1;
+float4 PI_WrinklesMask2 : PI_WrinklesMask2;
+float4 PI_WrinklesMask3 : PI_WrinklesMask3; // WH[TBa]: added to support 16 channels, KCD2-205005
+
+#endif
+
+///////////////// vertex shaders //////////////////
+
+vert2FragGeneral SkinVS(app2vertGeneral IN)
+{
+  vert2FragGeneral OUT = (vert2FragGeneral) 0;
+	
+	streamPos vertPassPos = (streamPos)0;
+  vs_shared_output( IN, OUT, vertPassPos, false );               
+  
+  return OUT;
+}
+
+//////////////////////////////// Custom shading utils ////////////////
+
+min16float3 SkinSynthesis( in min16float3 diffuseTex, in min16float m)
+{       
+  min16float fLum = dot(diffuseTex.xyz, min16float3(0.33, 0.59, 0.11));          
+  min16float3 melaninMax = diffuseTex.xyz * fLum;
+  return diffuseTex.xyz * lerp(1.0, melaninMax.xyz, m);  
+}
+
+#if %WRINKLE_BLENDING
+
+// Helpers functions
+// IZF: While exlusively used by the wrinkle blending for now, these are
+// general functions that should be moved in a shared location.
+
+void DecodeBlendMask(Texture2D<min16float4> tex, float2 coord, out min16float4 mask0, out min16float4 mask1, out min16float4 mask2)
+{
+	// Each mask has a granularity of 75 gradients.
+	// A gap in between each section is needed to avoid filtering artefacts.
+
+	//   0 -  75 mask 0
+	//  75 -  95 gap
+	//  95 - 170 mask 1
+	// 170 - 180 gap
+	// 180 - 255 mask 2
+
+	static const min16float GRADIENT_RANGE_SCALE = 255.0f / 75.0f;
+
+	static const min16float GRADIENT_RANGE_OFFSET_1 = -95.0f / 255.0f * GRADIENT_RANGE_SCALE;
+	static const min16float GRADIENT_RANGE_OFFSET_2 = -180.0f / 255.0f * GRADIENT_RANGE_SCALE;
+
+	static const min16float GRADIENT_RANGE_CLAMP_0 = 85.0f / 255.0f;
+	static const min16float GRADIENT_RANGE_CLAMP_1 = 175.0f / 255.0f;
+
+	min16float4 maskMap = GetTexture2D(tex, ssPointClamp, coord);
+
+	mask0 = saturate(maskMap * GRADIENT_RANGE_SCALE) * (maskMap < GRADIENT_RANGE_CLAMP_0);
+	mask1 = saturate(maskMap * GRADIENT_RANGE_SCALE + GRADIENT_RANGE_OFFSET_1) * (maskMap < GRADIENT_RANGE_CLAMP_1);
+	mask2 = saturate(maskMap * GRADIENT_RANGE_SCALE + GRADIENT_RANGE_OFFSET_2);
+}
+
+// WH[TBa]: added to support 16 channels, KCD2-205005
+void DecodeBlendMask16(Texture2D<min16float4> tex, float2 coord,
+	out min16float4 mask0, out min16float4 mask1, out min16float4 mask2, out min16float4 mask3)
+{
+	// Each mask has a granularity of 50 gradients.
+	// A gap in between each section is needed to avoid filtering artefacts.
+
+	//   0 -  50 mask 0
+	//  50 -  70 gap
+	//  70 - 120 mask 1
+	// 120 - 140 gap
+	// 140 - 190 mask 2
+	// 190 - 205 gap
+	// 205 - 255 mask 3
+
+	static const min16float GRADIENT_RANGE_SCALE = 255.0f / 50.0f;
+
+	static const min16float GRADIENT_RANGE_OFFSET_1 =  -70.0f / 255.0f * GRADIENT_RANGE_SCALE;
+	static const min16float GRADIENT_RANGE_OFFSET_2 = -140.0f / 255.0f * GRADIENT_RANGE_SCALE;
+	static const min16float GRADIENT_RANGE_OFFSET_3 = -205.0f / 255.0f * GRADIENT_RANGE_SCALE;
+
+	static const min16float GRADIENT_RANGE_CLAMP_0 =  60.0f / 255.0f;
+	static const min16float GRADIENT_RANGE_CLAMP_1 = 130.0f / 255.0f;
+	static const min16float GRADIENT_RANGE_CLAMP_2 = 197.5f / 255.0f;
+
+	min16float4 maskMap = GetTexture2D(tex, ssPointClamp, coord);
+
+	mask0 = saturate(maskMap * GRADIENT_RANGE_SCALE) * (maskMap < GRADIENT_RANGE_CLAMP_0);
+	mask1 = saturate(maskMap * GRADIENT_RANGE_SCALE + GRADIENT_RANGE_OFFSET_1) * (maskMap < GRADIENT_RANGE_CLAMP_1);
+	mask2 = saturate(maskMap * GRADIENT_RANGE_SCALE + GRADIENT_RANGE_OFFSET_2) * (maskMap < GRADIENT_RANGE_CLAMP_2);
+	mask3 = saturate(maskMap * GRADIENT_RANGE_SCALE + GRADIENT_RANGE_OFFSET_3);
+}
+
+min16float3 BlendTangentSpaceNormals(min16float3 normalBase, min16float3 normalAdd, min16float weight)
+{
+//	normalBase /= normalBase.z;
+//	normalAdd /= normalAdd.z;
+	normalBase.xy += normalAdd.xy * saturate(weight);
+	return (normalBase);
+}
+
+// Wrinkle Blending exlusive functions
+
+min16float ComputeWrinkleBlendingWeight(float2 maskCoord)
+{
+	// WH[TBa]: added to support 16 channels, KCD2-205005
+	min16float4 mask0, mask1, mask2, mask3;
+	DecodeBlendMask16(customSecondaryTex, maskCoord, mask0, mask1, mask2, mask3);
+
+	min16float weight =
+		dot(mask0, CD_WrinklesMask0) + 
+		dot(mask1, CD_WrinklesMask1) + 
+		dot(mask2, CD_WrinklesMask2) + 
+		dot(mask3, CD_WrinklesMask3);
+
+	weight *= WrinklesBlend;
+
+	return weight;
+}
+
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void GatherMaterialAttribs(in half3x3 mTangentToWS, in float2 baseTC, in float bloodSphereMask, out MaterialAttribsCommon attribs)
+{
+	attribs = MaterialAttribsDefault();
+
+#if DECAL_ATLAS
+	float3 decalAtlasTC;
+	half decalAtlasMask;
+	int decalAtlasIndex;
+	GetDecalAtlasTC(decalAtlasTC, decalAtlasMask, decalAtlasIndex, baseTC, MACRO_ATLAS_SIZE);
+#endif //DECAL_ATLAS
+
+#if CLS_BLOOD || CLS_GRIME
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	half3 macroMask = BloodGrimeScratchTexture.Sample(ssMaterialTrilinear, baseTC.xy).rgb;
+#endif //CLS_BLOOD || CLS_GRIME
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Normals
+	
+  min16float3 vNormalTS = min16float3(0, 0, 1);
+	#if %NORMAL_MAP
+		vNormalTS = GetNormalMap(normalsTex, baseTC.xy);
+	#endif
+
+	#if %WRINKLE_BLENDING
+		// WH[TBa]: added to support 16 channels, KCD2-205005
+		min16float wrinkleWeight = ComputeWrinkleBlendingWeight(baseTC.xy);
+		min16float3 wrinkleNormal = GetNormalMap(customTex, baseTC.xy);
+		min16float3 wrinkleNormal2 = GetNormalMap(heightTex, baseTC.xy); // WH[TBa]
+		vNormalTS = BlendTangentSpaceNormals(vNormalTS, wrinkleNormal, wrinkleWeight);
+		vNormalTS = BlendTangentSpaceNormals(vNormalTS, wrinkleNormal2, -wrinkleWeight);
+	#endif
+
+	#if %DETAIL_MAPPING
+		min16float2 vDetailBumpTilling = CM_DetailTilingAndAlphaRef.xy;
+		min16float fDetailBumpScale = DetailBumpScale;
+
+		min16float2 tcDetail = baseTC.xy * vDetailBumpTilling;
+		min16float2 vDetailN = GetDetailTex(detailTex, tcDetail).xy;
+
+	#if %ALPHAMASK_DETAILMAP
+		min16float bumpScale = GetAlphaTex(diffuseTex, baseTC.xy);
+		fDetailBumpScale *= bumpScale;
+	#endif
+
+		vNormalTS.xy += vDetailN.xy * fDetailBumpScale;
+	#endif
+
+#if DECAL_ATLAS
+		ApplyDecalAtlasNormal(vNormalTS, decalAtlasTC, decalAtlasMask, decalAtlasIndex);
+#endif
+
+#if CLS_BLOOD
+		half bloodIntensity = ComputeBloodIntensity(macroMask.r, 1.f, bloodSphereMask);
+#endif
+
+	min16float3 vNormal = ( mTangentToWS[2] ); 
+	#if %NORMAL_MAP || %WRINKLE_BLENDING || %DETAIL_MAPPING
+		vNormal = ( mul( vNormalTS, mTangentToWS ) ); 
+	#endif
+
+	attribs.NormalWorld = vNormal;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Albedo, Reflectance and Smoothness
+	
+	min16float fSmoothness = MatSpecColor.w;
+	fSmoothness *= GetSmoothnessTex(smoothnessTex, baseTC.xy);
+
+#if DECAL_ATLAS
+	ApplyDecalAtlasSmoothness(fSmoothness, decalAtlasTC, decalAtlasMask);
+#endif
+
+#if CLS_GRIME
+	half grimeIntensity = ComputeGrimeIntensity(macroMask.g, GrimeOpacity, MaterialInstanceBuffer[CD_MaterialInstanceIdWH].grimeLevel);
+	ApplyGrimeSmoothness(fSmoothness, GrimeGloss, grimeIntensity);
+#endif
+
+#if CLS_BLOOD
+	ApplyBloodSmoothness(fSmoothness, bloodIntensity);
+#endif
+	
+	attribs.Smoothness = fSmoothness;
+	
+	min16float3 albedo = GetDiffuseTex(diffuseTex, baseTC.xy).xyz;
+	albedo *= MatDifColor.rgb * MaterialInstanceBuffer[CD_MaterialInstanceIdWH].skinDiffuse;
+	
+	// Pre-process skin diffuse map color
+	albedo = SkinSynthesis(albedo, Melanin + MaterialInstanceBuffer[CD_MaterialInstanceIdWH].melanin);
+	
+#if %DECAL_MAP	
+	min16float4 cDecal = GetDecalTex(decalTex, baseTC.xy);
+	albedo = lerp(albedo, cDecal.rgb, cDecal.a);
+#endif
+
+#if DECAL_ATLAS
+	float decalAlpha;
+	ApplyDecalAtlasAlbedo(albedo, decalAlpha, decalAtlasTC, decalAtlasMask);
+#endif
+
+#if CLS_GRIME
+	ApplyGrimeAlbedo(albedo, GrimeDiffuse.rgb, grimeIntensity);
+#endif
+
+#if CLS_BLOOD
+	ApplyBloodAlbedo(albedo, bloodIntensity);
+#endif
+
+#if CLS_BLOOD && CLS_GRIME && %_RT_CLOTHING_SYSTEM_DEBUG
+	float3 dummyTC[2];
+	DrawClothingSystemDebug(albedo, 0, 0, 0, grimeIntensity, bloodIntensity, bloodSphereMask, dummyTC, decalAtlasIndex, decalAtlasMask);
+#endif
+
+	attribs.Albedo = albedo;
+	
+	min16float3 reflectance = MatSpecColor.rgb;
+
+	#if %SPECULAR_MAP
+		reflectance *= GetSpecularTex(specularTex, baseTC.xy).rgb;
+	#endif
+
+#if DECAL_ATLAS
+		ApplyDecalAtlasReflectance(reflectance, decalAtlasTC, decalAlpha);
+#endif
+
+#if CLS_GRIME
+		ApplyGrimeReflectance(reflectance, GrimeSpecular.rgb, grimeIntensity);
+#endif
+
+#if CLS_BLOOD
+		ApplyBloodReflectance(reflectance, bloodIntensity);
+#endif
+
+	attribs.Reflectance = reflectance;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // SSS and Transmittance
+	
+	attribs.LightingModel = LIGHTINGMODEL_TRANSMITTANCE;
+	
+	// WH[TBa]: clamp the upper value so it is not rounded up to the next SSS profile, KCD2-437688
+	min16float sssIndex = min(SSSIndex, 1.f + MAX_FRACTIONAL_8_BIT);
+#if %SUBSURFACE_SCATTERING_MASK
+	sssIndex = floor(sssIndex) + frac(sssIndex) * GetAlphaTex(diffuseTex, baseTC.xy);
+#endif
+	
+	attribs.ScatteringIndex = sssIndex;
+	
+	// Translucency
+	min16float fTranslucency = GetOpacityTex(opacityTex, baseTC.xy) * TranslucencyMultiplier;
+	
+	attribs.Transmittance = exp( (1 - saturate(fTranslucency)) * min16float3(-8, -40, -64) );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void Callback_ShadingDirect(in ForwardShadingAttribs attribs, in ForwardLightParams light, out float3 diffuseAcc, out float3 specularAcc)
+{
+    min16float3 viewVec = (-attribs.worldPos);
+    min16float NdotL = saturate(dot(attribs.normal, light.lightVec));
+
+#if %_RT_AREA_LIGHT
+	if (light.type == LIGHT_TYPE_REGULAR_AREA || light.type == LIGHT_TYPE_REGULAR_AREAFACE)
+	{
+		// WH[TBa]: pass directly areaAttribs, KCD2-73606
+		AreaLightLTC_GGX(attribs.normal, -normalize(attribs.areaAttribs.position), attribs.smoothness, attribs.reflectance, attribs.areaAttribs, Fwd_SpotTexArray, diffuseAcc, specularAcc);
+	}
+	else
+#endif
+	if (light.type == LIGHT_TYPE_SUN)
+	{
+		const float3 discLightVec = ComputeNearestLightOnSunWH(attribs.normal, viewVec, light.lightVec);
+		diffuseAcc.x = DiffuseBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, NdotL);
+		specularAcc  = SpecularBRDF(attribs.normal, viewVec, discLightVec, attribs.smoothness, attribs.reflectance) * NdotL;
+	}
+	else
+	{
+		diffuseAcc.x = DiffuseBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, NdotL);
+		specularAcc  = SpecularBRDF(attribs.normal, viewVec, light.lightVec, attribs.smoothness, attribs.reflectance) * NdotL;
+
+		diffuseAcc.x *= light.illuminanceWH.inverseSquareAttenuation;
+		specularAcc *= light.illuminanceWH.inverseSquareAttenuation;
+	}
+
+	diffuseAcc = diffuseAcc.x * light.illuminanceWH.color * light.illuminanceWH.clipping;
+	specularAcc = specularAcc * light.illuminanceWH.color * light.illuminanceWH.clipping;
+}
+
+#include "ForwardShading.cfi"
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if !HIDING_GROUPS
+CRY_EARLY_DEPTH
+#endif
+pixout SkinPS(vert2FragGeneral IN)
+{
+	// Gather surface material attributes
+	MaterialAttribsCommon commonAttribs;
+    min16float3x3 mTangentToWS = min16float3x3(IN.vTangent.xyz, IN.vBinormal.xyz, cross(IN.vTangent.xyz, IN.vBinormal.xyz) * IN.vTangent.w);
+	GatherMaterialAttribs(mTangentToWS, IN.baseTC.xy, 0.f, commonAttribs);
+	
+	ForwardShadingAttribs fwdAttribs;
+	fwdAttribs.screenUV = IN.screenProj.xy / IN.screenProj.w;
+	fwdAttribs.worldPos = IN.vView.xyz;
+	
+    min16float3 diffuseAcc = 0, specularAcc = 0;
+	Fwd_StandardShading(commonAttribs, fwdAttribs, diffuseAcc, specularAcc);
+	
+	pixout OUT = (pixout)0;
+	OUT.Color.rgb = diffuseAcc + specularAcc;
+	
+	return OUT;
+}
+
+#include "HumanSkinTess.cfi"
+
+//////////////////////////////// techniques ////////////////
+
+technique General
+<
+  string Script = 
+        "TechniqueZ=ZPass;"
+        "TechniqueZPrepass=ZPrePass;"
+        "TechniqueMotionBlur=MotionBlurPass;" 
+        "TechniqueCustomRender=CustomRenderPass;"
+        "TechniqueShadowGen=ShadowGen;"
+        "TechniqueDebug=DebugPass;"
+>
+{
+	pass p0
+	{
+		VertexShader = SkinVS() SkinVS;
+#if ENABLE_TESSELLATION
+		HullShader   = SkinHS() GeneralHS;
+		DomainShader = SkinDS() GeneralDS;
+#endif
+		PixelShader = SkinPS() SkinPS;
+
+		ZEnable = true;
+		ZWriteEnable = true;  // this is explicit disabled when zpass enabled
+		CullMode = Back;
+	}
+}
+
+//////////////////////////////// Common techniques ////////////////
+
+//////////////////////////////////////////////////////////////////
+// Custom Zpass for skin:
+//	- avoid poluting even further common zpass with yet aditional permutation
+
+///////////////// vertex shaders //////////////////
+vert2fragZ_C SkinZPassVS(app2vertGBuffer IN)
+{
+  vert2fragZ_C OUT = (vert2fragZ_C)0;
+  streamPos vertPassPos = (streamPos)0;
+  streamPos_FromGBuffer(IN, vertPassPos);
+	streamPos vertPassPosPrev = (streamPos) vertPassPos;
+
+#if CLS_BLOOD //before skinning
+	OUT.bloodSphereMask = ComputeBloodMask(vertPassPos.Position.xyz);
+#endif
+
+  const float4 HPosition = Pos_VS_General(g_VS_ViewProjZeroMatr, vertPassPos);    	
+  float3 vPos = vertPassPos.WorldPos.xyz;
+
+#if ENABLE_TESSELLATION && !%_RT_NO_TESSELLATION
+	//relative possition
+	OUT.vView.xyz = vPos.xyz;
+	OUT.vNormal.xyz = (mul((const min16float3x3)vertPassPos.InstMatrix, vertPassPos.Normal.xyz));
+#else
+	OUT.HPosition = HPosition;
+#endif
+
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	vertPassPosPrev.PositionCurr = vertPassPos.Position;
+	OUT.HPosPrev.xyz = HPosToScreenTC( Pos_Prev_VS_General(g_VS_ViewProjZeroMatr, vertPassPosPrev) ).xyw;
+#endif
+
+#if !%_RT_OBJ_IDENTITY
+	vPos += g_VS_WorldViewPos.xyz;
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Output tangents
+
+  // Note: Normalization required for normal diffuse map in world space in case scale used - Do not remove
+  min16float3 worldTangentS = ( mul((const min16float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[0]) );
+  min16float3 worldTangentT = ( mul((const min16float3x3)vertPassPos.InstMatrix, vertPassPos.ObjToTangentSpace[1]) );
+
+    OUT.vTangent = min16float4(worldTangentS, vertPassPos.Tangent.w);
+  OUT.vBinormal.xyz = worldTangentT;
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Output uv coordinates
+ 
+  float4 baseTC = vertPassPos.baseTC;  
+  
+  _TCModify(baseTC, OUT.baseTC, vertPassPos.Position, vertPassPos.ObjToTangentSpace[2], TS_DIFFUSE);	
+
+  #if %_RT_ALPHATEST || %_RT_DISSOLVE
+    OUT.baseTC.wz = float2(Get_MaterialAlphaTest(),Get_SPI_Dissolve());
+  #endif
+
+#if HIDING_GROUPS
+	DiscardVertexIfHidden(OUT.HPosition, vertPassPos.Color);
+#endif
+
+  return OUT;            
+}
+
+///////////////// pixel shaders //////////////////
+// WH[DH]: Do not use early-z with hiding groups that discard geometry in the vertex shader
+#if !HIDING_GROUPS
+CRY_EARLY_DEPTH_OR_RE_Z
+#endif
+pixout_gbuffer SkinZPassPS(vert2fragZ_C IN)
+{
+  pixout_gbuffer OUT = (pixout_gbuffer) 0;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Depth and alpha test
+	
+#if %_RT_ALPHATEST
+	min16float fDiffuseAlpha = GetAlphaTex(diffuseTex, IN.baseTC.xy);
+	#if %_RT_MSAA_QUALITY || %_RT_MSAA_QUALITY1
+		GetAlphaCoverageMask(diffuseTex, IN.baseTC.xy, IN.baseTC.w, fDiffuseAlpha, OUT.uCoverageMask);
+	#endif
+	clip(fDiffuseAlpha - IN.baseTC.w);
+#endif
+
+	// WH GM: Removed last parameter to unify dissolve across materials and prevent out-of-sync issues like #KCD2-329079
+	ApplyDissolve(IN.baseTC.z, (int2)IN.WPos.xy);
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+  // Gather material attributes
+	
+#if CLS_BLOOD
+	const float bloodSphereMask = IN.bloodSphereMask;
+#else
+	const float bloodSphereMask = 0;
+#endif
+
+	MaterialAttribsCommon attribs = MaterialAttribsDefault();
+    min16float3x3 mTangentToWS = min16float3x3(IN.vTangent.xyz, IN.vBinormal.xyz, cross(min16float3(IN.vTangent.xyz), min16float3(IN.vBinormal.xyz)) * min16float(IN.vTangent.w));
+	GatherMaterialAttribs(mTangentToWS, IN.baseTC.xy, bloodSphereMask, attribs);
+	
+	// Disable SSS at a certain distance
+	if (IN.WPos.w * g_PS_ProjRatio.w > 10)
+		attribs.ScatteringIndex = 0;
+	
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output to GBuffer
+	
+#if %_RT_SAMPLE0
+	EncodeMicroGBuffer(attribs, OUT.GBufferA, IN.WPos.xy);
+#else	
+	EncodeGBuffer( attribs, OUT.GBufferA, OUT.GBufferB, OUT.GBufferC );
+#endif
+
+	////////////////////////////////////////////////////////////////////////////////////////////////
+	// Output Velocity
+	
+#if %_RT_MOTION_BLUR && !%_RT_ALPHABLEND
+	float2 ScreenTCPrev = IN.HPosPrev.xy / IN.HPosPrev.z;
+	ScreenTCPrev = MapViewportToRaster(ScreenTCPrev);
+	OUT.VelocityRT = OutputVelocityRT(IN.WPos.xy * (CV_ScreenSize.zw * 2), ScreenTCPrev);
+#endif
+
+	return OUT;
+}
+
+//////////////////////////////// technique ////////////////
+
+technique ZPass
+{
+	pass p0
+	{
+		VertexShader = SkinZPassVS() ZVS;
+#if ENABLE_TESSELLATION
+		HullShader   = SkinZPassHS() GeneralHS;
+		DomainShader = SkinZPassDS() GeneralDS;
+#endif
+		PixelShader = SkinZPassPS() ZPS;
+
+		ZEnable = true;
+		ZWriteEnable = true;  
+		CullMode = Back;
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "CommonZPrePass.cfi"
+#include "CommonMotionBlurPass.cfi"
+#include "CommonViewsPass.cfi"
+#include "CommonShadowGenPass.cfi"
+#include "CommonDebugPass.cfi"

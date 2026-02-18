@@ -1,0 +1,562 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+#include "AgcBuiltIn.cfi"
+
+struct SEmpty
+{
+	// Empty on purpose
+};
+
+struct SColor0
+{
+	float4 color0 : SV_Target0;
+};
+
+struct SQuad
+{
+	float4 pos : SV_POSITION;
+	float4 uv : TEXCOORD; // xy: in [0, 1], zw: in [-1, 1]
+};
+
+struct SQuadArray
+{
+	float4 pos : SV_POSITION;
+	float4 uv : TEXCOORD; // xy: in [0, 1], zw: in [-1, 1]
+	uint slice : SV_RenderTargetArrayIndex;
+};
+
+float2 AgcFullscreenQuadPosition(uint vertId)
+{
+	// Construct quad from hard-coded index input: 0, 1, 2, 1, 3, 2
+	// 
+	// 0 ---- 1
+	// |   /  |
+	// |  /   |
+	// 2 ---- 3
+	const float x = vertId & 1;
+	const float y = (vertId & 2) * 0.5f;
+	return float2(x, y);
+}
+
+// Construct a full-screen quad
+// Note: Since any AGC shader exports at least one float4 parameter (other than position), we provide UV in there.
+SQuad AgcQuadVS(uint vertId : SV_VertexId)
+{
+	const float2 quadPos = AgcFullscreenQuadPosition(vertId);
+	const float2 viewPos = quadPos * 2.0f - 1.0f;
+
+	SQuad OUT;
+	OUT.pos = float4(viewPos, 0.0f, 1.0f);
+	OUT.uv = float4(quadPos, viewPos);
+	return OUT;
+}
+
+// Construct an array of full-screen quads (when rendering to an array)
+// Note: Since any AGC shader exports at least one float4 parameter (other than position), we provide UV in there.
+SQuadArray AgcQuadArrayVS(uint vertId : SV_VertexId, uint sliceId : SV_InstanceId)
+{
+	const float2 quadPos = AgcFullscreenQuadPosition(vertId);
+	const float2 viewPos = quadPos * 2.0f - 1.0f;
+
+	SQuadArray OUT;
+	OUT.pos = float4(viewPos, 0.0f, 1.0f);
+	OUT.uv = float4(quadPos, viewPos);
+	OUT.slice = sliceId;
+	return OUT;
+}
+
+// NULL-export shader
+// Use when no color target is bound
+SEmpty AgcEmptyPS()
+{
+	SEmpty OUT;
+	return OUT;
+}
+
+// Zero-export shader to MRT0
+// Use when color is irrelevant (or exactly zero is desired)
+SColor0 AgcZeroPS()
+{
+	SColor0 OUT;
+	OUT.color0 = float4(0, 0, 0, 0);
+	return OUT;
+}
+
+// Constant-export shader to MRT0
+// Use when specific color is desired
+SColor0 AgcConstantPS(SConstantColor userData : SV_UserData)
+{
+	SColor0 OUT;
+	OUT.color0 = userData.color;
+	return OUT;
+}
+
+// Copy 128-bit bit-pattern into 4-byte aligned memory, when the target buffer size is a multiple of 4-byte.
+// This is the minimum supported granularity, each thread stores 4x32 bit.
+[numthreads(64, 1, 1)]
+void AgcMemSet32CS(uint3 threadId : SV_DispatchThreadID, SMemSet32 userData : SV_UserData)
+{
+	// Note: Reason for this indexing pattern is that it generates contiguous stores per warp.
+	// We trust the buffer descriptor to discard writes "out of bounds" of the target area.
+	const uint bufferIndex = (threadId.x & 63) + (threadId.x & ~63) * 4;
+	const uint value = userData.source[threadId.x & 3];
+	userData.target[bufferIndex + 0  ] = value;
+	userData.target[bufferIndex + 64 ] = value;
+	userData.target[bufferIndex + 128] = value;
+	userData.target[bufferIndex + 192] = value;
+}
+
+// Copy 128-bit bit-pattern into 16-byte aligned memory, when the target buffer size is a multiple of 16-byte.
+// This allows for a single 128-bit wide store for each thread.
+[numthreads(64, 1, 1)]
+void AgcMemSet128CS(uint3 threadId : SV_DispatchThreadID, SMemSet128 userData : SV_UserData)
+{
+	userData.target[threadId.x] = userData.source;
+}
+
+// Copy data from one 4-byte aligned buffer to another 4-byte aligned buffer, the copy-size is a multiple of 4-byte.
+[numthreads(64, 1, 1)]
+void AgcMemCpyCS(uint3 threadId : SV_DispatchThreadID, SMemCpy userData : SV_UserData)
+{
+	userData.target[threadId.x] = userData.source[threadId.x];
+}
+
+// Copy data between 1D texture(array)s.
+[numthreads(64, 1, 1)]
+void AgcTexCpy1DCSRaw(uint3 threadId : SV_DispatchThreadID, STexCpy1DRaw userData : SV_UserData)
+{
+	if (threadId.x < userData.region)
+	{
+		const uint2 targetCoord = uint2(userData.targetOffset + threadId.x, userData.targetSlice);
+		const uint2 sourceCoord = uint2(userData.sourceOffset + threadId.x, userData.sourceSlice);
+		const uint4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+		userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = value;
+	}
+}
+
+[numthreads(64, 1, 1)]
+void AgcTexCpy1DCSF2F(uint3 threadId : SV_DispatchThreadID, STexCpy1DF2F userData : SV_UserData)
+{
+    if (threadId.x < userData.region)
+    {
+        const uint2 targetCoord = uint2(userData.targetOffset + threadId.x, userData.targetSlice);
+        const uint2 sourceCoord = uint2(userData.sourceOffset + threadId.x, userData.sourceSlice);
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = value;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void AgcTexCpy1DCSF2S(uint3 threadId : SV_DispatchThreadID, STexCpy1DF2S userData : SV_UserData)
+{
+    if (threadId.x < userData.region)
+    {
+        const uint2 targetCoord = uint2(userData.targetOffset + threadId.x, userData.targetSlice);
+        const uint2 sourceCoord = uint2(userData.sourceOffset + threadId.x, userData.sourceSlice);
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (int4)value;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void AgcTexCpy1DCSF2U(uint3 threadId : SV_DispatchThreadID, STexCpy1DF2U userData : SV_UserData)
+{
+    if (threadId.x < userData.region)
+    {
+        const uint2 targetCoord = uint2(userData.targetOffset + threadId.x, userData.targetSlice);
+        const uint2 sourceCoord = uint2(userData.sourceOffset + threadId.x, userData.sourceSlice);
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (uint4)value;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void AgcTexCpy1DCSS2F(uint3 threadId : SV_DispatchThreadID, STexCpy1DS2F userData : SV_UserData)
+{
+    if (threadId.x < userData.region)
+    {
+        const uint2 targetCoord = uint2(userData.targetOffset + threadId.x, userData.targetSlice);
+        const uint2 sourceCoord = uint2(userData.sourceOffset + threadId.x, userData.sourceSlice);
+        const int4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (float4)value;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void AgcTexCpy1DCSU2F(uint3 threadId : SV_DispatchThreadID, STexCpy1DU2F userData : SV_UserData)
+{
+    if (threadId.x < userData.region)
+    {
+        const uint2 targetCoord = uint2(userData.targetOffset + threadId.x, userData.targetSlice);
+        const uint2 sourceCoord = uint2(userData.sourceOffset + threadId.x, userData.sourceSlice);
+        const uint4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (float4)value;
+    }
+}
+
+// Copy data between 2D texture(array)s
+[numthreads(8, 8, 1)]
+void AgcTexCpy2DCSRaw(uint3 threadId : SV_DispatchThreadID, STexCpy2DRaw userData : SV_UserData)
+{
+    if (all(threadId.xy < userData.region))
+    {
+        const uint3 targetCoord = uint3(userData.targetOffset + threadId.xy, userData.targetSlice);
+        const uint3 sourceCoord = uint3(userData.sourceOffset + threadId.xy, userData.sourceSlice);
+        const uint4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = value;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void AgcTexCpy2DCSF2F(uint3 threadId : SV_DispatchThreadID, STexCpy2DF2F userData : SV_UserData)
+{
+	if (all(threadId.xy < userData.region))
+	{
+		const uint3 targetCoord = uint3(userData.targetOffset + threadId.xy, userData.targetSlice);
+		const uint3 sourceCoord = uint3(userData.sourceOffset + threadId.xy, userData.sourceSlice);
+		const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+		userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = value;
+	}
+}
+
+[numthreads(8, 8, 1)]
+void AgcTexCpy2DCSF2S(uint3 threadId : SV_DispatchThreadID, STexCpy2DF2S userData : SV_UserData)
+{
+    if (all(threadId.xy < userData.region))
+    {
+        const uint3 targetCoord = uint3(userData.targetOffset + threadId.xy, userData.targetSlice);
+        const uint3 sourceCoord = uint3(userData.sourceOffset + threadId.xy, userData.sourceSlice);
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (int4)value;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void AgcTexCpy2DCSF2U(uint3 threadId : SV_DispatchThreadID, STexCpy2DF2U userData : SV_UserData)
+{
+    if (all(threadId.xy < userData.region))
+    {
+        const uint3 targetCoord = uint3(userData.targetOffset + threadId.xy, userData.targetSlice);
+        const uint3 sourceCoord = uint3(userData.sourceOffset + threadId.xy, userData.sourceSlice);
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (uint4)value;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void AgcTexCpy2DCSS2F(uint3 threadId : SV_DispatchThreadID, STexCpy2DS2F userData : SV_UserData)
+{
+    if (all(threadId.xy < userData.region))
+    {
+        const uint3 targetCoord = uint3(userData.targetOffset + threadId.xy, userData.targetSlice);
+        const uint3 sourceCoord = uint3(userData.sourceOffset + threadId.xy, userData.sourceSlice);
+        const int4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (float4)value;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void AgcTexCpy2DCSU2F(uint3 threadId : SV_DispatchThreadID, STexCpy2DU2F userData : SV_UserData)
+{
+    if (all(threadId.xy < userData.region))
+    {
+        const uint3 targetCoord = uint3(userData.targetOffset + threadId.xy, userData.targetSlice);
+        const uint3 sourceCoord = uint3(userData.sourceOffset + threadId.xy, userData.sourceSlice);
+        const uint4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (float4)value;
+    }
+}
+
+// Copy data between 3D textures.
+[numthreads(4, 4, 4)]
+void AgcTexCpy3DCSRaw(uint3 threadId : SV_DispatchThreadID, STexCpy3DRaw userData : SV_UserData)
+{
+	if (all(threadId < userData.region))
+	{
+		const uint3 targetCoord = userData.targetOffset + threadId;
+		const uint3 sourceCoord = userData.sourceOffset + threadId;
+		const uint4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+		userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = value;
+	}
+}
+
+[numthreads(4, 4, 4)]
+void AgcTexCpy3DCSF2F(uint3 threadId : SV_DispatchThreadID, STexCpy3DF2F userData : SV_UserData)
+{
+    if (all(threadId < userData.region))
+    {
+        const uint3 targetCoord = userData.targetOffset + threadId;
+        const uint3 sourceCoord = userData.sourceOffset + threadId;
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = value;
+    }
+}
+
+[numthreads(4, 4, 4)]
+void AgcTexCpy3DCSF2S(uint3 threadId : SV_DispatchThreadID, STexCpy3DF2S userData : SV_UserData)
+{
+    if (all(threadId < userData.region))
+    {
+        const uint3 targetCoord = userData.targetOffset + threadId;
+        const uint3 sourceCoord = userData.sourceOffset + threadId;
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (int4)value;
+    }
+}
+
+[numthreads(4, 4, 4)]
+void AgcTexCpy3DCSF2U(uint3 threadId : SV_DispatchThreadID, STexCpy3DF2U userData : SV_UserData)
+{
+    if (all(threadId < userData.region))
+    {
+        const uint3 targetCoord = userData.targetOffset + threadId;
+        const uint3 sourceCoord = userData.sourceOffset + threadId;
+        const float4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (uint4)value;
+    }
+}
+
+[numthreads(4, 4, 4)]
+void AgcTexCpy3DCSS2F(uint3 threadId : SV_DispatchThreadID, STexCpy3DS2F userData : SV_UserData)
+{
+    if (all(threadId < userData.region))
+    {
+        const uint3 targetCoord = userData.targetOffset + threadId;
+        const uint3 sourceCoord = userData.sourceOffset + threadId;
+        const int4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (float4)value;
+    }
+}
+
+[numthreads(4, 4, 4)]
+void AgcTexCpy3DCSU2F(uint3 threadId : SV_DispatchThreadID, STexCpy3DU2F userData : SV_UserData)
+{
+    if (all(threadId < userData.region))
+    {
+        const uint3 targetCoord = userData.targetOffset + threadId;
+        const uint3 sourceCoord = userData.sourceOffset + threadId;
+        const uint4 value = userData.pIndirect->source.MipMaps(userData.sourceMip, sourceCoord);
+        userData.pIndirect->target.MipMaps(userData.targetMip, targetCoord) = (float4)value;
+    }
+}
+
+technique AgcNullExport
+{
+	pass p0
+	{
+		VertexShader = AgcQuadVS();
+		PixelShader = AgcEmptyPS();
+	}
+}
+
+technique AgcNullArrayExport
+{
+	pass p0
+	{
+		VertexShader = AgcQuadArrayVS();
+		PixelShader = AgcEmptyPS();
+	}
+}
+
+technique AgcZeroExport
+{
+	pass p0
+	{
+		VertexShader = AgcQuadVS();
+		PixelShader = AgcZeroPS();
+	}
+}
+
+technique AgcZeroArrayExport
+{
+	pass p0
+	{
+		VertexShader = AgcQuadArrayVS();
+		PixelShader = AgcZeroPS();
+	}
+}
+
+technique AgcConstantExport
+{
+	pass p0
+	{
+		VertexShader = AgcQuadVS();
+		PixelShader = AgcConstantPS();
+	}
+}
+
+technique AgcConstantArrayExport
+{
+	pass p0
+	{
+		VertexShader = AgcQuadArrayVS();
+		PixelShader = AgcConstantPS();
+	}
+}
+
+technique AgcMemSet32
+{
+	pass p0
+	{
+		ComputeShader = AgcMemSet32CS();
+	}
+}
+
+technique AgcMemSet128
+{
+	pass p0
+	{
+		ComputeShader = AgcMemSet128CS();
+	}
+}
+
+technique AgcMemCpy
+{
+	pass p0
+	{
+		ComputeShader = AgcMemCpyCS();
+	}
+}
+
+technique AgcTexCpy1DRaw
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy1DCSRaw();
+    }
+}
+
+technique AgcTexCpy1DF2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy1DCSF2F();
+    }
+}
+
+technique AgcTexCpy1DF2S
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy1DCSF2S();
+    }
+}
+
+technique AgcTexCpy1DF2U
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy1DCSF2U();
+    }
+}
+
+technique AgcTexCpy1DS2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy1DCSS2F();
+    }
+}
+
+technique AgcTexCpy1DU2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy1DCSU2F();
+    }
+}
+
+technique AgcTexCpy2DRaw
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy2DCSRaw();
+    }
+}
+
+technique AgcTexCpy2DF2F
+{
+	pass p0
+	{
+		ComputeShader = AgcTexCpy2DCSF2F();
+	}
+}
+
+technique AgcTexCpy2DF2S
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy2DCSF2S();
+    }
+}
+
+technique AgcTexCpy2DF2U
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy2DCSF2U();
+    }
+}
+
+technique AgcTexCpy2DS2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy2DCSS2F();
+    }
+}
+
+technique AgcTexCpy2DU2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy2DCSU2F();
+    }
+}
+
+technique AgcTexCpy3DRaw
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy3DCSRaw();
+    }
+}
+
+technique AgcTexCpy3DF2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy3DCSF2F();
+    }
+}
+
+technique AgcTexCpy3DF2S
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy3DCSF2S();
+    }
+}
+
+technique AgcTexCpy3DF2U
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy3DCSF2U();
+    }
+}
+
+technique AgcTexCpy3DS2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy3DCSS2F();
+    }
+}
+
+technique AgcTexCpy3DU2F
+{
+    pass p0
+    {
+        ComputeShader = AgcTexCpy3DCSU2F();
+    }
+}

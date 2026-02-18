@@ -1,0 +1,325 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+#include "Common.cfi"
+#include "ShadeLib.cfi"
+#include "PostEffectsLib.cfi"
+#include "MotionBlur.cfi"
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = PostProcess;"
+>; 
+
+/// Constants ////////////////////////////
+
+float4x4 currMatReprojection; 
+float4x4 prevMatReprojection; 
+float4 vMotionBlurParams;
+float4 vDirectionalBlur;
+float4 vRadBlurParam;
+float4 vViewportParams;
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Motion Blur
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float4> MoBlur_Targ              : register(t0); 
+Texture2D<float2> MoBlur_Vel               : register(t1);
+Texture2D<float4> MoBlur_VelTiles          : register(t2); 
+
+SamplerState MoBlur_TargSampler            : register(s0); //linearClamp
+SamplerState MoBlur_VelSampler             : register(s1); //pointClamp
+
+float4 MotionBlurPS(vtxOut IN) : SV_Target0 
+{
+	float2 screenTC = MapViewportToRaster(IN.baseTC.xy);
+
+#if %_RT_DEBUG0
+	const bool tileOptimizationDebugVisualization = true;
+#else
+	const bool tileOptimizationDebugVisualization = false;
+#endif
+
+	return float4(ApplyMotionBlur(IN.WPos.xy, IN.baseTC.xy, MoBlur_Targ, MoBlur_TargSampler, MoBlur_Vel, MoBlur_VelSampler, MoBlur_VelTiles, vMotionBlurParams, tileOptimizationDebugVisualization), 0);
+}
+
+technique MotionBlur
+{
+  pass p0
+  {
+    VertexShader = FullscreenTriVS() PostMotionBlurVS;
+    PixelShader = MotionBlurPS() PostMotionBlurPS;
+    CullMode = None;        
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Velocity buffers pre-processing techniques
+
+RWTexture2D<float2> PkVel_Dst                : register(u0);
+RWTexture2D<float4> PkVel_DstMaxVelocityTile : register(u1);
+
+Texture2D<float>  PkVel_DepthTex : register(t0);
+Texture2D<float2> PkVel_VelObj   : register(t1);
+
+SamplerState PkVel_Sampler         : register(s0); //pointClamp
+
+groupshared uint sGroupMaxMotion;
+groupshared uint sGroupMinVelocity;
+
+// Limit velocity by rescaling according to max velocity to retain direction
+float2 rescaleVelocityToMax(float2 velocity, float maxVelocityLen)
+{
+	// Optimized formula to that only requires a single transcendental operation.
+	// See section 2.2 in [0] for naive approach that requires two transcendental: one sqrt() and one rcp().
+	// Compute ratio = max / |V|.
+	// If |V| < max then ratio > 1, which is clamped to 1.
+	// If |V| > max then ratio < 1, which will scale velocity to max.
+	const float invLen = rsqrt(dot(velocity, velocity) + 1e-6f);
+	const float ratioMaxToLength = maxVelocityLen * invLen;
+	velocity *= saturate(ratioMaxToLength);
+
+	return velocity;
+}
+
+#define MB_PACK_VELOCITY_TILE_SIZE 8
+
+// Combines object and camera motion vectors and encodes velocity/depth for motion blur filter.
+// In addition, performs an initial 8x8 max velocity motion downsample using wave-ops/shared-memory to speed up max-velocity motion-tile generation.
+// References:
+// [0] "A Reconstruction Filter for Plausible Motion Blur", McGuire 2012
+[numthreads(MB_PACK_VELOCITY_TILE_SIZE, MB_PACK_VELOCITY_TILE_SIZE, 1)]
+void PackVelocitiesCS(uint3 GroupID : SV_GroupID, uint3 GroupThreadID : SV_GroupThreadID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint2 pixelCoord = GroupID.xy * uint2(MB_PACK_VELOCITY_TILE_SIZE, MB_PACK_VELOCITY_TILE_SIZE) + GroupThreadID.xy;
+	const uint2 outputSize = asuint(vViewportParams.xy);
+
+	const float2 outputSizeRcp = vViewportParams.zw;
+	const float2 screenTC = float2(pixelCoord + 0.5) * outputSizeRcp;
+
+	VelocityTileData tileData;
+
+	// =============================================================================================================
+	// Read depth, combine camera + object motion vectors and output full resolution encoded velocity/depth
+	// =============================================================================================================
+
+	// Since we may use some group barriers later we are not allowed to early out any threads here, branch instead
+	const bool isValidPixel = all(pixelCoord < outputSize);
+	if (isValidPixel)
+	{
+		const float depthScaleFactor = vDirectionalBlur.w; // inputTexWidth / outputTexWidth
+		const float deviceDepth = PkVel_DepthTex.Load(int3(outputSize * screenTC * depthScaleFactor, 0));
+
+		// This linear depth is only valid for non-near objects, but near objects read their camera motion from the G-Buffer anyways
+		// WH[DH]: We are not using view constants
+		const float depthLinear = CV_ProjRatio.y / (deviceDepth - CV_ProjRatio.x);
+	
+		float2 velocityObj = PkVel_VelObj.SampleLevel(PkVel_Sampler, screenTC, 0);
+
+		const float motionVectorScale = vMotionBlurParams.x;
+		const float maxVelocity = vMotionBlurParams.y;
+
+		// Camera motion uses a lower velocity limit, instead of scaling the velocity directly.
+		// Must be applied separately before combining with object velocity.
+		const float maxVelocityCam = vMotionBlurParams.z;
+
+		// Most of the time both near objects and objects with per-object velocity are very close together in screen space.
+		// Use wave intrinsics for fast paths when only near objects or only camera velocity is used to skip some ALU.
+		// Saves 0.015ms on Series S.
+		float2 velocity;
+
+		// WH[DH]: Removed motion blur fast path, it does not work well with dynamic objects that do not support motion vectors
+		// Full path: Compute camera velocity, add to per-object velocity and rescale twice, once for camera limit and once for global limit on combined velocity
+		{
+			const float3 posWS = ReconstructWorldPos(pixelCoord, depthLinear, 0);
+			float2 velocityCam = GetCameraVelocity(posWS, currMatReprojection, prevMatReprojection);
+
+			velocityCam *= motionVectorScale;
+			velocityObj *= motionVectorScale;
+
+			velocityCam = rescaleVelocityToMax(velocityCam, maxVelocityCam);
+
+			// Note that near objects currently write both camera and object motion to the velocity texture and the separately computed camera velocity is discarded.
+			// Therefore they do not use the camera velocity limit. That doesn't really matter since they are usually stuck to the camera anyways, e.g. FPS weapons.
+			// Revisit when unifying near/far object velocity handling.
+			velocity = CombineObjectAndCameraVelocity(velocityObj, velocityCam);
+
+			// Limit combined velocity length according to global limit
+			velocity = rescaleVelocityToMax(velocity, maxVelocity);
+		}
+
+		// Apply radial blur
+#if %_RT_SAMPLE0
+		float2 vBlur = vRadBlurParam.xy - screenTC * vDirectionalBlur.zw;
+		vBlur = vBlur * saturate(vRadBlurParam.w - length(vBlur) * vRadBlurParam.z) + vDirectionalBlur.xy;
+		velocity += vBlur;
+#endif
+
+		// Encode and write out result
+		// WH[DH]: We are not using view constants
+		const float2 velocityDepthEncoded = PackLengthAndDepth(velocity, depthLinear, CV_NearFarClipDist.y);
+		PkVel_Dst[pixelCoord] = velocityDepthEncoded;
+
+		tileData.motionEncoded   = EncodeMotionVector8Bit(velocity);
+		tileData.velocityEncoded = velocityDepthEncoded.x;
+	}
+
+	// ============================================================================================================= 
+	// Find motion with maximum velocity and minimum velocity in 8x8 thread group
+	// =============================================================================================================
+
+	// Pack motion and velocity into uint to efficiently find motion with max velocity
+	const uint tileDataPacked = PackMaxVelocityTileDataToUint(tileData);
+
+	// Separately compute tile min velocity
+	const uint velocityEncodedUint = uint(tileData.velocityEncoded * 255.0 + 0.5) & 0xFF;
+
+	// First find min/max inside wave
+	uint maxTileMotionWave;
+	uint minTileVelocityWave;
+	if (isValidPixel)
+	{
+		maxTileMotionWave   = WaveActiveMax(tileDataPacked);
+		minTileVelocityWave = WaveActiveMin(velocityEncodedUint);
+	}
+
+	uint maxTileMotion   = maxTileMotionWave;
+	uint minTileVelocity = minTileVelocityWave;
+
+	const bool isFirstThreadInGroup = GroupIndex == 0;
+
+	// For wave sizes < 64 we have to go through shared memory to get the final result
+	if (WaveGetLaneCount() < 64)
+	{
+		if (isFirstThreadInGroup)
+		{
+			sGroupMaxMotion   = 0;
+			sGroupMinVelocity = 0xFFFFFFFF;
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// First lane per wave performs atomic max
+		const bool anyValidPixelsInWave = WaveActiveAnyTrue(isValidPixel);
+		if (anyValidPixelsInWave && WaveIsFirstLane())
+		{
+			InterlockedMax(sGroupMaxMotion,   maxTileMotionWave);
+			InterlockedMin(sGroupMinVelocity, minTileVelocityWave);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		// Only first thread in group needs to read result from shared memory
+		if (isFirstThreadInGroup)
+		{
+			maxTileMotion   = sGroupMaxMotion;
+			minTileVelocity = sGroupMinVelocity;
+		}
+	}
+
+	// First thread in group writes tile result
+	if (isFirstThreadInGroup)
+	{
+		const VelocityTileData maxVelocityTileData = UnpackMaxVelocityTileDataFromUint(maxTileMotion);
+		const float minTileVelocityFloat = minTileVelocity * rcp(255.0);
+		PkVel_DstMaxVelocityTile[GroupID.xy] = float4(maxVelocityTileData.motionEncoded, maxVelocityTileData.velocityEncoded, minTileVelocityFloat);
+	}
+}
+
+technique PackVelocities
+{
+  pass p0
+  {
+    ComputeShader = PackVelocitiesCS() MotionBlurPackVelocitiesCS;
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2D<float4> MB_Tex0 : register(t0);
+
+float4 VelocityTileGenPS(vtxOut IN) : SV_Target0
+{
+	float2 pixelCoords = IN.baseTC.xy * vMotionBlurParams.xy;
+	float2 dir = vMotionBlurParams.w == 0 ? float2(1, 0) : float2(0, 1);
+	float4 tileData = MB_Tex0.Load(int3(pixelCoords, 0));
+	float3 maxVel = tileData.xyz;
+	float  minVel = tileData.a;
+
+	const float maxSrcIndex = (vMotionBlurParams.w == 0 ? vMotionBlurParams.x : vMotionBlurParams.y) - 1.0;
+	const float startIndex  =  vMotionBlurParams.w == 0 ? pixelCoords.x       : pixelCoords.y;
+
+	// Ensure we do not sample outside of the source image
+	const float sampleCount = min(vMotionBlurParams.z, maxSrcIndex - startIndex);
+
+	for (float i = 0; i < sampleCount; i += 1.0f)
+	{
+		float4 tileData = MB_Tex0.Load(int3(pixelCoords + i * dir, 0));
+		if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+		minVel = min(minVel, tileData.a);
+	}
+	
+	return float4(maxVel, minVel);
+}
+
+technique VelocityTileGen
+{
+  pass p0
+  {
+    VertexShader = FullscreenTriVS();
+    PixelShader = VelocityTileGenPS();
+    CullMode = None;        
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+Texture2D<float4> VTileN_VelTile             : register(t0); 
+SamplerState VTileN_Sampler                  : register(s0); //pointClamp
+
+
+float4 VelocityTileNeighborhoodPS(vtxOut IN) : SV_Target0
+{
+	float4 tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2(0, 0) * vMotionBlurParams.xy);
+	float3 maxVel = tileData.xyz;
+	float  minVel = tileData.w;
+
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2( 0, -1) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2(-1,  0) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2( 1,  0) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2( 0,  1) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2(-1, -1) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2( 1, -1) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2(-1,  1) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+	tileData = GetTexture2D(VTileN_VelTile, VTileN_Sampler, IN.baseTC.xy + float2( 1,  1) * vMotionBlurParams.xy);
+	if (tileData.b > maxVel.b) maxVel = tileData.xyz;
+	minVel = min(minVel, tileData.a);
+
+	return float4(maxVel, minVel);
+}
+
+technique VelocityTileNeighborhood
+{
+  pass p0
+  {
+    VertexShader = FullscreenTriVS();
+    PixelShader = VelocityTileNeighborhoodPS();
+    CullMode = None;        
+  }
+}

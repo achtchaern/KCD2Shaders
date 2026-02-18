@@ -1,0 +1,192 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Color grading/charts tex lookup
+void TexColorChart2D(in Texture2D<min16float4> chartTex, in SamplerState chartSampler, inout min16float3 cImage)
+{
+    const min16float chartDim = 16.0;
+    const min16float3 scale = min16float3(chartDim - 1.0, chartDim - 1.0, chartDim - 1.0) / chartDim;
+    const min16float3 bias = min16float3(0.5, 0.5, 0.0) / chartDim;
+
+	//cImage = float3(0.5, 1.0, 4.0 / chartDim); // debug lookup color to test addressing of "unwrapped" chart slices
+	
+    min16float3 lookup = saturate(cImage) * scale + bias;
+	
+	// convert input color into 2d color chart lookup address 
+    min16float slice = lookup.z * chartDim;
+    min16float sliceFrac = frac(slice);
+    min16float sliceIdx = slice - sliceFrac;
+	
+    lookup.x = (lookup.x + sliceIdx) / chartDim;
+	
+ 	// lookup adjacent slices
+    min16float3 col0 = GetTexture2D(chartTex, chartSampler, lookup.xy).rgb;
+    lookup.x += min16float(1.) / chartDim;
+    min16float3 col1 = GetTexture2D(chartTex, chartSampler, lookup.xy).rgb;
+
+	// linearly blend between slices 	 	
+    cImage = col0 + (col1 - col0) * sliceFrac;
+ 	//cImage = sliceFrac;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define LIGHT_UNIT_SCALE min16float(10000)
+
+min16float ComputeExposure(min16float fIlluminance, min16float4 hdrEyeAdaptation)
+{
+	// Compute EV with ISO 100 and standard camera settings
+    min16float EV100 = log2(fIlluminance * LIGHT_UNIT_SCALE * min16float(100.0 / 330.0));
+	
+	// Apply automatic exposure compensation based on scene key
+    EV100 -= ((clamp(log10(fIlluminance * LIGHT_UNIT_SCALE + 1), min16float(0.1), min16float(5.2)) - min16float(3.0)) * min16float(.5)) * hdrEyeAdaptation.z;
+	
+	// Clamp EV
+	EV100 = clamp(EV100, hdrEyeAdaptation.x, hdrEyeAdaptation.y) - hdrEyeAdaptation.w; // WH[Owlcat/Kazakov]: Added extra control (.w) because hdrEyeAdaptation.z does not work as expected
+	
+	// Compute maximum luminance based on Saturation Based Film Sensitivity (ISO 100, lens factor q=0.65)
+    min16float maxLum = min16float(1.2) * exp2(EV100) / LIGHT_UNIT_SCALE;
+	
+    return min16float(1.0) / maxLum;
+}
+
+min16float ComputeExposureFromLuminance(min16float fLuminance, min16float4 hdrEyeAdaptation)
+{
+	// Compute EV with ISO 100 and standard camera settings
+    const min16float d = log2(LIGHT_UNIT_SCALE);
+    min16float EV100 = log2(fLuminance * min16float(100.0 / 12.5));
+		
+	// Apply automatic exposure compensation based on scene key
+    EV100 -= ((clamp(log10(fLuminance * LIGHT_UNIT_SCALE + 1), min16float(0.1), min16float(5.2)) - min16float(3.0)) * min16float(.5)) * hdrEyeAdaptation.z;
+	
+	// Clamp EV
+    EV100 = clamp(EV100 + d, min16float(hdrEyeAdaptation.x), min16float(hdrEyeAdaptation.y)) - d;
+	
+	// Compute maximum luminance based on Saturation Based Film Sensitivity (ISO 100, lens factor q=0.65)
+    return min16float(1.0 / 1.2) / exp2(EV100);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+min16float3 FilmMappingACEs(
+	in min16float3 cScene,
+	in min16float fExposure )
+{
+	// Apply exposure
+	min16float3 cColor = fExposure * cScene;
+	
+	// Tonemap (ACES Filmic Curve, fitted by K. Narkowicz)
+	cColor = saturate((cColor * (2.51 * cColor + 0.03)) / (cColor * (2.43 * cColor + 0.59) + 0.14));
+	
+	return cColor;
+}
+
+min16float3 FilmMapping(
+	in min16float3 cScene,
+	in min16float fExposure,
+	in min16float4 hdrColorBalance,
+	in min16float4 hdrFilmCurve )
+{
+	// Apply exposure
+	min16float3 cColor = fExposure * cScene;
+
+	// HDR color grading
+	min16float fLuminance = GetLuminance(cColor);
+	cColor = fLuminance + hdrColorBalance.a * ( cColor - fLuminance );	// saturation
+	cColor *= hdrColorBalance.rgb;	// color balance
+
+	// Filmic response curve as proposed by J. Hable
+	min16float4 c = min16float4(max(cColor, 0), hdrFilmCurve.w);
+	
+	const min16float 
+		ShoStren  = 0.22 * hdrFilmCurve.x,
+		LinStren  = 0.3  * hdrFilmCurve.y,
+		LinAngle  = 0.1, 
+		ToeStren  = 0.2,
+		ToeNum    = 0.01 * hdrFilmCurve.z,
+		ToeDenom  = 0.3;
+		
+	min16float4 compressedCol = 
+		(
+			(c * (float(ShoStren) * c + LinAngle*LinStren) + ToeStren*ToeNum) / 
+			(c * (float(ShoStren) * c + LinStren)          + ToeStren*ToeDenom)
+		) -                                          (ToeNum/ToeDenom);
+		
+	cColor = saturate(compressedCol.rgb / compressedCol.w);
+	
+	return cColor;
+}
+
+min16float3 FilmMappingWithEffects(
+	in min16float3 cScene,
+	in min16float3 cBloom,
+	in min16float fExposure,
+	in min16float fVignetting,
+	in min16float3 hdrBloomColor,
+	in min16float4 hdrColorBalance,
+	in min16float4 hdrFilmCurve )
+{
+	min16float3 cColor = fVignetting * lerp(cScene, cBloom, saturate(hdrBloomColor));
+
+	cColor = FilmMapping(
+		cColor,
+		fExposure,
+		hdrColorBalance,
+		hdrFilmCurve);
+	
+	return cColor;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void ApplyRandomDithering(inout min16float3 color, float2 uv)
+{
+	// Apply dithering in sRGB space to minimize quantization artifacts
+	// Use a triangular distribution which gives a more uniform noise by avoiding low-noise areas
+	float3 rndValue = NRand3(uv) + NRand3(uv + 0.5789) - 0.5;
+	color += 0.5f * rndValue / 255.0;
+}
+
+void ApplyOrderedDithering(inout min16float3 color, int2 uv)
+{
+	// Get values from -15.5/32 to 15.5/32 (~-0.5f to ~0.5f)
+	float fThresholdR = GetDissolveThreshold17(uv + int2(0, 0)) - 0.5f * (15.0f / 16);
+	float fThresholdG = GetDissolveThreshold17(uv + int2(0, 1)) - 0.5f * (15.0f / 16);
+	float fThresholdB = GetDissolveThreshold17(uv + int2(0, 2)) - 0.5f * (15.0f / 16);
+
+	// Add dithering below 10bit range (we convert from HDR to 10bit)
+	// NOTE: with R11G11B10F we could add dither below the 6bit mantissa instead
+	color.r = saturate(color.r + fThresholdR * (1.0f / 1024.0f));
+	color.g = saturate(color.g + fThresholdG * (1.0f / 1024.0f));
+	color.b = saturate(color.b + fThresholdB * (1.0f / 1024.0f));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+min16float CompressLogLuminance(min16float3 vSample, min16float2 log2MinMaxLuminance)
+{
+	const min16float minValue = log2MinMaxLuminance.x;
+	const min16float rngValue = log2MinMaxLuminance.y;
+
+	min16float linScale = all(isfinite(vSample)) ? GetLuminance(vSample) : min16float(0.0f);
+	min16float logScale = log2(linScale + min16float(1.0f));
+	
+	return (logScale - minValue) * rcp(rngValue) + min16float(0.5f / 255.0f);
+}
+
+min16float RestoreLogLuminance(min16float val, min16float2 log2MinMaxLuminance)
+{
+	const min16float minValue = log2MinMaxLuminance.x;
+	const min16float rngValue = log2MinMaxLuminance.y;
+	
+	min16float logScale = (val * rngValue) + minValue;
+	min16float linScale = exp2(logScale) - min16float(1.0f);
+	
+	return linScale;
+}

@@ -1,0 +1,132 @@
+
+
+// Permutations
+//----------------------------------------------------------------------------------------------------------------------------------------------
+//FFX_FSR2_OPTION_HDR_COLOR_INPUT                      // HDR Display output
+//FFX_FSR2_OPTION_APPLY_SHARPENING                     // Apply sharpening filter
+//FFX_HALF                                             // Use 16-bit precision
+//FFX_FSR2_OPTION_LOW_RESOLUTION_MOTION_VECTORS        // Provide motion vectors in render resolution
+//FFX_FSR2_OPTION_JITTERED_MOTION_VECTORS              // Provide motion vectors as jittered
+//FFX_FSR2_OPTION_INVERTED_DEPTH                       // Use Reverse-Depth
+//FFX_FSR2_OPTION_REPROJECT_USE_LANCZOS_TYPE           // Use either reference (0) or LUT (1)
+//----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+// typdefs
+//------------------------------------------------
+#define FfxBoolean bool
+// TODO: HALF PRECISION DOESNT WORK YET, SEE IF NECESSARY ?
+#ifdef FFX_HALF
+#define FfxFloat16 float16_t
+#define FfxFloat16x2 float16_t2
+#define FfxFloat16x3 float16_t3
+#define FfxFloat16x4 float16_t4
+
+#define FfxUInt16 uint16_t
+#define FfxUInt16x2 uint16_t2
+#define FfxUInt16x3 uint16_t3
+#define FfxUInt16x4 uint16_t4
+
+#define FfxInt16 int16_t
+#define FfxInt16x2 int16_t2
+#define FfxInt16x3 int16_t3
+#define FfxInt16x4 int16_t4
+
+#define FFX_MIN16_F float16_t
+#define FFX_MIN16_F2 vector<float16_t, 2>
+#define FFX_MIN16_F3 vector<float16_t, 3>
+#define FFX_MIN16_F4 <float16_t, 4>
+
+#define FFX_MIN16_I int16_t
+#define FFX_MIN16_I2 vector<int16_t, 2>
+#define FFX_MIN16_I3 vector<int16_t, 3>
+#define FFX_MIN16_I4 vector<int16_t, 4>
+
+#define FFX_MIN16_U uint16_t
+#define FFX_MIN16_U2 vector<uint16_t, 2>
+#define FFX_MIN16_U3 <uint16_t, 3>
+#define FFX_MIN16_U4 vector<uint16_t, 4>
+
+#define FFX_F16_t float16_t
+#define FFX_F16_t2 vector<float16_t, 2>
+#define FFX_F16_t3 vector<float16_t, 3>
+#define FFX_F16_t4 vector<float16_t, 4>
+
+#define FFX_I16_t int
+#define FFX_I16_t2 vector<int16_t, 2>
+#define FFX_I16_t3 vector<int16_t, 3>
+#define FFX_I16_t4 vector<int16_t, 4>
+
+#define FFX_U16_t uint16_t
+#define FFX_U16_t2 vector<uint16_t, 2>
+#define FFX_U16_t3 vector<uint16_t, 3>
+#define FFX_U16_t4 vector<uint16_t, 4>
+
+#else
+
+#define FfxFloat32 float
+#define FfxFloat32x2 float2
+#define FfxFloat32x3 float3
+#define FfxFloat32x4 float4
+
+#define FfxUInt32 uint
+#define FfxUInt32x2 uint2
+#define FfxUInt32x3 uint3
+#define FfxUInt32x4 uint4
+
+#define FfxInt32 int
+#define FfxInt32x2 int2
+#define FfxInt32x3 int3
+#define FfxInt32x4 int4
+
+#define FFX_MIN16_F float
+#define FFX_MIN16_F2 float2
+#define FFX_MIN16_F3 float3
+#define FFX_MIN16_F4 float4
+
+#define FFX_MIN16_I int
+#define FFX_MIN16_I2 int2
+#define FFX_MIN16_I3 int3
+#define FFX_MIN16_I4 int4
+
+#define FFX_MIN16_U uint
+#define FFX_MIN16_U2 uint2
+#define FFX_MIN16_U3 uint3
+#define FFX_MIN16_U4 uint4
+
+#define FFX_F16_t float
+#define FFX_F16_t2 float2
+#define FFX_F16_t3 float3
+#define FFX_F16_t4 float4
+
+#define FFX_I16_t int
+#define FFX_I16_t2 int2
+#define FFX_I16_t3 int3
+#define FFX_I16_t4 int4
+
+#define FFX_U16_t uint
+#define FFX_U16_t2 uint2
+#define FFX_U16_t3 uint3
+#define FFX_U16_t4 uint4
+
+#endif
+//------------------------------------------------
+
+
+
+// Static const
+//------------------------------------------------
+#define FSR2_EPSILON 1e-03f
+#define FSR2_TONEMAP_EPSILON 1e-03f
+#define FSR2_FLT_MAX 3.402823466e+38f
+#define FSR2_FLT_MIN 1.175494351e-38f
+
+#define reconstructedDepthBilinearWeightThreshold 0.05f
+#define averageLanczosWeightPerFrame 0.74f
+#define accumulationMaxOnMotion 4.0f
+#define resetAutoExposureAverageSmoothing 1e8f
+#define DepthClipBaseScale 4.0f
+#define iLanczos2SampleCount 16
+
+#define rgb2y FfxFloat32x3(0.2126, 0.7152, 0.0722)
+//------------------------------------------------
