@@ -1609,7 +1609,7 @@ void InjectCloudDensityAndShadowCS(uint3 GroupID : SV_GroupID,
 	const float cloudAltitude = vc.cloudGenParams.x;
 	const float cloudThickness = vc.cloudGenParams.y;
 	const float cloudiness = vc.cloudGenParams.z;
-	//const float upsamplingScale = 1.0f;
+	//const float upsamplingScale = vc.cloudGenParams.w;
 	//const float scatterCoefficient = vc.cloudRenderParams.x;
 	const float extinctionCoefficient = vc.cloudRenderParams.y;
 	const float shadingLODThreshold = vc.cloudRenderParams.w;
