@@ -730,6 +730,13 @@ float4 ConeTraceTreeAndSkyEx(
 	// WH[LH] nonfunctional underground leak fix deleted
 #endif
 
+	// --- AO reduction in dark environments ---
+	float ao = saturate(vC.a);
+	float envLuma = dot(vC.xyz, float3(0.299, 0.587, 0.114)); // GI brightness
+	float aoEnvScale = saturate((envLuma - 0.02) / 0.25);     // darker -> less AO
+	ao *= aoEnvScale;
+	// ---------------------------------------
+
 	//float3 vAOTint = lerp(float3(1,1,1), float3(1.5, 1.5, 0), saturate((vC.a-.3)/.7));
 	vC.xyz = vC.xyz * fCloudsShadow + GetSkyColor(r.direction, fConeSev) * (saturate(1 - vC.a)) * bAllowSkyLight * (fCloudsShadow * 0.2 + 0.8);
 	vC.xyz = lerp((vC.x + vC.y + vC.z) / 3, vC.xyz, fConesColorSatur);
@@ -1038,8 +1045,8 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
 	float2 vR = 2.f * fResScale / (int2(PS_ScreenSize.xy / fResScale) * fResScale);
 	float fSumm0 = 0;
 	float fSumm1 = 0;
-	float fDepthRange = 0.12 + 0.08 * saturate(1.f - dot(normalize(IN.CamVec.xyz), -vNor0)); // floor fix
-	float fDotMax = .25;
+	float fDepthRange = 0.10 + 0.06 * saturate(1.f - dot(normalize(IN.CamVec.xyz), -vNor0)); // tighter = less leak
+	float fDotMax = .32; // tighter normal rejection
 
 	float2 vShift;
 	if (IsDiffuseMode())
@@ -1079,17 +1086,17 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
 			float3 vNorm = texALD.xyz; // WH[TBa]: implicit truncation of vector type, KCD2-448804
 
 			float fDistW = saturate(fRangeFade - sqrt(x * x + y * y) / max(1, nRange / 2));
-
-			float fDotTest = lerp(.25, saturate(fAverTransmittanceY * 4 + dot(normalize(vNorm), vFocus) - fDotMax), saturate(length(vNorm) / max(0.0001, texALD.w) * 8.f)) + .001;
-
-			float fDepTest0 = saturate((fDepthRange - abs(1.f - fNewDepth / fDepthMin)) * 4) + .001;
-			float fDepTest1 = saturate((fDepthRange - abs(1.f - fNewDepth / fDepthMax)) * 4) + .001;
+			
+			float fDotTest = lerp(.20, saturate(fAverTransmittanceY * 4 + dot(normalize(vNorm), vFocus) - fDotMax), saturate(length(vNorm) / max(0.0001, texALD.w) * 8.f)) + .001;
+			fDotTest *= fDotTest; // sharpen normal gating
+			float fDepTest0 = saturate((fDepthRange - abs(1.f - fNewDepth / fDepthMin)) * 5) + .001;
+			float fDepTest1 = saturate((fDepthRange - abs(1.f - fNewDepth / fDepthMax)) * 5) + .001;
 
 			float fWeigth0 = fDepTest0 * fDotTest * fDistW;
 			float fWeigth1 = fDepTest1 * fDotTest * fDistW;
 
-			fWeigth0 = lerp(.015f, fWeigth0, saturate(texALD.w * 1000));
-			fWeigth1 = lerp(.015f, fWeigth1, saturate(texALD.w * 1000));
+			fWeigth0 = lerp(.010f, fWeigth0, saturate(texALD.w * 1000));
+			fWeigth1 = lerp(.010f, fWeigth1, saturate(texALD.w * 1000));
 
 			vALD0 += texALD * fWeigth0;
 			vRGB0 += texRGB * fWeigth0;
@@ -1216,7 +1223,7 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
 		#else
 		OUT.Specular *= saturate(1 - vC.w);
 		#endif
-
+	
 		if (!bSameMinMaxDepth)
 		{
 			r.direction = normalize(OUT.Specular1.xyz);
@@ -1225,12 +1232,6 @@ pixoutMRTDemosaic DemosaicPS(vtxOutWPOS IN)
 			vC = 0;
 			ProcessAnalyticalOccluders(VOX_POST_AO_MAX_DIST, r, vC, IsDiffuseMode() ? fDirectionality : pow(fAverSmoothness, .5), true);
 		}
-
-		#if %_RT_LIGHTVOLUME1 && %_RT_LIGHTVOLUME0
-		OUT.Specular1 *= saturate(1 - vC.w * 0.5);
-		#else
-		OUT.Specular1 *= saturate(1 - vC.w);
-		#endif
 	}
 	#endif
 
@@ -1586,12 +1587,11 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 			bool bRotate = dot(vFocus, float3(0, 0, 1)) > -0.999f;
 			float3 kernOpa = GetDiffuseKernel(GI_DIFFUSE_KERNEL_TILING, i + s * nGiDiffuseSampleNum / nFramesNum / nPassesNum, false);
 
-			if (nFramesNum == 2) // TODO: use rotation instead of flip
+			// Rotate kernel in tangent plane instead of flip (better temporal supersampling)
 			{
-				if (int(SVO_FrameIdByte.x / 2) & 1)
-					kernOpa.x = -kernOpa.x;
-				if (int(SVO_FrameIdByte.x / 2) & 2)
-					kernOpa.y = -kernOpa.y;
+				half2x2 mSampleRotMat = 0;
+				GetRndRotationMat(vPos0 + SVO_FrameIdByte.x, vFocus, mSampleRotMat);
+				kernOpa.xy = mul(kernOpa.xy, mSampleRotMat);
 			}
 
 			kernOpa.z -= SvoParamsCommon.y;
@@ -1600,7 +1600,7 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 				kernOpa = normalize(mul(normalize(kernOpa), rotMat));
 			else
 				kernOpa = normalize(float3(kernOpa.x, kernOpa.y, -kernOpa.z));
-
+	
 #if %_RT_NO_TESSELLATION
 			if (IsDiffuseMode())
 				kern = lerp(kernOpa, kern, saturate(fAverTransmittanceY * 4));
@@ -1681,7 +1681,13 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		const bool bUseRT = false;
 // #endif
 
-		vC = ConeTraceTreeAndSky(fRayLen, r, SvoParamsDiffuse.x + power / 10000, SvoParamsInject.z, bUseRT ? 1 : 0, false, false, bUseRT ? float3(0, 0, 0) : normalize(vNor0));
+	float fConeSev = SvoParamsDiffuse.x;
+	if (IsDiffuseMode())
+		fConeSev = lerp(fConeSev * 0.55f, fConeSev, saturate(fAverSmoothness * 1.25f));
+	else
+		fConeSev = lerp(fConeSev * 0.70f, fConeSev, saturate(fAverSmoothness));
+
+	vC = ConeTraceTreeAndSky(fRayLen, r, fConeSev + power / 10000, SvoParamsInject.z, bUseRT ? 1 : 0, false, false, bUseRT ? float3(0, 0, 0) : normalize(vNor0));
 
 #if %_RT_NO_TESSELLATION
 		vC *= lerp(1.f, SvoParamsInject.w, saturate(fAverTransmittanceY * 8));
@@ -2599,8 +2605,8 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 {
 	pixoutMRTUpscale OUT = (pixoutMRTUpscale)0;
 
-	const float fDepthRange = .12;
-	const float fDotMax = .20;
+	const float fDepthRange = .10;
+	const float fDotMax = .28;
 	const float fDepthC = SampleLinearDepth(sceneDepth, IN.baseTC.xy);
 	const float fDepthClampMin = 4.f / PS_NearFarClipDist.y;
 	float fTransmittanceY = 0;
@@ -2696,6 +2702,17 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 		fShadowSvoFin /= vRGB.w;
 	}
 
+	// Edge-aware unsharp mask to boost GI detail (no extra samples)
+	{
+		float3 center = tex2DlodLC(sceneRgbMin, IN.baseTC.xy).xyz; // center low-res GI
+		float3 blur = vRGB.xyz;
+		float3 sharp = center + (center - blur) * 0.6f;
+
+		// only sharpen if normals/depth agree (avoid halos)
+		float fSharpenGate = saturate(1.0 - abs(1.0 - SampleLinearDepth(sceneDepth, IN.baseTC.xy) / max(0.0001, vRGB.w)));
+		vRGB.xyz = lerp(blur, sharp, fSharpenGate);
+	}
+
 	// copmute lighting
 	float fDirIntens = max(0, length(vALD.xyz)) * saturate(1 - fTransmittanceY);
 
@@ -2737,6 +2754,18 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 	OUT.Diffuse.rgb += SvoParamsCommon.z;
 #endif
 
+	// ---- Color-preserving AO tint (always active path) ----
+	{
+		// Use occlusion already encoded in vALD.w as AO estimate
+		float ao = saturate(1.0 - saturate(vALD.w / max(0.001, fIntensity + vALD.w)));
+		ao = pow(ao, 0.85);
+
+		float3 surfColor = saturate(tex2DlodPC(sceneDiffuseFin, IN.baseTC.xy).rgb);
+		float3 aoTint = lerp(float3(1, 1, 1), surfColor, 0.7);
+
+		OUT.Diffuse.rgb *= lerp(float3(1, 1, 1), aoTint, ao * 0.99);
+	}
+
 	OUT.Diffuse.w = fDepthC;
 
 	float3 vReprojTC = Reproject(IN.baseTC.xy, fDepthC, SVO_ReprojectionMatrix);
@@ -2746,12 +2775,14 @@ pixoutMRTUpscale UpScalePS(vtxOutWPOS IN)
 
 	float fBlend = GetBlendMin(vReprojTC.xy, IN.baseTC.xy, fAverSmoothness, fDepthC, valPrev.w);
 
-	// detect high contrast difference
+	// More current-frame detail on depth change
+	fBlend += saturate(abs(fDepthC - valPrev.w) * PS_NearFarClipDist.y * 0.75);
+
 	float fDiff = dot(abs(1.f - OUT.Diffuse.xyz / valPrev.xyz), min16float3(0.33f, 0.33f, 0.33f));
 	if (fDiff > 0)
-		fBlend += (1.f - fBlend) * saturate(fDiff * 3);
+		fBlend += (1.f - fBlend) * saturate(fDiff * 4);
 
-	OUT.Diffuse = clamp(lerp(valPrev, OUT.Diffuse, fBlend), 0, 8);
+	OUT.Diffuse = clamp(lerp(valPrev, OUT.Diffuse, saturate(fBlend)), 0, 8);
 
 #if %_RT_REVERSE_DEPTH
 	if (IsDiffuseMode())
