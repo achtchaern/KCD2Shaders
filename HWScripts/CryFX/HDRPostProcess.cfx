@@ -345,7 +345,7 @@ min16float3 HDRComposition(in min16float3 cScene, in min16float3 cBloom, in min1
 	// Increase min EV -> limit brightening in dark scenes
 	// Increase max EV -> allow darker exposure for bright scenes
 	min16float4 eye = min16float4(HDREyeAdaptation);
-	eye.x += 0.4h; // raise min EV (less brightening)
+	eye.x -= 0.1h; // raise min EV (less brightening)
 	eye.y += 0.8h; // raise max EV (more darkening)
 
 	fExposure = ComputeExposure(vAdaptedLum.y, eye);
@@ -354,7 +354,7 @@ min16float3 HDRComposition(in min16float3 cScene, in min16float3 cBloom, in min1
 	// DR tuning: lift shadows + compress highlights (no exposure bias)
 	const min16float kShadowLift = 0.00h;           // 0..1: stronger shadow lift
 	const min16float kShadowGamma = 1.0h;          // < 1.0: lifts darks
-	const min16float kHighlightCompression = 0.00h; // 0..1: stronger highlight roll-off
+	const min16float kHighlightCompression = 0.23h; // 0..1: stronger highlight roll-off
 
 	min16float3 cColor = fVignetting * fExposure * lerp(cScene, cBloom, saturate(HDRBloomColor));
 
