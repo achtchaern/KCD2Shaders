@@ -221,15 +221,67 @@ float4 CalcShadowSpace(float4 HPos)
   return P0;
 }
 
+// --- new: deterministic 5x5 Gaussian PCF (real blur, no duplicate ghosts)
+min16float Gaussian5x5PCF(float4 P0, float2 kernelRadius, ShadowSamplingContext samplingContext, bool bContactHardening)
+{
+	float2 texel = c_ShadowMaskConstants.vInvShadowMapSize.xy;
+
+	// scale radius by depth for a soft contact-hardening feel
+	float depthScale = bContactHardening ? saturate(P0.z) : 1.0;
+	float r = max(1.0h, kernelRadius.x * lerp(0.6h, 1.6h, depthScale));
+	float2 step = texel * r;
+
+	float sum = 0.0;
+	float wsum = 0.0;
+
+	[unroll] for (int y = -2; y <= 2; ++y)
+	{
+		float wy = (abs(y) == 0) ? 6.0 : (abs(y) == 1 ? 4.0 : 1.0);
+		[unroll] for (int x = -2; x <= 2; ++x)
+		{
+			float wx = (abs(x) == 0) ? 6.0 : (abs(x) == 1 ? 4.0 : 1.0);
+			float w = wx * wy;
+
+			float4 P = P0;
+			P.xy = saturate(P.xy + float2(x, y) * step);
+
+			min16float s = 1;
+			shadow_sample(shadowDepthTex, samplingContext.comparisonSampler, P, s);
+
+			sum += s * w;
+			wsum += w;
+		}
+	}
+
+	return (min16float)(sum / wsum);
+}
+
+// --- new helpers: per‑pixel hash + rotation (stabilizes blur, removes axial repetition)
+float Hash12(float2 p)
+{
+	float3 p3 = frac(float3(p.xyx) * 0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float2 Hash22(float2 p)
+{
+	float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+	p3 += dot(p3, p3.yzx + 33.33);
+	return frac((p3.xx + p3.yz) * p3.zy);
+}
+
+float2 Rotate2D(float2 v, float a)
+{
+	float s = sin(a);
+	float c = cos(a);
+	return float2(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
 
 min16float CalcShadow(float4 vShPos, float2 vNoisePos, const bool bContactHardening)
 {
   float4 P0 = vShPos;
-
-//scale for noise projecton should be computed based on the size of shadow frustums(increase if it's bigger) 
-//and distance to viewer((decrease if it's father)) 
-
-	float2 NoiseP = vNoisePos.xy;
 
 	min16float fInShadow = 1;
 
@@ -239,16 +291,12 @@ min16float CalcShadow(float4 vShPos, float2 vNoisePos, const bool bContactHarden
 	samplingContext.pointSamplerWrap  = ssShadowPointWrap;
 	samplingContext.noiseTex          = noiseTex;
 
-	IrregularFilterKernel filterKernel;
-	filterKernel.taps           = c_ShadowMaskConstants.irreg_kernel_2d;
-	// WH[TBa]: implicit truncation of vector type, KCD2-448804
-	filterKernel.scale          = GetShadowQuality() == QUALITY_LOW ? float2(1.1f,1.1f) : c_ShadowMaskConstants.fKernelRadius.xy;
-	filterKernel.noiseLookupPos = NoiseP.xy * (filterKernel.scale.y * 15.h);
-	filterKernel.adaption       = c_ShadowMaskConstants.vAdaption;
+	// Use kernel radius for blur size (still controlled by CVars)
+	float2 kernelRadius = GetShadowQuality() == QUALITY_LOW ? float2(1.1f,1.1f) : c_ShadowMaskConstants.fKernelRadius.xy;
 
 #if %_RT_SHADOW_JITTERING
-      irregular_filter(shadowDepthTex, c_ShadowMaskConstants.vInvShadowMapSize.xx, samplingContext, filterKernel, P0, fInShadow, bContactHardening);
-	  fInShadow = pow(fInShadow,2);
+	// Deterministic Gaussian PCF (true blur, no jitter ghosts)
+	fInShadow = Gaussian5x5PCF(P0, kernelRadius, samplingContext, bContactHardening);
 #else 
 	//debug one-tap sampling
 	shadow_sample(shadowDepthTex, samplingContext.comparisonSampler, P0, fInShadow);
