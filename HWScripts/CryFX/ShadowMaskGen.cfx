@@ -224,10 +224,14 @@ float4 CalcShadowSpace(float4 HPos)
 
 min16float CalcShadow(float4 vShPos, float2 vNoisePos, const bool bContactHardening)
 {
-	float4 P0 = vShPos;
+  float4 P0 = vShPos;
+
+//scale for noise projecton should be computed based on the size of shadow frustums(increase if it's bigger) 
+//and distance to viewer((decrease if it's father)) 
+
 	float2 NoiseP = vNoisePos.xy;
 
-	min16float fInShadow = 1.0h;
+	min16float fInShadow = 1;
 
 	ShadowSamplingContext samplingContext;
 	samplingContext.comparisonSampler = ssShadowComparison;
@@ -237,36 +241,20 @@ min16float CalcShadow(float4 vShPos, float2 vNoisePos, const bool bContactHarden
 
 	IrregularFilterKernel filterKernel;
 	filterKernel.taps           = c_ShadowMaskConstants.irreg_kernel_2d;
-	filterKernel.scale          = (GetShadowQuality() == QUALITY_LOW) ? float2(1.1f, 1.1f) : c_ShadowMaskConstants.fKernelRadius.xy;
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	filterKernel.scale          = GetShadowQuality() == QUALITY_LOW ? float2(1.1f,1.1f) : c_ShadowMaskConstants.fKernelRadius.xy;
+	filterKernel.noiseLookupPos = NoiseP.xy * (filterKernel.scale.y * 15.h);
 	filterKernel.adaption       = c_ShadowMaskConstants.vAdaption;
 
 #if %_RT_SHADOW_JITTERING
-	// Keep radius close to vanilla to avoid "repeated foliage" artifacts.
-	// Only a tiny boost for contact hardening.
-	if (bContactHardening)
-	{
-		filterKernel.scale *= 1.08f;
-	}
-
-	// First estimate
-	filterKernel.noiseLookupPos = NoiseP.xy * (filterKernel.scale.y * 15.0h);
-	min16float s0 = 1.0h;
-	irregular_filter(shadowDepthTex, c_ShadowMaskConstants.vInvShadowMapSize.xx, samplingContext, filterKernel, P0, s0, bContactHardening);
-
-	// Second decorrelated estimate (small extra cost, much better stability)
-	filterKernel.noiseLookupPos = (NoiseP.yx + float2(23.17h, 11.93h)) * (filterKernel.scale.y * 15.0h);
-	min16float s1 = 1.0h;
-	irregular_filter(shadowDepthTex, c_ShadowMaskConstants.vInvShadowMapSize.xx, samplingContext, filterKernel, P0, s1, bContactHardening);
-
-	fInShadow = (s0 + s1) * 0.5h;
-
-	// Gentler than pow(x,2): reduces blotchy dark clumps
-	fInShadow = saturate(fInShadow * (1.10h - 0.10h * fInShadow));
-#else
+      irregular_filter(shadowDepthTex, c_ShadowMaskConstants.vInvShadowMapSize.xx, samplingContext, filterKernel, P0, fInShadow, bContactHardening);
+	  fInShadow = pow(fInShadow,2);
+#else 
+	//debug one-tap sampling
 	shadow_sample(shadowDepthTex, samplingContext.comparisonSampler, P0, fInShadow);
 #endif
 
-	return fInShadow;
+  return fInShadow;
 }
 
 ////////////////////////////////////////////////////////////
@@ -316,25 +304,6 @@ pixout_cl DeferredShadowPS(float4 WPos : SV_POSITION)
 #endif
 
   min16float fInShadow = CalcShadow(P0, NoiseP, bContactHardening);
-
-	#if %_RT_SHADOW_JITTERING
-	// Non-recursive stabilization: no extra shadow map sampling, only tiny local smoothing.
-	// This avoids the recursive breakage you saw.
-	if (bContactHardening)
-	{
-		// Use depth to avoid smoothing across strong geometric edges.
-		float centerDepth = SceneDepth;
-
-		// Recompute 4 neighbors cheaply with CalcShadow is too risky/expensive in this shader path.
-		// So we only apply a tiny confidence-based compression on noisy mid-range:
-		// pull mid values slightly toward local mean proxy (0.5), preserve extremes.
-		min16float t = saturate(1.0h - abs(fInShadow - 0.5h) * 2.0h); // strongest at mid penumbra
-		min16float edgePreserve = saturate(1.0h - abs(ddx(centerDepth)) * 500.0h - abs(ddy(centerDepth)) * 500.0h);
-		min16float k = 0.12h * t * edgePreserve; // small, safe
-
-		fInShadow = lerp(fInShadow, 0.5h, k);
-	}
-	#endif
 
   //gsm fading
 	min16float2 fDist = 2.0*abs(P0.xy-min16float2(0.5,0.5));
