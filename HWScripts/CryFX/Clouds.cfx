@@ -728,9 +728,9 @@ float3 GetOpticalThicknessCombined(in float3 rayOriginWS, in float3 rayDir, in f
 #if !%_RT_SAMPLE5
 	if(rayMarchingShadow)
 	{
-		const float MaxStepRaymarch = 16.0f;
-		const float MaxStepCoarseRaymarch = 6.0f;
-		const float MaxStepCoarseRaymarchSun = 8.0f;
+		const float MaxStepRaymarch = 20.0f;
+		const float MaxStepCoarseRaymarch = 12.0f;
+		const float MaxStepCoarseRaymarchSun = 12.0f;
 
 		bool inShadowTex = false;
 		if(all(shadowTC.xy >= 0.0f) && all(shadowTC.xy <= 1.0f))

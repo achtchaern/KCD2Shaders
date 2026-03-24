@@ -152,35 +152,36 @@ pixout SunShaftsMaskGenPS(vtxOutSunShaftsGen IN)
 
 pixout SunShaftsGenPS(vtxOutSunShaftsGen IN)
 {
-  pixout OUT;
-  OUT.Color = 0.0f;
+    pixout OUT;
+    OUT.Color = 0.0f;
 
-  float2 sunPosProj = cbSunShafts.sunPos.xy;
+    float2 sunPosProj = cbSunShafts.sunPos.xy;
+    float fSign = cbSunShafts.sunPos.w;
 
-	float fSign = cbSunShafts.sunPos.w;
-  
-  float2 sunVec = ( GetScaledScreenTC(sunPosProj.xy) - IN.baseTC.xy)/CV_HPosScale.xy;
-  
-  float fAspectRatio =  1.333 * (CV_ScreenSize.y*CV_HPosScale.x) /(CV_ScreenSize.x*CV_HPosScale.y);
+    float2 sunVec = (GetScaledScreenTC(sunPosProj.xy) - IN.baseTC.xy) / CV_HPosScale.xy;
+    float fAspectRatio = 1.333 * (CV_ScreenSize.y * CV_HPosScale.x) / (CV_ScreenSize.x * CV_HPosScale.y);
 
-	float sunDist = saturate(fSign) * saturate(1.0f - saturate(length(sunVec * float2(1.0f, fAspectRatio)) * cbSunShafts.params.y));
-	float2 sunDir = (GetScaledScreenTC(sunPosProj.xy) - IN.baseTC.xy) * cbSunShafts.params.x * saturate(fSign);
+    float sunDist = saturate(fSign) * saturate(1.0f - saturate(length(sunVec * float2(1.0f, fAspectRatio)) * cbSunShafts.params.y));
 
-	// WH[DH]: Keep the output in linear space to safe performance; the ST2084 encoding does not improve the visuals
-	min16float4 accum = 0; 
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy));
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 1.0f)) * (7.0f/8.0f);
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 2.0f)) * (6.0f/8.0f);
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 3.0f)) * (5.0f/8.0f);
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 4.0f)) * (4.0f/8.0f);
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 5.0f)) * (3.0f/8.0f);
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 6.0f)) * (2.0f/8.0f);
-	accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 7.0f)) * (1.0f/8.0f);
-	accum /= 4.5f; // Normalized with sum of all weights
+    // === Hard-coded controls (tweak these) ===
+    const float INTENSITY    = 0.6f; // overall strength
+    const float LENGTH_SCALE = 1.0f; // 1.0 = vanilla length
 
-	OUT.Color.rgb = accum.rgb * sunDist;
+    float2 sunDir = (GetScaledScreenTC(sunPosProj.xy) - IN.baseTC.xy) * cbSunShafts.params.x * LENGTH_SCALE * saturate(fSign);
 
-	return OUT;
+    min16float4 accum = 0; 
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy));
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 1.0f)) * (7.0f/8.0f);
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 2.0f)) * (6.0f/8.0f);
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 3.0f)) * (5.0f/8.0f);
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 4.0f)) * (4.0f/8.0f);
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 5.0f)) * (3.0f/8.0f);
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 6.0f)) * (2.0f/8.0f);
+    accum += GetTexture2D(SSHFTG_Target, SSHFTG_LCSampler, MapViewportToRaster(IN.baseTC.xy + sunDir.xy * 7.0f)) * (1.0f/8.0f);
+    accum /= 4.5f; // original normalization
+
+    OUT.Color.rgb = accum.rgb * sunDist * INTENSITY;
+    return OUT;
 }
 
 

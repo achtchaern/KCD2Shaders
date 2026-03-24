@@ -390,9 +390,9 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
     // Grazing boost: increases POM only at shallow angles
     const float viewZ = abs(vViewTS.z);
     const float grazing = saturate((0.6 - viewZ) * 2.5); // starts below ~0.6
-    const float pomDisp = mdDisplacement * (1.0 + grazing * 0.95); // max 1.75x
+    const float pomDisp = mdDisplacement * (1.0 + grazing * 0.85); // max 1.75x
 
-    const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, 15, pomDisp, mdHeightBias, blendFac, blendLayer2Tiling);
+    const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, 48, pomDisp, mdHeightBias, blendFac, blendLayer2Tiling);
     IN.baseTC.xy = offsetBest.xy;
   #endif
 #endif

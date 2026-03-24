@@ -169,11 +169,15 @@ float2 HDRSampleLumInitialPS(vtxOut IN) : SV_Target
 #endif
 	{
 		float2 SampleTC = IN.baseTC.xy + sampleOffsets[i];
+
+		// --- SAMPLE ONLY LOWER 70% OF SCREEN ---
+		// compress Y into [0.30 .. 1.00]
+		SampleTC.y = 0.30h + SampleTC.y * 0.70h;
+
 		SampleTC = MapViewportToRaster(SampleTC);
 
 #if  %_RT_SAMPLE1   // Using GBuffer
 	#if !%_RT_SAMPLE0		 
-		// Use base color to get a coarse approximation of the (incoming) illuminance
 		MaterialAttribsCommon attribs = DecodeGBuffer(
 			GetTexture2D(HDRLum_Norm, HDRLum_LClampSampler, SampleTC),
 			GetTexture2D(HDRLum_Diff, HDRLum_LClampSampler, SampleTC),

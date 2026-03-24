@@ -256,7 +256,7 @@ void irregular_filter_impl(Texture2D<min16float4> depthMap, ShadowSamplingContex
     min16float kernelOffset = 0;
     min16float kernelSize = GetShadowSamplesNum() / 2;
 
-	const int kernelStepSize = 2;
+	const int kernelStepSize = 1;
 
 	/////////////////////////////
 	//depth range estimation
