@@ -1,0 +1,1609 @@
+// Copyright 2001-2020 Crytek GmbH / Crytek Group. All rights reserved.
+
+// Common Samplers //////////////////////
+#ifndef SHADELIB_USE_CUSTOM_TEXTURES
+DIFFUSEMAP
+NORMALMAP
+HEIGHTMAP
+SPECULARMAP
+SMOOTHNESSMAP
+DETAILMAP
+SCENEDEPTHMAP
+
+
+
+// Deferred Shading Samplers /////////////
+
+SCENE_NORMALS_MAP
+SCENE_NORMALS_BENT
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+Texture2DMS<float4> sceneDepthTexMS       : TS_ZTargetMS;
+
+min16float4 GetDecodedSceneDepthMS( float2 baseTC, int NumSamples, int nCurrSample ) 
+{
+#if %_RT_MSAA_QUALITY || %_RT_MSAA_QUALITY1
+	int3 vPixCoord = int3( baseTC * PS_ScreenSize.xy, 0);  
+	return GetLinearDepth(sceneDepthTexMS.Load(vPixCoord, nCurrSample).x, true);
+#else
+	return 0;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+struct AreaLightShadingAttribs
+{
+    float4x4 transform;
+    float3 position;
+    float3 lightPos;
+    uint lightArrayIdx;
+		// WH[TBa]: KCD2-73606
+		float2 wallChamfer;
+		float2 windowMargin;
+		float wallThickness;
+};
+
+struct ForwardShadingAttribs
+{
+	min16float2  screenUV;
+	float3  worldPos;
+	min16float3  normal;
+	min16float3  normalSpecProbe;
+	min16float3  reflectance;
+	min16float3  albedo;
+	min16float   smoothness;
+	
+	CustomForwardShadingAttribs  custom;
+    AreaLightShadingAttribs areaAttribs;
+};
+
+// WH[TBa]: keep synced with ETileLightFlagsWH, KCD2-444074
+#define LIGHT_FLAG_SS_SHADOWS_FALLBACK_WH (0)
+#define LIGHT_FLAG_SS_SHADOWS_FALLBACK_MASK_WH (1 << LIGHT_FLAG_SS_SHADOWS_FALLBACK_WH)
+
+struct STiledLightShadeInfo
+{
+	uint      lightType;
+	uint      resIndex;
+	uint      shadowMaskIndex;
+	uint      stencilID;
+	float4    posRad;
+	float4    attenuationParams;  // WH[TBa]: add fadeInRadius (z) and nearClip (w) params, KCD2-81869
+	float2    shadowParams;
+	float2    areaLightWallChamfer; // WH[TBa]: add for KCD2-73606
+	float4    color;
+	float4x4  projectorMatrix;
+	float4x4  shadowMatrix;
+	float2    areaLightWindowMargin; // WH[TBa]: add for KCD2-73606
+	float     areaLightWallThickness; // WH[TBa]: add for KCD2-73606
+	float     volumetricMultiplier; // WH[TBa]: correction for volumetric lighting (fog), KCD2-259576
+	float     giMultiplier; // WH[TBa]: correction for GI/SVOTI, KCD2-328021
+	float     shadowStrength; // WH[TBa]: we can use this to control the amount of shadow, KCD2-411675
+	uint      spotShadowLightShadeMask; // WH[TomK]: Multiple spot shadows side mask (KCD2-359239)
+	uint      flagsWH; // WH[TBa]: introduce additional flags, starting with LIGHT_FLAG_SS_SHADOWS_FALLBACK_WH for KCD2-444074
+};
+
+//WH[TBa]: factor clipping and attenuation out of illuminance, so we can simulate more complex light types inside shading callbacks, KCD2-291146, KCD2-74373
+struct IlluminanceEvaluationContextWH
+{
+	float3 color; // light color times texture, times shadow, common/same for all light types
+	float clipping; // limit by radius and fadeIn times clip volume fade in, common/same for all light types
+	float inverseSquareAttenuation; // depends on the light type, only approximate for area lights (for shaders that cannot use the ltc-ggx model)
+};
+
+struct ForwardLightParams
+{
+	min12int     type;
+	min16float3  lightVec;
+
+	//WH[TBa]: factor clipping and attenuation out of illuminance, so we can simulate more complex light types inside shading callbacks, KCD2-291146, KCD2-74373
+	IlluminanceEvaluationContextWH illuminanceWH;
+};
+
+// WH[TBa]: constructor for ForwardLightParams, default-initialize all properties
+ForwardLightParams CreateForwardLightParamsWH(min12int type)
+{
+	ForwardLightParams ret;
+	ret.type = type;
+	ret.lightVec = 0;
+	ret.illuminanceWH.color = 0;
+	ret.illuminanceWH.clipping = 1;
+	ret.illuminanceWH.inverseSquareAttenuation = 1;
+	return ret;
+}
+
+#define TILED_SHADING_SPECPROBE_MAXMIP  6
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float GetDissolveThreshold5(int2 sc)
+{
+	// 4 transparency levels for a 2x2 quad. We're using dot/abs instead, since rsx doens't support array indexing.
+	return abs(dot(min16float4(0.0h, 0.76h, 0.5h,-1.0h), sc.xxyy % 2));
+}
+
+float GetDissolveThreshold9(int2 sc)
+{
+	float tm[2][4] =
+	{
+		{  0.0f / 8,  4.0f / 8,  2.0f / 8,  6.0f / 8 },
+		{  3.0f / 8,  7.0f / 8,  1.0f / 8,  5.0f / 8 }
+	};
+
+	return tm[sc.y & 1][sc.x & 3];
+}
+
+float GetDissolveThreshold17(int2 sc)
+{
+	float tm[4][4] =
+	{
+		{  0.0f / 16,  12.0f / 16,   3.0f / 16,  15.0f / 16 },
+		{  8.0f / 16,   4.0f / 16,  11.0f / 16,   7.0f / 16 },
+		{  2.0f / 16,  14.0f / 16,   1.0f / 16,  13.0f / 16 },
+		{ 10.0f / 16,   6.0f / 16,   9.0f / 16,   5.0f / 16 }
+	};
+
+	return tm[sc.y & 3][sc.x & 3];
+}
+
+float GetDissolveThreshold33(int2 sc)
+{
+	float tm[4][8] =
+	{
+		{  0.0f / 32,  16.0f / 32,   8.0f / 32,  24.0f / 32,   2.0f / 32,  18.0f / 32,  10.0f / 32,  26.0f / 32 },
+		{ 12.0f / 32,  28.0f / 32,   4.0f / 32,  20.0f / 32,  14.0f / 32,  30.0f / 32,   6.0f / 32,  22.0f / 32 },
+		{  3.0f / 32,  19.0f / 32,  11.0f / 32,  27.0f / 32,   1.0f / 32,  17.0f / 32,   9.0f / 32,  25.0f / 32 },
+		{ 15.0f / 32,  31.0f / 32,   7.0f / 32,  23.0f / 32,  13.0f / 32,  29.0f / 32,   5.0f / 32,  21.0f / 32 }
+	};
+
+	return tm[sc.y & 3][sc.x & 7];
+}
+
+float TestDissolve(float fDissolve, int2 sc, int levels = 17)
+{
+#if %_RT_DISSOLVE
+	float fThreshold = 0;
+	if (levels <= 5)
+		fThreshold = GetDissolveThreshold5(sc);
+	else if (levels <= 9)
+		fThreshold = GetDissolveThreshold9(sc);
+	else if (levels <= 17)
+		fThreshold = GetDissolveThreshold17(sc);
+	else if (levels <= 33)
+		fThreshold = GetDissolveThreshold33(sc);
+	else
+		fThreshold = 0;
+
+	return (fDissolve >= 0 ? 1 : -1) * (fThreshold - abs(fDissolve));
+#else
+	return 0.0f;
+#endif
+}
+
+void ApplyDissolve(float fDissolve, int2 sc, int levels = 17)
+{
+#if %_RT_DISSOLVE
+	clip(TestDissolve(fDissolve, sc, levels));
+#endif
+}
+
+//////////////////////////////// Common shading utilities ////////////////
+
+// assumes 0 is min
+min16float smoothstep_opt(in min16float maxi, in min16float x)
+{
+  x = saturate( x / maxi );
+  return  x * x  * (3.0 - 2.0 * x);
+}
+
+min16float GlossToSpecExp255(in min16float gloss)
+{
+	return gloss * 255.h;
+}
+
+min16float GetFresnel(min16float NdotI, min16float bias, min16float power)
+{
+  min16float facing = (1.0 - NdotI);
+  return saturate(bias + (1-bias)*pow(facing, power));
+}
+
+min16float3 GetEnvmapFresnel(min16float3 specCol0, min16float gloss, min16float fNdotE)
+{
+	const min16float3 specCol90 = min16float3( 1, 1, 1 );
+
+	// Empirical approximation to the reduced gain at grazing angles for rough materials
+	return lerp( specCol0, specCol90, pow( 1 - saturate( fNdotE ), 5 ) / (40 - 39 * gloss) );
+}
+
+min16float GetAttenuation(min16float3 L, min16float fInvRadius, bool bUserFalloff = false, min16float fFalloffMax = 1.0h)
+{
+  min16float3 vDist = L * fInvRadius;
+  min16float fFallOff = saturate(1 + dot(vDist, -vDist));
+
+	if( bUserFalloff )
+		fFallOff = smoothstep_opt( fFalloffMax, fFallOff);
+
+  return fFallOff;
+}
+
+// WH[TBa]: factor clipping out of physical light attenuation as area light sources have their own attenuation model, KCD2-291146, KCD2-74373
+min16float GetLightClippingWH(STiledLightShadeInfo light, min16float fDist)
+{
+	const min16float radius = light.posRad.w;
+	const min16float fNearClip = light.attenuationParams.w;
+	const min16float fFadeInRadiusAndClip = light.attenuationParams.z + fNearClip;
+	min16float d = fDist;
+
+	// Fadeout last 30% of radius
+	// WH[LH] nicer curve with no 2nd order discontinuity
+	min16float fadeoutFactor = 1.0f - smoothstep(0.7*radius, radius, d);
+
+	// WH[TBa]: add near clip and fade in radius, KCD2-81869
+	min16float fadeInFactor = step(fNearClip, d);
+
+	// WH[Woody,TBa]: fade-in
+	if (fFadeInRadiusAndClip > 0.f)
+	{
+		min16float fadeInCoef = saturate(d / fFadeInRadiusAndClip);
+		fadeInFactor *= fadeInCoef * fadeInCoef; // WH[Woody]: quadratic version looks better
+	}
+
+	return fadeInFactor * fadeoutFactor;
+}
+
+// WH[TBa]: physical light source modelled as a sphere (light bulb), KCD2-291146, KCD2-74373
+min16float GetPhysicalBulbLightAttenuationWH(STiledLightShadeInfo light, min16float fDist)
+{
+	const min16float fAttenuationBulbSize = light.attenuationParams.x;
+	min16float d = fDist;
+
+	// Light attenuation model: 1 / (1 + d/lightsize)^2
+	d = max(d - fAttenuationBulbSize, 0);
+	min16float denom = 1 + d / fAttenuationBulbSize;
+	min16float fAttenuation = 1 / (denom * denom);
+
+	return fAttenuation;
+}
+
+min16float GetSpotAttenuation(min16float fPdotL, min16float fCosAngle, min16float fRadius)
+{
+	// Compute cosine of spot direction and light.
+	min16float fSpotFalloff = fCosAngle / (fPdotL+1e-6); // 1 alu
+	
+	// Apply planar falloff and computed spot falloff.
+	min16float fFallOff = 1.0h - pow(saturate(fSpotFalloff), fRadius); //  4 alu
+
+	return fFallOff;
+}
+
+float3 MapCubeToSphere(float3 pos)
+{
+	float3 pos2 = pos.xyz * pos.xyz;
+	return pos * sqrt(1 - rcp(2) * (pos2.yzx + pos2.zxy) + rcp(3) * (pos2.yzx * pos2.zxy));
+}
+
+min16float3 ShiftVector(min16float3 V, min16float3 N, min16float shiftAmount)
+{
+  return normalize(V + shiftAmount * N);
+  // 3 alu, 1 mad
+}
+
+// optimized shift vector - skips normalization - use only when vector lenght not relevant
+min16float3 ShiftVectorOpt(min16float3 V, min16float3 N, min16float shiftAmount)
+{
+  return (V + shiftAmount * N);
+  // 1 mad
+}
+
+//////////////////////////////// Common HDR encoding/decoding ////////////////////////////////
+
+#define MAX_FLOAT						128.h
+
+#define fHDR_EXP_BASE_1_04	1.04h
+#define fHDR_EXP_BASE_1_06	1.06h
+#define fHDR_EXP_OFFSET			128.h
+
+// Using RGBK format (multiplier in alpha - filtering should work fine)
+// quality: good	
+min16float4 EncodeRGBK(in min16float4 Color, const min16float fMultiplier, bool bUsePPP = false)
+{
+	const min16float4 cScale = min16float4(min16float3(1.h, 1.h, 1.h) / fMultiplier, 1.h / 255.0);
+	min16float fMax = saturate(dot(min16float4(Color.rgb, 1.h), cScale));   // 1 alu
+
+	Color.a = ceil(fMax * 255.h) / 255.h;                       // 3 alu
+
+	Color.xyz /= Color.a * fMultiplier;                         // 2alu
+
+  if( bUsePPP )
+  {
+	//Color *= rsqrt( Color ); // for best quality
+
+	Color.a = sqrt( Color.a ); // encode just multiplier for performance reasons
+  }
+
+  return Color;
+}
+
+void EncodeRGBKPair(inout min16float4 Color0, inout min16float4 Color1, const min16float fMultiplier, bool bUsePPP = false)
+{
+  min16float fMax0 = saturate(dot(Color0.rgb, 1.h / fMultiplier));    // 1 alu
+  min16float fMax1 = saturate(dot(Color1.rgb, 1.h / fMultiplier));    // 1 alu
+
+  Color0.a = ceil(fMax0 * 255.h) / 255.h;                       // 3 alu
+  Color1.a = ceil(fMax1 * 255.h) / 255.h;                       // 3 alu
+
+  Color0.xyz /= Color0.a * fMultiplier;                         // 2alu
+  Color1.xyz /= Color1.a * fMultiplier;                         // 2alu
+  
+  if( bUsePPP )
+  {
+	  //Color0 *= rsqrt( Color0 ); // for best quality
+	  //Color0 *= rsqrt( Color0 ); 
+
+		Color0.a = sqrt( Color0.a ); // encode just multiplier for performance reasons
+		Color1.a = sqrt( Color1.a );
+
+  }
+}
+
+min16float4 DecodeRGBK(in min16float4 Color, const min16float fMultiplier, bool bUsePPP= false)
+{
+  if( bUsePPP )
+  {
+	 //Color.rgb *= Color.rgb * (Color.a * Color.a) * fMultiplier;
+
+	Color.rgb *= (Color.a * Color.a) * fMultiplier;
+  }
+  else
+    Color.rgb *= Color.a * fMultiplier;
+
+  return Color;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// These functions are used for each and every manipulation with compressed HDR buffer 
+
+#define SCENE_HDR_MULTIPLIER 32.h
+
+min16float4 EncodeHDRBuffer( in min16float4 color )
+{
+	return color;
+}
+
+void EncodeLightBufferPair( inout min16float4 diffuse, inout min16float4 specular )
+{
+}
+
+min16float4 DecodeHDRBuffer( in min16float4 rgbk )
+{
+	return rgbk;
+}
+
+min16float4 EncodeLightBuffer( in min16float4 color )
+{
+	return color;
+}
+
+min16float4 Decode7E3F(in min16float4 color)
+{
+	// Reference	
+	//vColor.rgb *= 8.0f;  // Shift performed in resolve and tex bias
+	//float3 e = floor( vColor.rgb );
+	//float3 m = frac( vColor.rgb );
+	//vColor.rgb  = (e == 0.0f) ? 2*m/8 : (1+m)/8 * pow(2,e);  
+
+	float3 me = color.xyz;
+	float3 e  = floor(me);
+	float3 m  = frac(me);	
+		
+	color.xyz = (e == 0.0f) ? 2.0f * m : (1.0f+m) * exp2(e);
+	color.xyz *= 0.125f;
+
+	return color;
+}
+
+min16float4 DecodeLightBuffer( in min16float4 color , bool bRangeAdaptHDR = false)
+{
+	return color;
+}
+
+//////////////////////////////// Common Brdfs ////////////////////////////////
+
+// WH[TBa]: linear remapping makes the visual more consistent with point lights, KCD2-284659
+min16float SmoothnessToRoughnessAreaWH(min16float smoothness)
+{
+	return min16float(1.0f) - smoothness;
+}
+
+min16float SmoothnessToRoughness(min16float smoothness)
+{
+	return (min16float(1.0f) - smoothness) * (min16float(1.0f) - smoothness);
+}
+
+min16float RoughnessToSmoothness(min16float roughness)
+{
+	return 1.0f - sqrt(roughness);
+}
+
+//////////////////////////////// Phong model /////////////////////////////////////
+// - Phong model has good properties for plastic and some metallic surfaces. 
+// - Good for general use. Very cheap.
+
+#define ONE_OVER_PI 0.31831h
+#define ONE_OVER_TWO_PI 0.159155h
+
+// Optimized phong, use if mirrowed reflection vector pre-computed
+min16float Phong(min16float3 R, min16float3 L, min16float Exp)
+{	
+	min16float fNormFactor = Exp * ONE_OVER_TWO_PI + ONE_OVER_TWO_PI;		// 1 ALU
+  return fNormFactor *  pow(saturate(dot(L, R)), Exp);					// 4 ALU
+	// 5 ALU
+}
+
+min16float Phong(min16float3 N, min16float3 V, min16float3 L, min16float Exp)
+{
+  min16float3 R = reflect(-V, N);	// 3 ALU
+  return Phong(R, L, Exp);	// 5 ALU
+  // 8 ALU
+}
+
+//////////////////////////////// Blinn BRDF model /////////////////////////////////////
+// - Blinn model has good properties for plastic and some metallic surfaces. 
+// - Good for general use. Very cheap.
+// *NOTE* We should also multiply by the clamped N.L factor. However this is 
+// delegated to the shader part for performance reasons
+
+min16float BlinnBRDF(min16float3 N, min16float3 V, min16float3 L, min16float Gloss)
+{
+  min16float3 H = normalize(V + L);
+	
+	// Compute perceptually linear exponent in range 2-2048
+	min16float power = exp2( 10.h * Gloss + 1.h );
+	
+	min16float fNormFactor = power * (1.0/8.0) + (2.0/8.0);
+	return fNormFactor * pow( saturate( dot( N, H ) ), power );
+}
+
+float3 SpecularBRDF(float3 N, float3 V, float3 L, min16float m, min16float3 f0, min16float NormalizationFactor)
+{
+	min16float m2 = m * m;
+	float3 H = normalize( V + L );
+
+	// GGX NDF
+	min16float NdotH = saturate( dot( N, H ) );
+	float spec = (NdotH * m2 - NdotH) * NdotH + 1;
+	// WH[TBa]: limit maximal value instead of the denominator to save the sharp heighlights
+	spec = min(m2 / (spec * spec), 100.f) * NormalizationFactor;
+	
+	// Correlated Smith Visibility Term (including Cook-Torrance denominator)
+	min16float NdotL = saturate( dot( N, L ) );
+    min16float NdotV = abs(dot(N, V)) + min16float(1e-4h);
+	min16float Gv = NdotL * sqrt( (-NdotV * m2 + NdotV) * NdotV + m2 );
+	min16float Gl = NdotV * sqrt( (-NdotL * m2 + NdotL) * NdotL + m2 );
+    spec *= min16float(0.5h) / max(Gv + Gl, min16float(1e-4));
+		
+	// Fresnel (Schlick approximation)
+	min16float f90 = saturate( dot( f0, min16float(0.33333h) ) / min16float(0.02h) );  // Assume micro-occlusion when reflectance is below 2%
+	min16float3 fresnel = lerp( f0, f90, pow( 1 - saturate( dot( L, H ) ), min16float(5) ) );
+
+	return fresnel * spec;
+}
+
+float3 SpecularBRDF(float3 N, float3 V, float3 L, min16float Gloss, min16float3 SpecCol)
+{
+	min16float m = max(SmoothnessToRoughness( Gloss ), 0.001);  // Prevent highlights from getting too tiny without area lights
+	return SpecularBRDF(N, V, L, m, SpecCol, 1.0f);
+}
+
+////////////////////////////////////////////////////////////////////////////
+// Anisotropic Kajiya Kay model
+
+min16float KajiyaKayAnisotropic(min16float3 T, min16float3 H, min16float Exp)
+{	
+	min16float TdotH = dot( T, H );
+	min16float fSpec = sqrt( max( 1.0 - TdotH * TdotH, 0.01) );
+  
+	return pow( fSpec, Exp );
+}
+
+// Constants
+static const float LTC_LUT_SIZE = 64.0f;
+static const float LTC_LUT_SCALE = (LTC_LUT_SIZE - 1.0f) / LTC_LUT_SIZE;
+static const float LTC_LUT_BIAS = 0.5f / LTC_LUT_SIZE;
+
+// WH[TBa]: removed circular lights and support for area light textures, KCD2-337067
+
+// Precomputed textures
+Texture2D<float4> LTCTex_1 : register(t48); 
+Texture2D<float4> LTCTex_2 : register(t49); 
+
+// Utility functions
+float3 IntegrateEdgeVec(float3 v1, float3 v2)
+{
+    float x = dot(v1, v2);
+    float y = abs(x);
+
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+
+    float theta_sintheta = (x > 0.0) ? v : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+
+    return cross(v1, v2) * theta_sintheta;
+}
+float IntegrateEdge(float3 v1, float3 v2)
+{
+    return IntegrateEdgeVec(v1, v2).z;
+}
+
+// WH[TBa]: removed circular lights and support for area light textures, KCD2-337067
+
+float2 LTC_Evaluate(float3 N, float3 V, float Gloss, inout float3x3 matILT, inout float3x3 matIdentity,
+                    inout float3 T1, inout float3 T2)
+{
+    // Fetch precomputed data (InverseLinearTransformMatrix / GGX normalization)
+	float m = max(SmoothnessToRoughnessAreaWH(Gloss), 0.02f); // WH[TBa]: KCD2-284659
+    float NdotV = saturate(dot(N, V)) + 1e-6;
+    float2 texUV = float2(m, sqrt(1.0f - NdotV));
+    texUV = texUV * LTC_LUT_SCALE + LTC_LUT_BIAS;
+    float4 t1 = LTCTex_1.SampleLevel(SampStateTrilinearClamp, texUV, 0);
+    float4 t2 = LTCTex_2.SampleLevel(SampStateTrilinearClamp, texUV, 0);
+
+    matILT = float3x3(t1.x, 0, t1.z,
+		                 0, 1, 0,
+		              t1.y, 0, t1.w);
+
+    matIdentity = float3x3(1, 0, 0,
+                           0, 1, 0,
+                           0, 0, 1);
+
+
+    // Construct orthonormal basis around N
+    T1 = normalize(V - N * NdotV);
+    T2 = cross(N, T1);
+
+    return float2(t2.x, t2.y);
+}
+
+float3 LTC_Rectangle(float3 N, float3 P, float3x3 mat, float3 points[4],
+                     float3 T1, float3 T2, bool twoSided, bool behind)
+{
+    // Rotate area light in (T1, T2, N) basis
+    mat = mul(mat, float3x3(T1, T2, N));
+
+    // Polygon
+    float3 L[4];
+    L[0] = mul(mat, points[0] - P);
+    L[1] = mul(mat, points[1] - P);
+    L[2] = mul(mat, points[2] - P);
+    L[3] = mul(mat, points[3] - P);
+
+    // WH[TBa]: removed circular lights and support for area light textures, KCD2-337067
+
+    // Integrate
+    float sum = 0.0f;
+    L[0] = normalize(L[0]);
+    L[1] = normalize(L[1]);
+    L[2] = normalize(L[2]);
+    L[3] = normalize(L[3]);
+        
+    float3 vsum = 0.0f;       
+    vsum += IntegrateEdgeVec(L[0], L[1]);
+    vsum += IntegrateEdgeVec(L[1], L[2]);
+    vsum += IntegrateEdgeVec(L[2], L[3]);
+    vsum += IntegrateEdgeVec(L[3], L[0]);
+
+    float len = length(vsum);
+    float z = (behind ? -vsum.z : vsum.z) / len;
+    float2 uv = float2(z * 0.5f + 0.5f, len);
+    uv = uv * LTC_LUT_SCALE + LTC_LUT_BIAS;
+    float scale = LTCTex_2.SampleLevel(SampStateTrilinearClamp, uv, 0).w;
+    sum = len * scale;
+
+    float3 output = float3(sum, sum, sum);
+
+    return output;
+}
+
+// WH[TBa]: removed circular lights and support for area light textures, KCD2-337067
+
+// WH[TBa]: analytic attenuation for lights in thick wall windows,
+// implements physically correct "FOV" for area lights, KCD2-73606
+// Attenuation is calculated separatedly for XY ad YZ planes.
+// CalcThickWallWindowSection solves one plane.
+//    ^
+//  Y |
+//    |                                                          + p
+//    |
+//    |
+//    |
+//    |
+//    |                                     edge                            Solution A
+//    |                                         +------------------------------------
+//    |                                        /                     ^      Solution B
+//    |                                       / |                    |
+//    |                                      /                       |
+//    |                                     /   |                thickness
+//    |                                    /                         |
+//    |                                   /     |   (solid wall)     |
+//    |                                  /                           |
+//    | (area light / window)           /       |                    v
+//    +-----------------------+--------+--------+--------------------------------->
+//  (0, 0)      width           margin   chamfer                                  X
+//
+float CalcThickWallWindowSection(float2 p, float width, float margin, float chamfer, float thickness)
+{
+	const float2 edge = float2(width + margin + chamfer, thickness);
+	if (p.y > edge.y) // Solution A
+	{
+		const float slope = (p.x - edge.x) / (p.y - edge.y);
+		const float pproj_x = edge.x - edge.y * slope;
+		const float fraction = saturate(pproj_x / width);
+		return fraction;
+	}
+	else // Solution B
+	{
+		const float visible = step(p.x, p.y * chamfer / thickness + width + margin);
+		return visible;
+	}
+}
+
+// WH[TBa]: parameters of the thick wall window model
+struct SThickWallWindow
+{
+	float3 origin;
+	float3 right;
+	float3 up;
+	float3 normal;
+	float2 chamfer;
+	float2 margin;
+	float thickness;
+};
+
+// WH[TBa]: given a window and a point it calculates the area of the window visible from the point
+// 0 -> the window is completely hidden behind the wall
+// 1 -> thw window is visible
+float CalcThickWallWindowAttenuation(SThickWallWindow window, float3 p)
+{
+	const float3 windowSize = {length(window.right), 0, length(window.up)};
+	const float3 windowHalfSize = windowSize / 2;
+	// construct light/windows matrix and transform point to light coordinates
+	const float3x3 windowMatrix = {normalize(window.right), window.normal, normalize(window.up)};
+	const float3 pInWindowCoords = mul(windowMatrix, p - window.origin);
+	// mirror the point so it is always in the positive quadrant (the solution is symetric in the negative quadrant)
+	const float3 pMirrored = abs(pInWindowCoords - windowHalfSize) + windowHalfSize;
+	// calculate portion of the visible area
+	const float horizontalFraction = CalcThickWallWindowSection(pMirrored.xy, windowSize.x, window.margin.x, window.chamfer.x, window.thickness);
+	const float verticalFraction = CalcThickWallWindowSection(pMirrored.zy, windowSize.z, window.margin.y, window.chamfer.y, window.thickness);
+	const float atten = horizontalFraction * verticalFraction;
+	return atten;
+}
+
+// WH[TBa]: changed arguments, pass AreaLightShadingAttribs instead of many arguments
+// WH[TBa]: removed circular lights and support for area light textures, KCD2-337067
+void AreaLightLTC_GGX(float3 N, float3 V, float Gloss, float3 SpecCol, AreaLightShadingAttribs areaAttribs,
+	Texture2DArray<min16float4> ,
+	inout float3 outDiffuse, inout float3 outSpecular)
+{
+	const float4x4 lightParamMatrix = areaAttribs.transform;
+	const float3 position = areaAttribs.position;
+
+    // Define Light shape
+    float3 points[4];
+    points[0] = float3(lightParamMatrix[0][0], lightParamMatrix[0][1], lightParamMatrix[0][2]);
+    points[1] = float3(lightParamMatrix[1][0], lightParamMatrix[1][1], lightParamMatrix[1][2]);
+    points[2] = float3(lightParamMatrix[2][0], lightParamMatrix[2][1], lightParamMatrix[2][2]);
+    points[3] = float3(lightParamMatrix[3][0], lightParamMatrix[3][1], lightParamMatrix[3][2]);
+
+    bool twoSided = lightParamMatrix[1][3];
+
+	// Early out
+    float3 center = (points[0] + points[2]) / 2 - position;
+    float3 lightNormal = normalize(cross(points[3] - points[0], points[1] - points[0]));
+    bool behindLight = dot(position - points[0], lightNormal) < 0.0f;  
+
+    if ((behindLight && !twoSided))
+    {
+        outDiffuse = 0;
+        outSpecular = 0;
+        return;
+    }
+                                 
+    // Retrieve precomputed data
+    float3x3 matILT, matIdentity;
+    float3 T1, T2;
+    float2 F_G = LTC_Evaluate(N, V, Gloss, matILT, matIdentity, T1, T2);
+
+    // Evaluate
+    // WH[TBa]: removed circular lights and support for area light textures, KCD2-337067
+    {
+        outDiffuse = LTC_Rectangle(N, position, matIdentity, points, T1, T2, twoSided, behindLight);
+        outSpecular = LTC_Rectangle(N, position, matILT, points, T1, T2, twoSided, behindLight);
+
+				// WH[TBa]: "FOV" for area lights in walls, KCD2-73606
+				if (areaAttribs.wallThickness > 0.f)
+				{
+					SThickWallWindow window;
+					window.origin = points[0];
+					window.right = points[1] - points[0];
+					window.up = points[3] - points[0];
+					window.normal = lightNormal;
+					window.thickness = areaAttribs.wallThickness;
+					window.chamfer = areaAttribs.wallChamfer;
+					window.margin = areaAttribs.windowMargin;
+
+					float windowAttenuation = CalcThickWallWindowAttenuation(window, position);
+					// umbra/penumbra debug
+					//outDiffuse = float3(saturate(1 - windowAttenuation), saturate(windowAttenuation), 0);
+					outDiffuse *= windowAttenuation;
+					outSpecular *= windowAttenuation;
+				}
+    }
+
+		// WH[Woody,TBa]: fade-in for portal lights
+		float fadeInRadiusWH = lightParamMatrix[3][3];
+		if (fadeInRadiusWH > 0.f)
+		{
+			float dist = dot(position - points[0], lightNormal);
+			float fadeInCoef = saturate(dist / fadeInRadiusWH);
+			float fadeInCoef2 = fadeInCoef * fadeInCoef; // WH[Woody]: quadratic version looks better
+			outDiffuse *= fadeInCoef2;
+			outSpecular *= fadeInCoef2;
+		}
+
+	// Apply fresnel and shadowing term + cosine factor
+    float cosTheta_i = saturate(dot(center, N));
+    outSpecular *= cosTheta_i * SpecCol * F_G.x + (1.0 - SpecCol) * F_G.y;
+}
+
+// WH_TODO(KCD2-139829,2022-11-30): TBa: this function duplicates ComputeNearestPointOnRectangleWH and does not work
+// Diffuse BRDFs
+min16float3 ComputeNearestLightOnRectangle(min16float3 vLightPoint, float4x4 mAreaLightMatr)
+{
+	// Calculate light space plane.
+	min16float3 vLightDir = dot(mAreaLightMatr[0].xyz, vLightPoint.xyz) * mAreaLightMatr[0].xyz - vLightPoint.xyz;
+
+	// Calculate the nearest point.
+	min16float2 vSurfArea = float2(dot(vLightDir.xyz, mAreaLightMatr[1].xyz), dot(vLightDir.xyz, mAreaLightMatr[2].xyz));
+	min16float2 vSurfAreaClamp = clamp(vSurfArea.xy, -mAreaLightMatr[3].xy, mAreaLightMatr[3].xy); // 1 alu
+	min16float3 vNearestPoint = mAreaLightMatr[1].xyz * vSurfAreaClamp.x + (mAreaLightMatr[2].xyz * vSurfAreaClamp.y);
+
+	return vLightPoint.xyz + vNearestPoint.xyz;
+}
+
+// WH[TBa]: KCD2-128852
+// Using this function to widen specular response means biasing the output.
+// The normalization is not done here as the numbers in the lighting model are not in physical units anyway.
+// Details described here: https://blog.selfshadow.com/publications/s2013-shading-course/karis/s2013_pbs_epic_notes_v2.pdf
+float3 ComputeNearestLightOnDiscWH(float3 N, float3 V, float3 L, float discRadius)
+{
+	const float3 R = reflect(-V, N);
+	const float3 centerToRay = dot(L, R) * R - L;
+	const float3 closestPoint = L + centerToRay * saturate(discRadius / length(centerToRay));
+	const float3 Lclosest = normalize(closestPoint);
+	return Lclosest;
+}
+
+// WH[TBa]: approximate The Sun using closest point on a disc, KCD2-128852
+float3 ComputeNearestLightOnSunWH(float3 N, float3 V, float3 L)
+{
+	// equivalent sphere 1m away from the shading point (as L is normalized)
+	const float sunApparentRadius = 0.0046525f;
+	return ComputeNearestLightOnDiscWH(N, V, L, sunApparentRadius);
+}
+
+// WH[TBa]: given a position (not direction) and rectangle vertices
+// it finds a point that is closest to the position but still lies on the rectangle, KCD2-124866
+float3 ComputeNearestPointOnRectangleWH(float3 position, float3 rectangle[4])
+{
+	// establis base of the rectangle
+	const float3 origin = rectangle[0];
+	const float3 right = rectangle[1] - rectangle[0];
+	const float3 up = rectangle[3] - rectangle[0];
+	const float2x3 rectangleMatrix = {normalize(right), normalize(up)};
+
+	// express position in the rectangle space and clamp coordinates so the point does not move outside
+	const float2 positionInRectangleSpace = mul(rectangleMatrix, position - origin);
+	const float2 positionInRectangleSpaceClamped = saturate(positionInRectangleSpace / float2(length(right), length(up)));
+
+	// move back to the original space
+	const float3 ret = mul(float3(positionInRectangleSpaceClamped, 1.f), float3x3(right, up, origin));
+	return ret;
+}
+
+// WH[TBa]: rectangular light source normal from 4 corners
+float3 GetAreaLightNormalWH(float3 points[4])
+{
+	return normalize(cross(points[3] - points[0], points[1] - points[0]));
+}
+
+// WH[TBa]: simplified "attenuation" for area lights, finds the closest point on the light and uses the same model as point lights,
+// using light physical area instead of "bulbSize", KCD2-124866
+float GetFakeAreaLightAttenuationWH(float3 position, float3 points[4])
+{
+	const float3 nearestLightPos = ComputeNearestPointOnRectangleWH(position, points);
+	const float3 L = nearestLightPos - position;
+	const float3 lightNormal = GetAreaLightNormalWH(points);
+	const float posDotLightNormal = saturate(dot(normalize(-L), lightNormal));
+	const float lightSize = length(points[3] - points[0]) * length(points[1] - points[0]);
+	const float denom = 1 + length(L) / sqrt(lightSize);
+	const float ret = posDotLightNormal / (denom * denom);
+	return ret;
+}
+
+// WH[TBa]: simplified area ligh model (for SVOTI), modeled as attenuated point light,
+// contents of the function are mainly copy-pasted from AreaLightLTC_GGX, KCD2-124866
+// the light vertices are relative to the current view, the coordinates of the shaded point must also be.
+// This model also includes distance-based attenuation, do not distance-attenuate the returned value further.
+float GetAreaLighAsAttenuatedPointWH(STiledLightShadeInfo light, float3 positionViewSpace)
+{
+	const float4x4 lightParamMatrix = light.projectorMatrix;
+	float3 points[4];
+	points[0] = float3(lightParamMatrix[0][0], lightParamMatrix[0][1], lightParamMatrix[0][2]);
+	points[1] = float3(lightParamMatrix[1][0], lightParamMatrix[1][1], lightParamMatrix[1][2]);
+	points[2] = float3(lightParamMatrix[2][0], lightParamMatrix[2][1], lightParamMatrix[2][2]);
+	points[3] = float3(lightParamMatrix[3][0], lightParamMatrix[3][1], lightParamMatrix[3][2]);
+
+	const bool twoSided = lightParamMatrix[1][3];
+
+	// Early out - behind light
+	const float3 center = (points[0] + points[2]) / 2 - positionViewSpace;
+	const float3 lightNormal = GetAreaLightNormalWH(points);
+	const bool behindLight = dot(positionViewSpace - points[0], lightNormal) < 0.0f;
+	if (behindLight && !twoSided)
+	{
+		return 0.f;
+	}
+
+	float ret = 1.f;
+
+	// distance "attenuation"
+	ret *= GetFakeAreaLightAttenuationWH(positionViewSpace, points);
+
+	// WH[Woody,TBa]: fade-in for portal lights
+	float fadeInRadiusWH = lightParamMatrix[3][3];
+	if (fadeInRadiusWH > 0.f)
+	{
+		float dist = dot(positionViewSpace - points[0], lightNormal);
+		float fadeInCoef = saturate(dist / fadeInRadiusWH);
+		float fadeInCoef2 = fadeInCoef * fadeInCoef; // WH[Woody]: quadratic version looks better
+		ret *= fadeInCoef2;
+	}
+
+	// WH[TBa]: "FOV" for area lights in walls, KCD2-73606
+	if (light.areaLightWallThickness > 0.f)
+	{
+		SThickWallWindow window;
+		window.origin = points[0];
+		window.right = points[1] - points[0];
+		window.up = points[3] - points[0];
+		window.normal = lightNormal;
+		window.thickness = light.areaLightWallThickness;
+		window.chamfer = light.areaLightWallChamfer;
+		window.margin = light.areaLightWindowMargin;
+
+		float windowAttenuation = CalcThickWallWindowAttenuation(window, positionViewSpace);
+		ret *= windowAttenuation;
+	}
+
+	return ret;
+}
+
+min16float OrenNayarBRDF(min16float3 N, min16float3 V, min16float3 L, min16float Gloss, min16float NdotL)
+{
+	min16float m = SmoothnessToRoughness(Gloss);
+	m *= m * m;  // Map GGX to Oren-Nayar roughness (purely empirical remapping)
+	
+	// Approximation of the full quality Oren-Nayar model
+	min16float s = dot(L, V) - dot(N, L) * dot(N, V);
+	min16float t = s <= 0 ? 1 : max(max(dot(N, L), dot(N, V)), 1e-6);
+	min16float A = 1.0h / (1.0h + (0.5h - 2.0h / (3.0h * PI)) * m);
+	min16float B = m * A;
+	
+	return NdotL * max(A + B * (s / t), 0);
+}
+
+min16float Pow5(min16float v)
+{
+	return v * v * v * v * v;
+}
+
+// WH[TBa]: implicit truncation of vector type, KCD2-448804
+min16float BurleyBRDF(min16float NdotL, min16float NdotV, min16float VdotH, min16float roughness)
+{
+	NdotV = max(NdotV, min16float(0.1));  // Prevent overly dark edges
+	
+	// Burley BRDF with renormalization to conserve energy
+	min16float energyBias = min16float(0.5) * roughness;
+	min16float energyFactor = lerp(1, 1 / 1.51, roughness);
+	min16float fd90 = energyBias + 2.0 * VdotH * VdotH * roughness;
+	min16float scatterL = lerp(1, fd90, Pow5(1 - NdotL));
+	min16float scatterV = lerp(1, fd90, Pow5(1 - NdotV));
+	
+	return scatterL * scatterV * energyFactor * NdotL;
+}
+
+min16float DiffuseBRDF(min16float3 N, min16float3 V, min16float3 L, min16float Gloss, min16float NdotL)
+{
+	// TODO: Share computations with Specular BRDF
+	min16float m = SmoothnessToRoughness(min(Gloss, min16float(1)));
+	min16float VdotH = saturate(dot(V, normalize(V + L)));
+	min16float NdotV = abs(dot(N, V)) + 1e-5h;
+	
+	// Burley BRDF with renormalization to conserve energy
+	return BurleyBRDF(NdotL, NdotV, VdotH, m);
+}
+
+min16float3 ThinTranslucencyBRDF(min16float3 N, min16float3 L, min16float3 transmittanceColor)
+{
+	min16float w = lerp(0, 0.5, GetLuminance(transmittanceColor));
+	min16float wn = rcp((1 + w) * (1 + w));
+	min16float NdotL = dot(N, L);
+	min16float transmittance = saturate((-NdotL + w) * wn);
+	min16float diffuse = saturate((NdotL + w) * wn);
+	
+	return transmittanceColor * transmittance + diffuse;
+}
+
+
+////////////////////////////////////////////////////////////////////////////
+// Occlusion
+
+min16float DeriveSpecularOcclusion(min16float fNdotV, min16float aoAmount, min16float smoothness)
+{
+	// Derive specular occlusion term form ambient occlusion:
+	//   Rough surfaces receive full ambient occlusion
+	//   Smooth surfaces get more occlusion at grazing angles and less at normal incidence
+	return saturate(pow(fNdotV + aoAmount, smoothness) - 1 + aoAmount);
+}
+
+
+//////////////////////////////// Vegetation shading ////////////////
+
+// Common vegetation shading
+
+min16float3 LeafShadingBack(min16float3 vEye, min16float3 vLight, min16float3 vNormal, min16float3 cDiffBackK, min16float backViewDep)
+{            
+  min16float EdotL=saturate(dot(vEye.xyz, -vLight.xyz));          
+  
+  // Tweaked NdotL wrapping - Artists request
+  min16float fLdotNBack=saturate(dot(vNormal.xyz, vLight.xyz)*0.6+0.4);
+
+  min16float powEdotL = EdotL*EdotL;
+  powEdotL *= powEdotL;
+    
+  min16float3 vBackShading = saturate(powEdotL*backViewDep + (1.0-backViewDep) * fLdotNBack);    
+
+  return vBackShading * cDiffBackK.xyz;
+}   
+
+void LeafShadingFront(min16float3 vEye, min16float3 vLight, min16float3 vNormal, min16float3 cDifK, min16float3 cSpecK, inout min16float3 outDif, inout min16float3 outSpec, min16float fGloss)
+{                                                                                                                                  
+  min16float fLdotNFront=dot(vNormal.xyz, vLight.xyz);      
+  // Compute front diffuse term  
+#if %GRASS   
+  outDif=max(fLdotNFront, 0.5)*cDifK.xyz; 
+#else
+  outDif=saturate(fLdotNFront)*cDifK.xyz;
+#endif
+  // compute specular if necessary 
+#if !%GRASS
+  outSpec = BlinnBRDF(vNormal, vEye, vLight, fGloss) * saturate(fLdotNFront) * cSpecK.xyz;  
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Parallel view opacity falloff (for close to parallel leaf polys)
+
+float ParallelOpacityFalloff(float3 vWorldPos, float3 vNormal, float fCapOpacityFalloff, float fAlphaTest)
+{
+	min16float3 inverseViewVec = normalize(vWorldPos.xyz); // we use the abs of the dot on next line, so direction of view vec doesn't matter
+	min16float parallelViewOpacity = abs(dot(inverseViewVec, vNormal));
+
+	// cos(alpha ramp start angle) = 0.05
+	// cos(alpha ramp end angle) = 0.3
+	const min16float a = 1.0h / (0.3h - 0.05h);
+	const min16float b = -0.05h / (0.3h - 0.05h);
+
+	min16float x = parallelViewOpacity;
+
+	x = saturate(x*a + b); // remap alpha ramp range to [0..1]
+	//x *= (2.0h - x); // eval 2nd order polynomial
+
+	parallelViewOpacity = max(x, fCapOpacityFalloff);
+
+	return 1.0f + parallelViewOpacity * (fAlphaTest - 1.0f);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Layer blending
+
+min16float GetLayerBlendingValue(in Texture2D<min16float4> blendTex, in float2 uv, in float lod, in min16float vtxAlpha, in min16float blendFactor, in min16float blendFalloff)
+{
+	#if %SNDUVS
+		// WH[TBa]: the blending texture (opacity) is currently beeing used as the snduvs diffuse texture
+		// which is rgba texture with alpha beeing the blending channel
+		half4 blendMap = GetTexture2D(blendTex, ssMaterialAnisoHigh, uv);
+		blendMap.r = blendMap.w;
+	#elif !ENABLE_TESSELLATION && !%SILHOUETTE_PARALLAX_OCCLUSION_MAPPING // TODO: find way to compute lod without gradients as they cause pixel artifacts at fin / shell transition
+		min16float4 blendMap = GetBlendTex(blendTex, uv);
+	#else
+		min16float4 blendMap = GetBlendTexLod(blendTex, float4(uv, 0, lod));
+	#endif
+
+	min16float blendFac = vtxAlpha * blendMap.r * (1 + abs(blendFactor));
+	blendFac = saturate(pow(blendFac, blendFalloff));
+
+	// WH GM: Mask can be inverted by setting BlendFactor to negative
+	return blendFactor < 0 ? 1 - blendFac : blendFac;
+}
+
+// Terrain layers are a particular case of blend layer, where blendmap is the heightmap and blending
+// is only valid on transition from full opaque (vtx alpha = 1) to fully transparent (vtx alpha = 0)	
+min16float GetTerrainLayerBlendingValue(in Texture2D<min16float4> heightTex, in float2 uv, in float lod, in min16float vtxAlpha, in min16float blendFactor, in min16float blendFalloff)
+{
+	#if !ENABLE_TESSELLATION && !%SILHOUETTE_PARALLAX_OCCLUSION_MAPPING // TODO: find way to compute lod without gradients as they cause pixel artifacts at fin / shell transition
+		min16float4 blendMap = GetHeightTex(heightTex, uv);
+	#else
+		min16float4 blendMap = GetHeightTexLod(heightTex, float4(uv, 0, lod));
+	#endif
+
+
+	blendMap = saturate(saturate(vtxAlpha*2-1) + blendMap.x); // 2 inst
+
+	min16float blendFac = vtxAlpha * blendMap.r * (1 + blendFactor);
+	blendFac = saturate(pow(blendFac, blendFalloff));
+	return blendFac;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Silhouette POM, POM & OBM tex coord gen
+
+float4 ComputeBarycentricCorrespondence(in float3 wsPos, in float3 wsTriPos[3], in float3 wsTriDispl[3]) // WS -> TS
+{
+	float w = 0.0;
+	float stepsize = 0.5;
+
+	float3 p0, p1, p2;
+	float3 u, v, n, d;
+
+	[unroll]
+	for (int i=0; i<10; ++i)
+	{
+		p0 = wsTriPos[0] + w * wsTriDispl[0];
+		p1 = wsTriPos[1] + w * wsTriDispl[1];
+		p2 = wsTriPos[2] + w * wsTriDispl[2];
+
+		u = p1 - p0;
+		v = p2 - p0;
+		n = cross(u, v);
+		d = wsPos - p0;
+
+		const float dist = dot(n, d);
+		w += (dist > 0.0) ? stepsize : -stepsize;
+		stepsize *= 0.5;
+	}
+
+	float oneOver4ASquared = 1.0 / dot(n, n);
+	float2 bary_uv = float2(dot(cross(d, v), n), dot(cross(u, d), n)) * oneOver4ASquared;
+
+	return float4(1.0 - dot(bary_uv, float2(1, 1)), bary_uv, w);
+}
+
+struct CbcWsRes
+{
+	float3 wsPos;
+	float3 wsNorm;
+};
+
+CbcWsRes ComputeBarycentricCorrespondence(in float4 bary, in float3 wsTriPos[3], in float3 wsTriDispl[3]) // TS to WS
+{
+	const float3 disp = wsTriDispl[0].xyz * bary.x + wsTriDispl[1].xyz * bary.y + wsTriDispl[2].xyz * bary.z;
+	const float3 pos = wsTriPos[0].xyz * bary.x + wsTriPos[1].xyz * bary.y + wsTriPos[2].xyz * bary.z + disp * bary.w;
+
+	CbcWsRes res;
+	res.wsPos = pos;
+	res.wsNorm = normalize(disp);
+
+	return res;
+}
+
+struct SilMapRes
+{
+	float2 uvHitPos;
+	float4 baryHitPos;
+};
+
+SilMapRes SilhouetteMap(in const float3 wsTriPos[3], in const float3 wsTriDispl[3], in const float4 wsClipPlane[5], in const float3 wsViewDir, in const float3 texGenU, in const float3 texGenV, in float lod, in float numSteps, in float displacement)
+{
+	const float stepSize = 1.0 / clamp(numSteps, 1.f, 512.f);
+	
+	const float3 wsStartPos = wsViewDir;
+	float3 wsEndPos = wsStartPos;
+	{
+		float tEnd = 1e8;
+		for (int i=0; i<5; i++)
+		{
+			const float3 o = wsStartPos;
+			const float3 d = wsViewDir;
+	
+			const float denom = dot(wsClipPlane[i].xyz, d);
+			//if (denom > 0)
+			{
+				const float t = (wsClipPlane[i].w - dot(wsClipPlane[i].xyz, o)) / denom;
+				if (denom > 0 && t < tEnd)
+				{
+					wsEndPos.xyz = o + d * t;
+					tEnd = t;
+				}
+			}
+		}
+	}
+	
+	const float4 baryStart = ComputeBarycentricCorrespondence(wsStartPos, wsTriPos, wsTriDispl);
+	const float4 baryEnd = ComputeBarycentricCorrespondence(wsEndPos, wsTriPos, wsTriDispl);
+	
+	const float3 uvStart = float3(dot(texGenU, baryStart.xyz), dot(texGenV, baryStart.xyz), baryStart.w);
+	const float3 uvEnd = float3(dot(texGenU, baryEnd.xyz), dot(texGenV, baryEnd.xyz), baryEnd.w);
+	const float3 uvDeltaStep = (uvEnd - uvStart) * stepSize;
+	
+	float stepped = 0;
+	float4 uv = float4(uvStart, lod);
+	
+	float height = GetHeightTexLod(heightTex, uv);
+	
+	if (height < uv.z)
+	{
+		{
+			for (; stepped < 1.0; stepped += stepSize)
+			{
+				[flatten]
+				if (height >= uv.z)
+					break;
+	
+				uv.xyz += uvDeltaStep;
+	
+				height = GetHeightTexLod(heightTex, uv);
+			}
+	
+			clip(height - uv.z + 0.001);
+		}
+	
+		{
+			float pivot = -0.5;
+			float bstep = 0.5;
+	
+			for (int i=0; i<10; i++)
+			{
+				const float3 lookup = uv.xyz + pivot * uvDeltaStep;
+				bstep *= 0.5;
+				
+				height = GetHeightTexLod(heightTex, float4(lookup, uv.w));
+
+				pivot += (height >= lookup.z) ? -bstep : bstep;
+			}
+	
+			uv.xyz += uvDeltaStep * pivot;
+			stepped += stepSize * pivot;
+		}
+	}
+	
+	SilMapRes res;
+	res.uvHitPos = uv.xy;
+	res.baryHitPos = baryStart + (baryEnd - baryStart) * stepped;
+	
+	return res;
+}
+
+float3 ParallaxOcclusionMap(in float2 baseTC, in float lod, in float3 viewDirNrm, in int numSteps, in float displacement, in float bias, in float blendLayerFactor, in float blendLayer2Tiling)
+{
+	float step =  1.0 / numSteps;
+	float bumpScale = displacement;
+
+	float2 delta = float2(viewDirNrm.x, viewDirNrm.y) * bumpScale / (-viewDirNrm.z * numSteps); // / max(-viewDirNrm.z * numSteps, 0.1)
+
+	baseTC -= (1.0 - bias) * numSteps * delta;
+
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	float NB0 = GetHeightTex(heightTex, baseTC).x;
+#if %BLENDLAYER
+	float NB02 = GetHeight2Tex(Height2Tex, baseTC.xy * blendLayer2Tiling).x;
+
+	NB0 += blendLayerFactor * (NB02 - NB0);
+#endif
+
+	float height = 1 - step;
+	float4 offset = float4(baseTC + delta, 0, lod);
+
+	// WH[TBa]: implicit truncation of vector type, KCD2-448804
+	float NB1 = GetHeightTex(heightTex, offset.xy).x;
+#if %BLENDLAYER
+	float NB12 = GetHeight2Tex(Height2Tex, offset.xy * blendLayer2Tiling).x;
+
+	NB1 += blendLayerFactor * (NB12 - NB1);
+#endif
+
+	for (int i=0; i<numSteps; i++)
+	{
+		[flatten]
+		if (NB1 >= height)
+			break;
+
+		NB0 = NB1;
+
+		height -= step;
+		offset.xy += delta;
+
+		NB1 = GetHeightTexLod(heightTex, offset);
+#if %BLENDLAYER
+		NB12 = GetHeightTexLod(Height2Tex, float4(offset.xy * blendLayer2Tiling, offset.zw));
+
+		NB1 += blendLayerFactor * (NB12 - NB1);
+#endif
+	}
+
+	float4 offsetBest = offset;
+	float error = 1.0;
+
+	float t1 = height;
+	float t0 = t1 + step;
+
+	float delta1 = t1 - NB1;
+	float delta0 = t0 - NB0;
+
+	float4 intersect = float4(delta * numSteps, delta * numSteps + baseTC);
+
+	float t = 0;
+
+	for (int j=0; j<10; j++)
+	{
+		[flatten]
+		if (abs(error) <= 0.01)
+			break;
+
+		float denom = delta1 - delta0;
+		t = (t0 * delta1 - t1 * delta0) / denom;
+		offsetBest.xy = -t * intersect.xy + intersect.zw;
+
+		float NB = GetHeightTexLod(heightTex, offsetBest);
+#if %BLENDLAYER
+		float NB2 = GetHeightTexLod(heightTex, float4(offsetBest.xy * blendLayer2Tiling, offsetBest.zw));
+
+		NB += blendLayerFactor * (NB2 - NB);
+#endif
+
+		error = t - NB;
+		if (error < 0)
+		{
+			delta1 = error;
+			t1 = t;
+		}
+		else
+		{
+			delta0 = error;
+			t0 = t;
+		}
+	}
+	return float3(offsetBest.xy, t);
+}
+
+float2 OffsetMap(in float2 baseTC, in min16float3 viewDirNrm, in int numSteps, in min16float displacement, in min16float bias, in min16float blendLayerFactor, in float blendLayer2Tiling)
+{
+	min16float offset = -bias * displacement;
+	float3 newCoords = float3(baseTC, 0);
+	for (int i=0; i<numSteps; ++i)
+	{
+		min16float nz = GetNormalMap(normalsTex, newCoords.xy).z;
+		min16float h = GetHeightTex(heightTex, newCoords.xy);
+
+#if %BLENDLAYER
+		const float2 newCoords2 = newCoords.xy * blendLayer2Tiling;
+		nz += blendLayerFactor * (GetNormalMap(Bump2Tex, newCoords2.xy).z - nz);
+		// WH[TBa]: implicit truncation of vector type, KCD2-448804
+		h += blendLayerFactor * (GetHeight2Tex(Height2Tex, newCoords2.xy).x - h);
+#endif
+
+		min16float height = h * displacement + offset;
+		newCoords += (height - newCoords.z) * nz * viewDirNrm;
+	}
+	return newCoords.xy;
+}
+
+#define MICRO_DETAIL_QUALITY_DEF 0
+#define MICRO_DETAIL_QUALITY_OBM 1
+#define MICRO_DETAIL_QUALITY_POM 2
+#define MICRO_DETAIL_QUALITY_SPM 3
+
+void GetMicroDetailParams(out int mdQuality, out min16float mdDisplacement, out min16float mdHeightBias, out min16float mdSelfShadowStrength)
+{
+	mdQuality = MICRO_DETAIL_QUALITY_DEF;
+	mdDisplacement = 0.0h;
+	mdHeightBias = 1.0h;
+	mdSelfShadowStrength = 0.0h;
+
+#if %OFFSET_BUMP_MAPPING || %PARALLAX_OCCLUSION_MAPPING || %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+	int shQuality = GetShaderQuality();
+	#if %SILHOUETTE_PARALLAX_OCCLUSION_MAPPING
+		{
+			mdQuality = MICRO_DETAIL_QUALITY_SPM;
+			mdDisplacement = SilPomDisplacement;
+			mdHeightBias = HeightBias;
+			mdSelfShadowStrength = SelfShadowStrength;
+			return;
+		}
+	#endif
+
+	#if %OFFSET_BUMP_MAPPING && %PARALLAX_OCCLUSION_MAPPING
+		if (shQuality > QUALITY_MEDIUM)
+		{
+			mdQuality = MICRO_DETAIL_QUALITY_POM;
+			mdDisplacement = PomDisplacement;
+		}
+		else if (shQuality == QUALITY_MEDIUM)
+		{
+			mdQuality = MICRO_DETAIL_QUALITY_OBM;
+			mdDisplacement = ObmDisplacement;
+		}
+	#elif %PARALLAX_OCCLUSION_MAPPING
+		if (shQuality > QUALITY_MEDIUM)
+		{
+			mdQuality = MICRO_DETAIL_QUALITY_POM;
+			mdDisplacement = PomDisplacement;
+		}
+	#elif %OFFSET_BUMP_MAPPING
+		if (shQuality > QUALITY_LOW)
+		{
+			mdQuality = MICRO_DETAIL_QUALITY_OBM;
+			mdDisplacement = ObmDisplacement;
+		}
+	#endif
+
+	mdHeightBias = HeightBias;
+	mdSelfShadowStrength = SelfShadowStrength;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// WH[TBa]: detail mapping helper functions, KCD2-130352
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#if DETAIL_MAPPING_FADEOUT
+void ApplyDetailFadeoutWH(inout float3 detailScales, float worldDistance)
+{
+	if (DetailFadeoutDistance > 0.f)
+	{
+		const float coef = 1.f - pow(saturate(worldDistance / DetailFadeoutDistance), 2.f);
+		detailScales *= coef;
+	}
+}
+#else
+void ApplyDetailFadeoutWH(inout float3 detailScales, float worldDistance) {}
+#endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// EnvMap Samplers
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+min16float4 DecodeHDRCubemap(min16float4 color)
+{
+	return color;
+}
+
+min16float4 GetEnvironmentCMap(TextureCube<min16float4> envCubeTex, SamplerState envCubeSampler, in min16float3 envTC, in min16float fGloss)
+{
+	const min16float numCMapMips = 6.0;  // TODO: Use real cubemap size
+	
+	min16float fGlossinessLod = numCMapMips - fGloss * numCMapMips;
+	min16float4 envColor = DecodeHDRCubemap(envCubeTex.SampleLevel(envCubeSampler, envTC, fGlossinessLod));
+
+	return envColor;
+}
+
+void CubemapBoxParallaxCorrection(inout min16float3 vReflVec, in min16float3 vPosLightDist, in min16float3 vBoxExtentsMin, in min16float3 vBoxExtentsMax, inout min16float fGloss)
+{
+	// Parallax correction for local cubemaps using a box as geometry proxy
+
+	min16float3 vReflVecN = normalize(vReflVec.xyz);
+		
+	// Min/max intersection
+	min16float3 vBoxIntersectionMax = (vPosLightDist + vBoxExtentsMax) / vReflVecN;
+	min16float3 vBoxIntersectionMin = (vPosLightDist + vBoxExtentsMin) / vReflVecN;
+	
+	// Intersection test
+	min16float3 vFurthestPlane = vReflVecN > 0.0f ? vBoxIntersectionMax : vBoxIntersectionMin;
+	min16float fDistance = min(min(vFurthestPlane.x, vFurthestPlane.y), vFurthestPlane.z);
+
+	// Apply new reflection position
+	min16float3 vInterectionPos = -vPosLightDist;
+	vReflVec = vInterectionPos + (vReflVecN * fDistance);
+
+	// Modulate glossiness based on reflection vector length.
+	//min16float3 vDist = vBoxPos - vPosition;
+	//min16float fSqrLen = 1.h - saturate(dot(vDist, vDist));
+	//fGloss = lerp(fGloss, 1.h, saturate(fGloss * fSqrLen));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// HDR output
+
+void HDRFogOutput( out pixout OUT, min16float4 Color, min16float fDepth, min16float3 FogColor, min16float fFogFactor )
+{
+  Color.xyz = lerp(FogColor.xyz, Color.xyz, fFogFactor);
+  OUT.Color = Color;
+}
+
+void HDROutput( out pixout OUT, min16float4 Color, min16float fDepth)
+{
+  OUT.Color = Color;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Depth/Fog output
+
+#include "VolumetricFog.cfi"
+
+// NOTE: float[X] was used in favor of min16float[X] as precision is curcial and min16float's is not sufficient!
+min16float4 EncodeSceneDepth( float depth )
+{
+  return min16float4(depth,depth,depth,depth);
+} 
+
+// This function encodes a depth value so it can be stored in an ARGB8 rendertarget and sets a specific alpha value
+float4 EncodeSceneDepthWithAlpha( float depth, min16float alpha, min16float alphaTestRef)
+{
+  float4 ret = EncodeSceneDepth( depth );
+
+	clip(alpha - alphaTestRef);
+
+	ret.a = alpha;
+
+  return ret;
+}
+
+// This function encodes a depth value so it can be stored in an ARGB8 rendertarget and sets a specific alpha value
+float4 EncodeSceneDepthNoAlpha( float depth)
+{
+  return EncodeSceneDepth( depth );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Common culling/interpolation functions
+
+float4 BilinearInterp(float2 UV, float4 p0, float4 p1, float4 p2, float4 p3)
+{
+	float4 bl = float4( (1.f - UV.x) * (1.f - UV.y), UV.x * (1.f - UV.y), (1.f - UV.x) * UV.y, UV.x * UV.y );
+
+	return bl.x * p0 + bl.y * p1 + bl.z * p2+ bl.w * p3;
+}
+
+float4 BarycentricInterp(float3 bcs, float4 p0, float4 p1, float4 p2)
+{
+	return bcs.x * p0 + bcs.y * p1 + bcs.z * p2;
+}
+
+float DistanceFromPlane (float3 f3Position, float4 f4PlaneEquation)
+{
+  return dot(float4( f3Position, 1.0f ), f4PlaneEquation);
+}
+
+bool ViewFrustumCull(
+                    float3 f3EdgePosition0,         // World space position of patch control point 0
+                    float3 f3EdgePosition1,         // World space position of patch control point 1
+                    float3 f3EdgePosition2,         // World space position of patch control point 2
+                    float4x4 f4ViewFrustumPlanes,   // 4 plane equations (left, right, top, bottom)
+                    float fCullEpsilon              // Epsilon to determine the distance outside the view frustum is still considered inside
+                    )
+{    
+	bool4 f4PlaneTest;
+	// Left clip plane
+	f4PlaneTest.x = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[0]) < fCullEpsilon);
+	// Right clip plane
+	f4PlaneTest.y = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[1]) < fCullEpsilon);
+	// Top clip plane
+	f4PlaneTest.z = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[2]) < fCullEpsilon);
+	// Bottom clip plane
+	f4PlaneTest.w = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[3]) < fCullEpsilon);
+	
+	// Triangle has to pass all 4 plane tests to be visible
+	return !all( f4PlaneTest );
+}
+
+bool ViewFrustumCull(
+                    float3 f3EdgePosition0,         // World space position of patch control point 0
+                    float3 f3EdgePosition1,         // World space position of patch control point 1
+                    float3 f3EdgePosition2,         // World space position of patch control point 2
+                    float3 f3EdgePosition3,         // World space position of patch control point 3
+                    float4x4 f4ViewFrustumPlanes,   // 4 plane equations (left, right, top, bottom)
+                    float fCullEpsilon              // Epsilon to determine the distance outside the view frustum is still considered inside
+                    )
+{    
+	bool4 f4PlaneTest;
+	// Left clip plane
+	f4PlaneTest.x = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[0]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[0]) < fCullEpsilon);
+	// Right clip plane
+	f4PlaneTest.y = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[1]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[1]) < fCullEpsilon);
+	// Top clip plane
+	f4PlaneTest.z = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[2]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[2]) < fCullEpsilon);
+	// Bottom clip plane
+	f4PlaneTest.w = (DistanceFromPlane(f3EdgePosition0, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition1, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+		|| (DistanceFromPlane(f3EdgePosition2, f4ViewFrustumPlanes[3]) < fCullEpsilon)
+    || (DistanceFromPlane(f3EdgePosition3, f4ViewFrustumPlanes[3]) < fCullEpsilon);
+	
+	// Quad has to pass all 4 plane tests to be visible
+	return !all( f4PlaneTest );
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Setup alpha coverage/alpha value
+
+void GetAlphaCoverageMask(Texture2D<min16float4> texDiffuse, in float2 baseTC, in min16float4 fAlphaRef, min16float4 fDiffuseAlpha, inout uint uCoverageMask) 
+{
+#if %_RT_ALPHATEST
+
+#if %_RT_MSAA_QUALITY || %_RT_MSAA_QUALITY1
+	float2 vDDX = ddx( baseTC.xy );
+	float2 vDDY = ddy( baseTC.xy );
+
+	int nSamplesNum = GetMSAASampleNum();
+
+	// DX11 has standardized MSAA offsets
+#if %_RT_MSAA_QUALITY && %_RT_MSAA_QUALITY1
+	static const float2 vMSAAOffsets[8] = 
+	{ 
+		float2(0.0625, -0.1875),  float2(-0.0625,  0.1875),
+		float2(0.3125,  0.0625),  float2(-0.1875, -0.3125),
+		float2(-0.3125,  0.3125), float2(-0.4375, -0.0625),
+		float2(0.1875,  0.4375),  float2(0.4375, -0.4375)
+	};
+#elif %_RT_MSAA_QUALITY && !%_RT_MSAA_QUALITY1
+	static const float2 vMSAAOffsets[4] = 
+	{ 
+		float2(-0.125, -0.375), float2(0.375, -0.125),
+		float2(-0.375,  0.125), float2(0.125,  0.375)
+	};
+#elif !%_RT_MSAA_QUALITY && %_RT_MSAA_QUALITY1
+	static const float2 vMSAAOffsets[2] = 
+	{ 
+		float2(0.25, 0.25), float2(-0.25, -0.25) 
+	};
+#endif
+
+	// Loop through all sub-samples
+	[unroll] for( int i = 0; i < nSamplesNum; ++i )
+	{
+		// TODO: use gather
+		float2 v2TexelOffset = vMSAAOffsets[i].x * vDDX + vMSAAOffsets[i].y * vDDY;
+		float fSampleDiffuseAlpha = GetAlphaTex(texDiffuse, baseTC + v2TexelOffset);
+
+		if( ( fSampleDiffuseAlpha - fAlphaRef ) >= 0 )
+		{ 
+			// Update output coverage mask 
+			uCoverageMask |= ( uint(0x1) << i );
+		}
+	}
+#endif
+
+#endif
+}
