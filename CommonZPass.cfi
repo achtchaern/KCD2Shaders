@@ -387,16 +387,7 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
   #if !%TEMP_VEGETATION
     const float lod = ComputeTextureLOD(IN.baseTC.xy, normalTexRes.xy);
 
-    const float viewZ = abs(vViewTS.z);
-    const float grazing = 1.0 - smoothstep(0.15, 0.35, viewZ);
-
-    const float boost = 1.0 + grazing * 0.75;
-    const float pomDisp = mdDisplacement * boost;
-
-    // compensate bias so the surface plane doesn't shift
-    const float pomBias = saturate(1.0 - (1.0 - mdHeightBias) / boost);
-
-    const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, 15, pomDisp, pomBias, blendFac, blendLayer2Tiling);
+    const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, 15, mdDisplacement, mdHeightBias, blendFac, blendLayer2Tiling);
     IN.baseTC.xy = offsetBest.xy;
   #endif
 #endif
