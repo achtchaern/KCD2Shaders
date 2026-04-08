@@ -380,14 +380,18 @@ void GatherMaterialAttribs(in half3x3 mTangentToWS, in float2 baseTC, in float2 
 			baseTC.xy = OffsetMap(baseTC.xy, -vViewTS, 2, mdDisplacement, mdHeightBias, 0, 0);
 	#endif
 		}
-		else if(mdQuality == MICRO_DETAIL_QUALITY_POM)
-		{
+	else if(mdQuality == MICRO_DETAIL_QUALITY_POM)
+	{
 	#if %PARALLAX_OCCLUSION_MAPPING
-			const float lod = ComputeTextureLOD(baseTC.xy, normalTexRes.xy);
-			const float3 offsetBest = ParallaxOcclusionMap(baseTC.xy, lod, vViewTS, 15, mdDisplacement, mdHeightBias, 0, 0);
-			baseTC.xy = offsetBest.xy;
+		float lod = ComputeTextureLOD(baseTC.xy, normalTexRes.xy);
+
+		// POM LOD bias: keep higher-detail height mips further away
+		lod = max(lod - 1.5f, 0.0f);
+
+		const float3 offsetBest = ParallaxOcclusionMap(baseTC.xy, lod, vViewTS, 48, mdDisplacement, mdHeightBias, 0, 0);
+		baseTC.xy = offsetBest.xy;
 	#endif
-		}
+	}
 		
 		// Self shadowing
 		if (mdQuality == MICRO_DETAIL_QUALITY_POM || mdQuality == MICRO_DETAIL_QUALITY_OBM)
