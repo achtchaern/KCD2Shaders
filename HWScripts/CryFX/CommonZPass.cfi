@@ -385,15 +385,20 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
   {
 #if %PARALLAX_OCCLUSION_MAPPING // still needed to compile as we refer to IN.viewTS
   #if !%TEMP_VEGETATION
-    const float lod = ComputeTextureLOD(IN.baseTC.xy, normalTexRes.xy);
+	float lod = ComputeTextureLOD(IN.baseTC.xy, normalTexRes.xy);
 
-    // Grazing boost: increases POM only at shallow angles
-    const float viewZ = abs(vViewTS.z);
-    const float grazing = saturate((0.6 - viewZ) * 2.5); // starts below ~0.6
-    const float pomDisp = mdDisplacement * (1.0 + grazing * 0.85); // max 1.75x
+	// POM LOD bias: keep higher-detail height mips further away
+	lod = max(lod - 1.5f, 0.0f);   // try -1.0 to -2.0
 
-    const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, 48, pomDisp, mdHeightBias, blendFac, blendLayer2Tiling);
-    IN.baseTC.xy = offsetBest.xy;
+	// More steps at grazing angles (stronger + stable)
+	const float viewZ = abs(vViewTS.z);
+	const float grazing = saturate((0.6 - viewZ) * 2.5);
+	const int steps = (int)lerp(64.0, 128.0, grazing);
+
+	// POM
+	const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, steps, mdDisplacement, mdHeightBias, blendFac, blendLayer2Tiling);
+	IN.baseTC.xy = offsetBest.xy;
+
   #endif
 #endif
   }
@@ -534,7 +539,7 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
 	#if %DETAIL_MAPPING || %DETAIL_ATLAS
 		min16float3 vDetailScales = min16float3(DetailBumpScale, DetailDiffuseScale,DetailGlossScale);
 
-		ApplyDetailFadeoutWH(vDetailScales, worldDistance);
+		//ApplyDetailFadeoutWH(vDetailScales, worldDistance);
 
 		#if %SNDUVS && !%USE_FIRST_UV_DETMAP
 			const float2 tcDetail = IN.secondTC.xy * CM_DetailTilingAndAlphaRef.xy;
@@ -578,7 +583,7 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
 			ApplyWeaponToDetail(vDetail, wpnParams);
 		#endif
 
-		vNormalTS.xy += vDetail.xy;
+		vNormalTS.xy += vDetail.xy * 1.0h; // DEBUG: exaggerate detail
 	#endif
 
 #if %BILLBOARD
