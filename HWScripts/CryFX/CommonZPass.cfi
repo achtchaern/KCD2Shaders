@@ -392,7 +392,7 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
 
 	// More steps at grazing angles (stronger + stable)
 	const float viewZ = abs(vViewTS.z);
-	const float grazing = saturate((0.6 - viewZ) * 2.5);
+	const float grazing = saturate((0.5 - viewZ) * 3.0);
 	const int steps = (int)lerp(64.0, 128.0, grazing);
 
 	// POM

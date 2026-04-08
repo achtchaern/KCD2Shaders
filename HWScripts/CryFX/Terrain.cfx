@@ -380,14 +380,24 @@ void GatherMaterialAttribs(in half3x3 mTangentToWS, in float2 baseTC, in float2 
 			baseTC.xy = OffsetMap(baseTC.xy, -vViewTS, 2, mdDisplacement, mdHeightBias, 0, 0);
 	#endif
 		}
-		else if(mdQuality == MICRO_DETAIL_QUALITY_POM)
-		{
-	#if %PARALLAX_OCCLUSION_MAPPING
-			const float lod = ComputeTextureLOD(baseTC.xy, normalTexRes.xy);
-			const float3 offsetBest = ParallaxOcclusionMap(baseTC.xy, lod, vViewTS, 48, mdDisplacement, mdHeightBias, 0, 0);
+	else if(mdQuality == MICRO_DETAIL_QUALITY_POM)
+	{
+		#if %PARALLAX_OCCLUSION_MAPPING
+			float lod = ComputeTextureLOD(baseTC.xy, normalTexRes.xy);
+
+			// POM LOD bias: keep higher-detail height mips further away
+			lod = max(lod - 1.5f, 0.0f);
+
+			// Grazing-only boost (no change at steep angles)
+			const float viewZ = abs(vViewTS.z);                  // 1 = front-on, 0 = grazing
+			const float grazing = saturate((0.4 - viewZ) * 3.0); // starts only below ~0.4
+			const float grazingBoost = grazing * grazing;        // smoother ramp
+			const float pomDisp = mdDisplacement * (1.0 + grazingBoost * 0.35);
+
+			const float3 offsetBest = ParallaxOcclusionMap(baseTC.xy, lod, vViewTS, 48, pomDisp, mdHeightBias, 0, 0);
 			baseTC.xy = offsetBest.xy;
-	#endif
-		}
+		#endif
+	}
 		
 		// Self shadowing
 		if (mdQuality == MICRO_DETAIL_QUALITY_POM || mdQuality == MICRO_DETAIL_QUALITY_OBM)
