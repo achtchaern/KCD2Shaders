@@ -14,7 +14,7 @@ float Script : STANDARDSGLOBAL
 >; 
 
 Texture2D<min16float4> shadowDepthTex                : register(t0) = TS_Shadow0;
-Texture2D<min16float4> noiseTex                      : register(t1) = "%ENGINE%/EngineAssets/Textures/rotrandom.dds"; 
+Texture2D<min16float4> noiseTex                      : register(t1) = "%ENGINE%/EngineAssets/Textures/rotrandom128.dds"; 
 Texture2D           sceneDepthTexture   : register(t2) = TS_ZTarget ;
 Texture2DMS<float4> sceneDepthTextureMS : register(t3) = TS_ZTargetMS;
 
@@ -137,6 +137,10 @@ float BlendVP(float3 vp, bool blendOut)
 
 	float result = saturate(max(max(vBlend.x,vBlend.y),vBlend.z));
 
+	// --- NEW: expand blend overlap to hide seams ---
+	const float seamBias = 0.05f;          // try 0.02–0.06
+	result = saturate(result + seamBias);
+
 	return (blendOut) ? (1.0 - result) : result;
 }
 
@@ -247,7 +251,7 @@ min16float CalcShadow(float4 vShPos, float2 vNoisePos, const bool bContactHarden
 	filterKernel.adaption       = c_ShadowMaskConstants.vAdaption;
 
 #if %_RT_SHADOW_JITTERING
-      irregular_filter(shadowDepthTex, c_ShadowMaskConstants.vInvShadowMapSize.xx, samplingContext, filterKernel, P0, fInShadow, bContactHardening);
+      irregular_filter_sun(shadowDepthTex, c_ShadowMaskConstants.vInvShadowMapSize.xx, samplingContext, filterKernel, P0, fInShadow, bContactHardening);
 	  fInShadow = pow(fInShadow,2);
 #else 
 	//debug one-tap sampling

@@ -486,7 +486,14 @@ void Fwd_StandardShading(in MaterialAttribsCommon commonAttribs, inout ForwardSh
 		
 		ForwardLightParams lightParams = CreateForwardLightParamsWH(LIGHT_TYPE_SUN);
 		lightParams.lightVec = CV_SunLightDir.xyz;
-		lightParams.illuminanceWH.color = CV_SunColor.xyz * shadowOcclusion;
+
+		// subtle low-angle attenuation only (daytime unaffected)
+		const float sunHeight = saturate(CV_SunLightDir.z);           // 0 at horizon, 1 at zenith
+		const float dayThreshold = 0.20f;                              // above this = full strength
+		const float lowAngle = smoothstep(0.0f, dayThreshold, sunHeight);
+		const float sunAngleAtten = lerp(0.75f, 1.0f, lowAngle);        // subtle fade near horizon
+
+		lightParams.illuminanceWH.color = CV_SunColor.xyz * shadowOcclusion * sunAngleAtten;
 		Callback_ShadingDirect(fwdAttribs, lightParams, diffuseAcc, specularAcc);
 	}
 	

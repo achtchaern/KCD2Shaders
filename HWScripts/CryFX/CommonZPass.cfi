@@ -388,12 +388,12 @@ pixout_gbuffer Common_ZPassPS(vert2fragZ IN)
 	float lod = ComputeTextureLOD(IN.baseTC.xy, normalTexRes.xy);
 
 	// POM LOD bias: keep higher-detail height mips further away
-	lod = max(lod - 1.5f, 0.0f);   // try -1.0 to -2.0
+	lod = max(lod - 2.0f, 0.0f);   // stronger bias
 
 	// More steps at grazing angles (stronger + stable)
 	const float viewZ = abs(vViewTS.z);
-	const float grazing = saturate((0.5 - viewZ) * 3.0);
-	const int steps = (int)lerp(64.0, 128.0, grazing);
+	const float grazing = saturate((0.55 - viewZ) * 3.5);
+	const int steps = (int)lerp(80.0, 160.0, grazing);
 
 	// POM
 	const float3 offsetBest = ParallaxOcclusionMap(IN.baseTC.xy, lod, vViewTS, steps, mdDisplacement, mdHeightBias, blendFac, blendLayer2Tiling);

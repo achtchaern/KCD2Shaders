@@ -522,7 +522,8 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 		min16float2( -0.44, -0.34 ),
 		min16float2( -0.52, 0.4 ),
 		min16float2( 0.3, 0.68 ),
-		min16float2( 0.84, -0.32 )
+		min16float2( 0.84, -0.32 ),
+
 	};
 	
 	float4 screenTC;
@@ -645,6 +646,8 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 
 	const min16float fNormFac = 0.15;
 	sh2.xyzw *= fNormFac;
+	// soft clamp to avoid max‑dark clipping on sharp corners
+	sh2.w = sh2.w / (0.7h + sh2.w);
 		
 	// Heightmap AO
 #if %_RT_SAMPLE1

@@ -8,4 +8,44 @@ float Script : STANDARDSGLOBAL
            "ShaderDrawType = NoDraw;";
 >;
 
+// depth-only pass so Nodraw geometry still writes depth (AO uses depth)
+struct a2v
+{
+  float4 Position : POSITION;
+};
+
+struct v2f
+{
+  float4 Position : SV_POSITION;
+};
+
+v2f NoDrawZVS(a2v IN)
+{
+  v2f OUT = (v2f)0;
+  OUT.Position = mul(CV_ViewProjMatr, IN.Position);
+  return OUT;
+}
+
+pixout NoDrawZPS(v2f IN)
+{
+  pixout OUT = (pixout)0;
+  OUT.Color = 0;
+  return OUT;
+}
+
+technique ZPass
+{
+  pass p0
+  {
+    VertexShader = NoDrawZVS();
+    PixelShader = NoDrawZPS();
+
+    ZEnable = true;
+    ZWriteEnable = true;
+    CullMode = Back;
+
+    ColorWriteEnable = 0;
+  }
+}
+
 /////////////////////// eof ///

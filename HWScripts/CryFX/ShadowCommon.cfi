@@ -92,8 +92,8 @@ Texture2D<float4> depthMapSampler3 : TS_Shadow6;
 sampler2D sRotSampler = sampler_state
 {
   Texture = %ENGINE%/EngineAssets/Textures/rotrandom.dds;
-  MinFilter = POINT;
-  MagFilter = POINT;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
   MipFilter = POINT; 
   AddressU = Wrap;
   AddressV = Wrap;	
@@ -256,7 +256,7 @@ void irregular_filter_impl(Texture2D<min16float4> depthMap, ShadowSamplingContex
     min16float kernelOffset = 0;
     min16float kernelSize = GetShadowSamplesNum() / 2;
 
-	const int kernelStepSize = 1;
+	const int kernelStepSize = 2;
 
 	/////////////////////////////
 	//depth range estimation
@@ -323,6 +323,99 @@ void irregular_filter(Texture2D<min16float4> depthMap, float2 invShadowMapSize, 
 	irregular_filter_impl(depthMap, samplingContext, filterKernel, p, rotMatr, kernelRadius, shadowTest, bContactHardening);
 }
 
+void irregular_filter_impl_sun(Texture2D<min16float4> depthMap, ShadowSamplingContext samplingContext, IrregularFilterKernel filterKernel, float4 p, float4 rotMatr, min16float2 kernelRadius, out min16float shadowTest, const bool bContactHardening = false)
+{
+    min16float kernelOffset = 0;
+    min16float kernelSize = GetShadowSamplesNum() / 2;
+
+	const int kernelStepSize = 1;
+
+	/////////////////////////////
+	//depth range estimation
+	if (bContactHardening)
+	{
+        min16float accumArea = 0.0f;
+		min16float accumCoverage = 0.01f;
+		min16float2 kernelScale = kernelRadius * 2.7;
+
+		for(int i=kernelOffset; i<kernelSize; i+=kernelStepSize) // Loop over taps
+		{
+            min16float4 sampleDepth;
+			sampleDepth.x = depthMap.SampleLevel(samplingContext.pointSamplerClamp, p.xy + filterKernel.taps[i+0].xy * kernelScale, 0).r;
+			sampleDepth.y = depthMap.SampleLevel(samplingContext.pointSamplerClamp, p.xy + filterKernel.taps[i+0].zw * kernelScale, 0).r;
+			sampleDepth.z = depthMap.SampleLevel(samplingContext.pointSamplerClamp, p.xy + filterKernel.taps[i+1].xy * kernelScale, 0).r;
+			sampleDepth.w = depthMap.SampleLevel(samplingContext.pointSamplerClamp, p.xy + filterKernel.taps[i+1].zw * kernelScale, 0).r;
+
+            min16float4 localArea = (p.zzzz - sampleDepth);
+            min16float4 samplNum = localArea > 0.0f;
+			accumCoverage += dot(samplNum, float4(1,1,1,1));
+
+			localArea = min(abs(localArea), filterKernel.adaption.xxxx); 
+			accumArea += dot(localArea.xyzw, samplNum.xyzw);
+		}
+
+		float kernelAdjScale = 0.0f;
+
+		if (accumCoverage > 0.1f)
+		{
+			
+			kernelAdjScale = accumArea / accumCoverage;
+
+			// boost only below a knee (early blur)
+			// knee should be in the same scale as kernelAdjScale
+			const float boost = 2.0f;                    // try 1.5–2.5
+			const float knee  = filterKernel.adaption.z * 2.0f; // start point for transition
+
+			float t = saturate(kernelAdjScale / knee);
+			kernelAdjScale = lerp(kernelAdjScale * boost, kernelAdjScale, t);
+
+			// then keep original behavior
+			kernelAdjScale = kernelAdjScale * filterKernel.adaption.y;
+			rotMatr *= max(kernelAdjScale, filterKernel.adaption.z);
+
+		}
+		else
+		{
+			rotMatr *= filterKernel.adaption.z;
+		}
+	}
+	/////////////////////////////
+	
+	shadowTest = 0;
+		
+    [unroll]
+	for(int i=kernelOffset; i<kernelSize; i+=kernelStepSize) // Loop over taps
+	{
+        min16float4 inShadow;
+		DoubleSampleRotated(depthMap, samplingContext.comparisonSampler, p.xyz, rotMatr, filterKernel.taps[i+0], inShadow.xy);
+		DoubleSampleRotated(depthMap, samplingContext.comparisonSampler, p.xyz, rotMatr, filterKernel.taps[i+1], inShadow.zw);
+
+        min16float fInvSamplNum = (1.0 / GetShadowSamplesNum());
+		shadowTest += dot(inShadow,fInvSamplNum.xxxx);
+	}
+}
+
+// Bring parameters into tex space first and then call irregular_filter_impl 
+void irregular_filter_sun(Texture2D<min16float4> depthMap, float2 invShadowMapSize, ShadowSamplingContext samplingContext, IrregularFilterKernel filterKernel, float4 p, out min16float shadowTest, const bool bContactHardening = false)
+{
+	float2 randDirTC = filterKernel.noiseLookupPos.xy;
+	float2 kernelRadius = filterKernel.scale * invShadowMapSize;
+
+    min16float2 rotSampleA = GetTexture2D(samplingContext.noiseTex, samplingContext.pointSamplerWrap, randDirTC.xy).xy * kernelRadius.xy;
+    min16float2 rotSampleB = GetTexture2D(samplingContext.noiseTex, samplingContext.pointSamplerWrap, randDirTC.xy + float2(0.37h, 0.53h)).xy * kernelRadius.xy;
+
+    min16float4 rotMatrA = float4(rotSampleA.x, -rotSampleA.y, rotSampleA.y, rotSampleA.x);
+    min16float4 rotMatrB = float4(rotSampleB.x, -rotSampleB.y, rotSampleB.y, rotSampleB.x);
+
+    min16float shadowA;
+    min16float shadowB;
+
+	irregular_filter_impl_sun(depthMap, samplingContext, filterKernel, p, rotMatrA, kernelRadius, shadowA, bContactHardening);
+	irregular_filter_impl_sun(depthMap, samplingContext, filterKernel, p, rotMatrB, kernelRadius, shadowB, bContactHardening);
+
+    shadowTest = (shadowA + shadowB) * 0.5h;
+}
+
 min16float GetVolumetricCloudShadow(Texture3D<min16float4> volCloudShadowTex, SamplerState volCloudSState, float3 worldPos, min16float3 sunDir, min16float4 params, min16float4 animParams, float shadowStrength)
 {
     const min16float cloudBottomAltitude = params.x;
@@ -387,9 +480,9 @@ bool ShadowCascadeSample(Texture2D<min16float4> depthMap, ShadowSamplingContext 
 			IrregularFilterKernel filterKernel;
 			filterKernel.taps = params.IrregKernel2D;
 			filterKernel.scale = GetKernelSize(params.KernelRadius.xy);
-			filterKernel.noiseLookupPos = randDirTC * (filterKernel.scale.y * 15.h);
+			filterKernel.noiseLookupPos = randDirTC * (filterKernel.scale.y * 25.h);
 
-			irregular_filter(depthMap, params.InvShadowMapSize.xx, samplingContext, filterKernel, p, fShadow);
+			irregular_filter_sun(depthMap, params.InvShadowMapSize.xx, samplingContext, filterKernel, p, fShadow);
 			
 			fShadow = pow(fShadow,2);
 		}

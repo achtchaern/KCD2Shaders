@@ -356,12 +356,14 @@ min16float3 HDRComposition(in min16float3 cScene, in min16float3 cBloom, in min1
 #endif
 
 	// DR tuning: Compress highlights (no exposure bias)
-	const min16float kHighlightCompression = 0.23h; // 0..1: stronger highlight roll-off
+	const min16float kHighlightCompression = 0.25h; // 0..1: stronger highlight roll-off
+	const min16float kHighlightShoulder = 1.1h;     // shoulder start (>0). 1.0 = old behavior
+
 	min16float3 cColor = fVignetting * fExposure * lerp(cScene, cBloom, saturate(HDRBloomColor));
-	// Highlight compression (shoulder): only above ~1.0
-	min16float3 highlightExcess = max(cColor - 1.0h, 0.0h);
+	// Highlight compression (shoulder): only above shoulder start
+	min16float3 highlightExcess = max(cColor - kHighlightShoulder, 0.0h);
 	min16float3 cHighlight = cColor / (1.0h + highlightExcess * kHighlightCompression);
-	min16float3 highlightMask = saturate(cColor - 1.0h);
+	min16float3 highlightMask = saturate(cColor - kHighlightShoulder);
 	cColor = lerp(cColor, cHighlight, highlightMask);
 
 	// HDR color grading
