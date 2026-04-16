@@ -487,7 +487,7 @@ void Fwd_StandardShading(in MaterialAttribsCommon commonAttribs, inout ForwardSh
 		ForwardLightParams lightParams = CreateForwardLightParamsWH(LIGHT_TYPE_SUN);
 		lightParams.lightVec = CV_SunLightDir.xyz;
 
-		// subtle low-angle attenuation only (daytime unaffected)
+		// subtle low-angle attenuation only
 		const float sunHeight = saturate(CV_SunLightDir.z);           // 0 at horizon, 1 at zenith
 		const float dayThreshold = 0.20f;                              // above this = full strength
 		const float lowAngle = smoothstep(0.0f, dayThreshold, sunHeight);

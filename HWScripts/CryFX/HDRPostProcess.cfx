@@ -170,14 +170,15 @@ float2 HDRSampleLumInitialPS(vtxOut IN) : SV_Target
 	{
 		float2 SampleTC = IN.baseTC.xy + sampleOffsets[i];
 
-		// --- SAMPLE ONLY LOWER 70% OF SCREEN ---
-		// compress Y into [0.30 .. 1.00]
-		SampleTC.y = 0.30h + SampleTC.y * 0.70h;
+		// --- SAMPLE ONLY LOWER 60% OF SCREEN ---
+		// compress Y into [0.40 .. 1.00]
+		SampleTC.y = 0.40h + SampleTC.y * 0.60h;
 
 		SampleTC = MapViewportToRaster(SampleTC);
 
 #if  %_RT_SAMPLE1   // Using GBuffer
 	#if !%_RT_SAMPLE0		 
+		// Use base color to get a coarse approximation of the (incoming) illuminance
 		MaterialAttribsCommon attribs = DecodeGBuffer(
 			GetTexture2D(HDRLum_Norm, HDRLum_LClampSampler, SampleTC),
 			GetTexture2D(HDRLum_Diff, HDRLum_LClampSampler, SampleTC),
@@ -357,7 +358,7 @@ min16float3 HDRComposition(in min16float3 cScene, in min16float3 cBloom, in min1
 
 	// DR tuning: Compress highlights (no exposure bias)
 	const min16float kHighlightCompression = 0.25h; // 0..1: stronger highlight roll-off
-	const min16float kHighlightShoulder = 1.1h;     // shoulder start (>0). 1.0 = old behavior
+	const min16float kHighlightShoulder = 1.0h;     // shoulder start (>0). 1.0 = old behavior
 
 	min16float3 cColor = fVignetting * fExposure * lerp(cScene, cBloom, saturate(HDRBloomColor));
 	// Highlight compression (shoulder): only above shoulder start

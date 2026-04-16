@@ -522,7 +522,7 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 		min16float2( -0.44, -0.34 ),
 		min16float2( -0.52, 0.4 ),
 		min16float2( 0.3, 0.68 ),
-		min16float2( 0.84, -0.32 ),
+		min16float2( 0.84, -0.32 )
 
 	};
 	
