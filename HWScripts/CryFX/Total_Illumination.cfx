@@ -689,7 +689,7 @@ float4 ConeTraceTreeAndSkyEx(
 	float fConeSev,
 	out float4 vNor1,
 	const float fConesColorSatur = 1.f,
-	const float fMultTriRT = 0,
+	const float fMultTriRT = 1,
 	const bool bSpecular = false,
 	bool bForceUseLighting = false,
 	const bool bAllowSkyLight = true,
@@ -1634,8 +1634,10 @@ pixoutMRTTrace ConeTracePS(vtxOutWPOS IN)
 		r.startpoint += normalize(vNor0) * 0.02;
 
 		#if %_RT_TILED_SHADING && %_RT_NO_TESSELLATION
-		  r.startpoint += (vFocus * fAverTransmittanceY) * (VOX_MIN_VOX_SIZE + fDistM*.025f);
+		  const float voxScale = IsDiffuseMode() ? 0.5f : 1.0f;
+		  r.startpoint += (vFocus * fAverTransmittanceY) * ((VOX_MIN_VOX_SIZE * voxScale) + fDistM*.025f);
 		#endif
+
 
 		#if %_RT_SAMPLE5 && !%_RT_LIGHTVOLUME1 && %_RT_LIGHTVOLUME0
 		if (SvoTreeSettings5.y)
