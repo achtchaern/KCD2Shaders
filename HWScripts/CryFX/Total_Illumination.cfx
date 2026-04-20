@@ -689,7 +689,7 @@ float4 ConeTraceTreeAndSkyEx(
 	float fConeSev,
 	out float4 vNor1,
 	const float fConesColorSatur = 1.f,
-	const float fMultTriRT = 1,
+	const float fMultTriRT = 0,
 	const bool bSpecular = false,
 	bool bForceUseLighting = false,
 	const bool bAllowSkyLight = true,
