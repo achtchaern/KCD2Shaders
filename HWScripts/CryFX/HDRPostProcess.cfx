@@ -169,11 +169,6 @@ float2 HDRSampleLumInitialPS(vtxOut IN) : SV_Target
 #endif
 	{
 		float2 SampleTC = IN.baseTC.xy + sampleOffsets[i];
-
-		// --- SAMPLE ONLY LOWER 60% OF SCREEN ---
-		// compress Y into [0.40 .. 1.00]
-		SampleTC.y = 0.40h + SampleTC.y * 0.60h;
-
 		SampleTC = MapViewportToRaster(SampleTC);
 
 #if  %_RT_SAMPLE1   // Using GBuffer
