@@ -333,26 +333,16 @@ min16float3 HDRComposition(in min16float3 cScene, in min16float3 cBloom, in min1
 	min16float fExposure;
 
 #if %_RT_SAMPLE4
-	// Legacy exposure mode (clamp is in exposure space)
-	// Lower min -> allow darker; lower max -> limit brightening
-	const min16float minExp = HDREyeAdaptation.y * 0.7h; // allow darker exposure
-	const min16float maxExp = HDREyeAdaptation.z * 0.8h; // cap brightening in dark scenes
-
+	// Legacy exposure mode
+	// Krawczyk scene key estimation adjusted to better fit our range - low (0.05) to high key (0.8) interpolation based on avg scene luminance
 	const min16float fSceneKey = 1.03h - 2.0h / (2.0h + log2(vAdaptedLum.x + 1.0));
-	fExposure = clamp(fSceneKey / vAdaptedLum.x, minExp, maxExp);
+	fExposure = clamp(fSceneKey / vAdaptedLum.x, HDREyeAdaptation.y, HDREyeAdaptation.z);
 #else
-	// Modern exposure (clamp is in EV space)
-	// Increase min EV -> limit brightening in dark scenes
-	// Increase max EV -> allow darker exposure for bright scenes
-	min16float4 eye = min16float4(HDREyeAdaptation);
-	eye.x -= 0.1h; // raise min EV (less brightening)
-	eye.y += 0.8h; // raise max EV (more darkening)
-
-	fExposure = ComputeExposure(vAdaptedLum.y, eye);
+	fExposure = ComputeExposure(vAdaptedLum.y, min16float4(HDREyeAdaptation));
 #endif
 
 	// DR tuning: Compress highlights (no exposure bias)
-	const min16float kHighlightCompression = 0.25h; // 0..1: stronger highlight roll-off
+	const min16float kHighlightCompression = 0.20h; // 0..1: stronger highlight roll-off
 	const min16float kHighlightShoulder = 1.0h;     // shoulder start (>0). 1.0 = old behavior
 
 	min16float3 cColor = fVignetting * fExposure * lerp(cScene, cBloom, saturate(HDRBloomColor));

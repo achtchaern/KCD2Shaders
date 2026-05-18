@@ -390,7 +390,7 @@ void GatherMaterialAttribs(in half3x3 mTangentToWS, in float2 baseTC, in float2 
 
 			// Grazing-only boost (no change at steep angles)
 			const float viewZ = abs(vViewTS.z);                  // 1 = front-on, 0 = grazing
-			const float grazing = saturate((0.5 - viewZ) * 3.5); // starts only below ~0.5
+			const float grazing = saturate((0.6 - viewZ) * 4.5); // starts only below ~0.5
 			const float grazingBoost = grazing * grazing;        // smoother ramp
 			const float pomDisp = mdDisplacement * (1.0 + grazingBoost * 0.55);
 

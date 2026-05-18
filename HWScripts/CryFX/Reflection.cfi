@@ -380,6 +380,10 @@ SsrTraceResult SSRRaytrace
 		// Filter out NANs and clamp
 		color.rgb = min(isfinite(color.rgb) ? color.rgb : 0, params.maxLum.xxx);
 
+		// Reduce reflection saturation by 20% while preserving brightness
+		const float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+		color.rgb = lerp(luma.xxx, color.rgb, 0.67);
+
 		// Calculate blend weight for hit
 		//
 		// Projected position can cause judder on camera movement due to different parallax.

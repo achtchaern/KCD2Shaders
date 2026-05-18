@@ -766,12 +766,12 @@ bool ConeTraceBrick_SSR(const float3 vRayStartPos, Ray r, const float _fDistance
 	{
 		Ray rOrig = r;
 
-		float fStepSize = 0.125f;
+		float fStepSize = 0.0625f;
 
 		r.startpoint += r.direction * .1;
 		fDistance = fDistanceIn + length(r.startpoint - vRayStartPos);
 
-		for (int s = 0; s < 100; s++)
+		for (int s = 0; s < 160; s++)
 		{
 			float fVoxSize = (1 + (fDistM + fDistance) * .5) / 7;
 
@@ -867,6 +867,7 @@ bool ConeTraceBrick(const float3 vRayStartPos, inout Ray r, const float _fDistan
 		fDistance = fDistanceIn + length(r.startpoint - vRayStartPos);
 
 		const float fVoxSize = ocNodeSize / VOX_BRICK_TEXRES;
+		float fStepSizeHQ = min(fStepSize, 0.5f); // higher quality step
 
 		float3 vRayDirABS = normalize(abs(r.direction));
 
@@ -885,8 +886,8 @@ bool ConeTraceBrick(const float3 vRayStartPos, inout Ray r, const float _fDistan
 				}
 			}
 
-			r.startpoint += r.direction * fVoxSize * fStepSize;
-			t += fVoxSize * fStepSize;
+			r.startpoint += r.direction * fVoxSize * fStepSizeHQ;
+			t += fVoxSize * fStepSizeHQ;
 
 			float3 vCurTC = tcMin + ((clamp(r.startpoint, voxAreaMin.xyz + vHalfTexSizeWS, voxAreaMax.xyz - vHalfTexSizeWS) - voxAreaMin.xyz) / (vBoxSize)) * vMulTC;
 
