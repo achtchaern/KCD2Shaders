@@ -512,19 +512,22 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 {
 	pixout OUT = (pixout) 0;
 	
-	// Taps are arranged in a spiral pattern
-	static const int samplesNum = 8;
-	static const float2 kernel[8] = {
-		min16float2( -0.14, -0.02 ),
-		min16float2( -0.04, 0.24 ),
-		min16float2( 0.36, 0.08 ),
-		min16float2( 0.26, -0.4 ),
-		min16float2( -0.44, -0.34 ),
-		min16float2( -0.52, 0.4 ),
-		min16float2( 0.3, 0.68 ),
-		min16float2( 0.84, -0.32 )
-
-	};
+    // Taps arranged with golden-angle spiral (more isotropic, less patterning)
+    static const int samplesNum = 12;
+    static const float2 kernel[12] = {
+        float2( 0.166,  0.000),
+        float2(-0.279,  0.256),
+        float2( 0.039, -0.449),
+        float2( 0.358,  0.329),
+        float2(-0.541, -0.095),
+        float2( 0.521, -0.290),
+        float2(-0.192,  0.588),
+        float2(-0.174, -0.597),
+        float2( 0.667,  0.151),
+        float2(-0.666,  0.208),
+        float2( 0.097,  0.742),
+        float2( 0.257, -0.733)
+    };
 	
 	float4 screenTC;
 	screenTC.xy = IN.WPos.xy * cbSSDO.screenSize.zw;	
@@ -550,10 +553,12 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	const min16float2 radius0 = clamp( cbSSDO.ssdoParams.xy * cbSSDO.ssdoSecondaryBandRatioWH / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
 	const min16float2 radius1 = clamp( cbSSDO.ssdoParams.xy / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
 
-	// Compute jittering matrix
-	const min16float jitterIndex = dot( frac( screenTC.zw ), min16float2( 1, 0.25 ) );
-	min16float2 vJitterSinCos = min16float2( sin( PI_X2 * jitterIndex ), cos( PI_X2 * jitterIndex ) );
-	const half2x2 mSampleRotMat = { vJitterSinCos.y, vJitterSinCos.x, -vJitterSinCos.x, vJitterSinCos.y };
+    // Compute jittering matrix (add parity offset to break 4x4 repetition)
+    const min16float jitterIndex = dot( frac( screenTC.zw ), min16float2( 1, 0.25 ) );
+    const min16float parityOffset = ((int(IN.WPos.x + IN.WPos.y) & 1) != 0) ? 0.37h : 0.0h;
+    min16float2 vJitterSinCos = min16float2( sin( PI_X2 * (jitterIndex + parityOffset) ),
+                                             cos( PI_X2 * (jitterIndex + parityOffset) ) );
+    const half2x2 mSampleRotMat = { vJitterSinCos.y, vJitterSinCos.x, -vJitterSinCos.x, vJitterSinCos.y };
 
 	// rotate kernel
 	float2 rotatedKernel[samplesNum];

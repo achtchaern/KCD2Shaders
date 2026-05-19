@@ -294,14 +294,18 @@ void TiledForwardShading(in TiledForwardShadingParams shadingParams, in ForwardS
 
 	float2 occlusion = float2(1, 1);
     float occlSpec = 1;
-	if (shadingParams.ssdoMode == Mode_Deferred)
-	{
-		float aoAmount = Fwd_SSDO[attribs.screenUV * CV_ScreenSize.xy].w;
-		float occlDiff = saturate(1 - aoAmount * 1.0);
-		occlSpec = saturate(1 - aoAmount * 1.5);
-		occlusion.x = occlDiff * occlDiff;
-		occlusion.y = DeriveSpecularOcclusion(NdotV, max(occlSpec * occlSpec, 0.3), attribs.smoothness);
-	}
+    if (shadingParams.ssdoMode == Mode_Deferred)
+    {
+        float aoAmount = Fwd_SSDO[attribs.screenUV * CV_ScreenSize.xy].w;
+
+        const float aoCurveStrength = 2.0; // tune to match deferred
+        float aoRemap = 1.0 - exp2(-aoAmount * aoCurveStrength);
+
+        float occlDiff = saturate(1 - aoRemap * 1.0);
+        occlSpec = saturate(1 - aoRemap * 1.5);
+        occlusion.x = occlDiff * occlDiff;
+        occlusion.y = DeriveSpecularOcclusion(NdotV, max(occlSpec * occlSpec, 0.3), attribs.smoothness);
+    }
 
 	// WH[TBa]: add support for clip volumes in forward shaders, KCD2-291146
 	// The only exception is the eye shader, since the eye overlay reuses the Fwd_ClipVolumeIndexRT for eye AO.
@@ -1148,27 +1152,29 @@ void TiledDeferredShadingCS( uint3 GroupID : SV_GroupID,
 	// ==============================================================================================
 	// SSDO
 	// ==============================================================================================
-	float4 occlusionData = DirectionalOccRT[pixelCoord];
-	occlusionData.xyz = occlusionData.xyz * 2 - 1;
-		
-	{	
-		// Ambient occlusion
-		float occlDiff = saturate( 1 - occlusionData.a * SSDOParams.y );
-		occlDiff *= occlDiff;
+    float4 occlusionData = DirectionalOccRT[pixelCoord];
+    occlusionData.xyz = occlusionData.xyz * 2 - 1;
+        
+    {    
+        // Ambient occlusion with multi-bounce approximation
+        float aoDiff = saturate( 1 - occlusionData.a * SSDOParams.y );
+        float aoDiff2 = aoDiff * aoDiff;
 
-		// Apply simple color bleeding approximation to AO (1/8 resolution)
-		// WH[TBa]: add color bleeding strength to SSDOParams.w, KCD2-376117
-		float3 bleedColor = AOColorBleedRT.SampleLevel( SampStateTrilinearClamp, pixelUV, 0 ).rgb * SSDOParams.w;
-		
-		// WH[DH]: Clamp the diffuse occlusion to prevent the creation of invalid pixels
-		diffuseAcc *= pow(float3(occlDiff, occlDiff, occlDiff), max(float3(0.01, 0.01, 0.01), float3(1.0, 1.0, 1.0) - min(bleedColor * bleedColor * bleedColor * 3.0, float3(0.7, 0.7, 0.7))));
-		
-		// Specular occlusion
-		float NdotV = dot( -normalize( position ), surfNormal );
-		float ao = saturate( 1 - occlusionData.a * SSDOParams.z );
-		float occlSpec = DeriveSpecularOcclusion( NdotV, max(ao * ao, 0.3), surfGloss );
-		specularAcc *= occlSpec;
-	}
+        float3 bleedColor = AOColorBleedRT.SampleLevel( SampStateTrilinearClamp, pixelUV, 0 ).rgb * SSDOParams.w;
+        float3 albedo = saturate(diffuseAcc); // reuse diffuse as a cheap albedo proxy
+
+        // Multi-bounce: lifts occluded areas based on albedo
+        float3 multiBounce = (albedo * (1 - aoDiff2)) + aoDiff2;
+
+        float3 bleedClamp = max(float3(0.01, 0.01, 0.01), float3(1.0, 1.0, 1.0) - min(bleedColor * bleedColor * bleedColor * 3.0, float3(0.7, 0.7, 0.7)));
+        diffuseAcc *= pow(multiBounce, bleedClamp);
+        
+        // Specular occlusion
+        float NdotV = dot( -normalize( position ), surfNormal );
+        float aoSpec = saturate( 1 - occlusionData.a * SSDOParams.z );
+        float occlSpec = DeriveSpecularOcclusion( NdotV, max(aoSpec * aoSpec, 0.3), surfGloss );
+        specularAcc *= occlSpec;
+    }
 		
 	// ==============================================================================================
 	// Ambient lights
