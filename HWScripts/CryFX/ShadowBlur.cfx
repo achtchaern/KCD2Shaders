@@ -93,10 +93,11 @@ pixout SSDO_Blur_PS(vtxOut IN)
     depth4.w = GetTexture2D(DepthTexMinMax, DepthSS, addr3 + vDepthAddrOffset.xy);
 
 	min16float centerDepth = GetLinearDepth(DepthTexMinMax, IN.baseTC.xy);
-	min16float4 weight4 = saturate(1.h - 35.h * abs(depth4 / centerDepth - 1.h));
+    min16float4 depthDiff = abs(depth4 - centerDepth);
+    min16float4 weight4 = exp2(-depthDiff * 120.0h); // tighter edge preservation
 
-	min16float totalWeight = dot(weight4, 1.h);
-	weight4 /= totalWeight;
+    min16float totalWeight = dot(weight4, 1.h);
+    weight4 = (totalWeight > 0.0001h) ? (weight4 / totalWeight) : 0;
 	
 	OUT.Color = (value0 + value1 + value2 + value3) * 0.25h;
 	if (totalWeight > 0.01h)
