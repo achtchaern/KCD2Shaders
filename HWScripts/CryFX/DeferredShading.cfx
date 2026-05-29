@@ -549,16 +549,16 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	if (int(IN.WPos.x) & 1) maxRadius *= 0.5;
 	if (int(IN.WPos.y) & 1) maxRadius *= 0.5;
 	
-	// Use 2 bands so that occlusion works better for small-scale geometry
-	const min16float2 radius0 = clamp( cbSSDO.ssdoParams.xy * cbSSDO.ssdoSecondaryBandRatioWH / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
-	const min16float2 radius1 = clamp( cbSSDO.ssdoParams.xy / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
+	// Use 4 bands: half-small, small, large, double-large
+	const min16float2 radius0 = clamp( cbSSDO.ssdoParams.xy * (cbSSDO.ssdoSecondaryBandRatioWH * 0.5) / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
+	const min16float2 radius1 = clamp( cbSSDO.ssdoParams.xy * cbSSDO.ssdoSecondaryBandRatioWH / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
+	const min16float2 radius2 = clamp( cbSSDO.ssdoParams.xy / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
+	const min16float2 radius3 = clamp( cbSSDO.ssdoParams.xy * 2.0 / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius );
 
-    // Compute jittering matrix (add parity offset to break 4x4 repetition)
-    const min16float jitterIndex = dot( frac( screenTC.zw ), min16float2( 1, 0.25 ) );
-    const min16float parityOffset = ((int(IN.WPos.x + IN.WPos.y) & 1) != 0) ? 0.37h : 0.0h;
-    min16float2 vJitterSinCos = min16float2( sin( PI_X2 * (jitterIndex + parityOffset) ),
-                                             cos( PI_X2 * (jitterIndex + parityOffset) ) );
-    const half2x2 mSampleRotMat = { vJitterSinCos.y, vJitterSinCos.x, -vJitterSinCos.x, vJitterSinCos.y };
+	// Compute jittering matrix
+	const min16float jitterIndex = dot( frac( screenTC.zw ), min16float2( 1, 0.25 ) );
+	min16float2 vJitterSinCos = min16float2( sin( PI_X2 * jitterIndex ), cos( PI_X2 * jitterIndex ) );
+	const half2x2 mSampleRotMat = { vJitterSinCos.y, vJitterSinCos.x, -vJitterSinCos.x, vJitterSinCos.y };
 
 	// rotate kernel
 	float2 rotatedKernel[samplesNum];
@@ -580,13 +580,17 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	min16float3 vNormalVS = normalize( mul( CV_ViewMatr, min16float4(vNormal, 0) ).xyz ) * float3(1, -1, -1);
 #endif
 	
-	// WH[TBa]: redefinition of 'i' shadows declaration in the outer scope; most recent declaration will be used
+																											 
 	min16float4 sh2 = 0;
 	[unroll]
 	for (int smpl = 0; smpl < samplesNum; smpl += 4)
 	{
-		const bool narrowBand = smpl < 4;
-		const min16float2 radius = narrowBand ? radius0 : radius1;
+		const uint band = smpl / 4;
+		const min16float2 radius =
+			(band == 0) ? radius0 :
+			(band == 1) ? radius1 :
+			(band == 2) ? radius2 :
+			              radius3;
 		
 		min16float4 vSampleUV[2];
 		vSampleUV[0].xy = linearUV.xy + rotatedKernel[smpl+0].xy * radius;
@@ -612,37 +616,41 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	
 		fLinearDepthTap *= cbSSDO.nearFarClipDist.y;
 
-		// Compute view space position of emitter pixels
+												  
 		float3 vEmitterPos[4];
 		vEmitterPos[0] = float3( vSampleUV[0].xy * cbSSDO.viewSpaceParams.xy + cbSSDO.viewSpaceParams.zw, 1 ) * fLinearDepthTap.x;
 		vEmitterPos[1] = float3( vSampleUV[0].zw * cbSSDO.viewSpaceParams.xy + cbSSDO.viewSpaceParams.zw, 1 ) * fLinearDepthTap.y;
 		vEmitterPos[2] = float3( vSampleUV[1].xy * cbSSDO.viewSpaceParams.xy + cbSSDO.viewSpaceParams.zw, 1 ) * fLinearDepthTap.z;
 		vEmitterPos[3] = float3( vSampleUV[1].zw * cbSSDO.viewSpaceParams.xy + cbSSDO.viewSpaceParams.zw, 1 ) * fLinearDepthTap.w;
 
-		// Compute the vectors from the receiver to the emitters
+														  
 		min16float3 vSample[4];
 		vSample[0] = vEmitterPos[0] - vReceiverPos;
 		vSample[1] = vEmitterPos[1] - vReceiverPos;
 		vSample[2] = vEmitterPos[2] - vReceiverPos;
 		vSample[3] = vEmitterPos[3] - vReceiverPos;
 		
-		// Compute squared vector length
+								  
 		min16float4 fVecLenSqr = min16float4( dot( vSample[0], vSample[0] ), dot( vSample[1], vSample[1] ), dot( vSample[2], vSample[2] ), dot( vSample[3], vSample[3] ) );
 		
-		// Normalize vectors
+					  
 		vSample[0] = normalize( vSample[0] );
 		vSample[1] = normalize( vSample[1] );
 		vSample[2] = normalize( vSample[2] );
 		vSample[3] = normalize( vSample[3] );
 
-		// Compute obscurance using form factor of disks
+												  
 		const min16float radiusWS = (radius.x * fCenterDepth) * cbSSDO.viewSpaceParams.x * cbSSDO.nearFarClipDist.y;
-		const min16float emitterScale = narrowBand ? 0.5 : 2.5;
-		const min16float emitterArea = (emitterScale * PI * radiusWS * radiusWS) / (float)(samplesNum / 2);
+		const min16float emitterScale =
+			(band == 0) ? 1.5 :
+			(band == 1) ? 1.0  :
+			(band == 2) ? 1.5  :
+			              3.0;
+		const min16float emitterArea = (emitterScale * PI * radiusWS * radiusWS) / 4.0;
 		min16float4 fNdotSamp = min16float4( dot( vNormalVS, vSample[0] ), dot( vNormalVS, vSample[1] ), dot( vNormalVS, vSample[2] ), dot( vNormalVS, vSample[3] ) );
 		min16float4 fObscurance = emitterArea * saturate( fNdotSamp ) / (fVecLenSqr + emitterArea) * fadeoutWH;
 
-		// Accumulate AO and bent normal as SH basis
+											  
 		sh2.w += dot( fObscurance, 1.h );
 		sh2.xyz += fObscurance.x * vSample[0] + fObscurance.y * vSample[1] + fObscurance.z * vSample[2] + fObscurance.w * vSample[3];
 	}
@@ -651,7 +659,6 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 
 	const min16float fNormFac = 0.15;
 	sh2.xyzw *= fNormFac;
-	// soft clamp to avoid max‑dark clipping on sharp corners
 	sh2.w = sh2.w / (0.7h + sh2.w);
 		
 	// Heightmap AO
