@@ -513,10 +513,8 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	pixout OUT = (pixout) 0;
 	
     // Taps arranged with golden-angle spiral (more isotropic, less patterning)
-	static const int samplesNum = 32;
-	// 32-tap kernel (keeps your original 16 first, appends 16 new taps)
-	// 3-decimal style, roughly uniform spiral-ish distribution in unit disk
-	static const float2 kernel[32] = {
+	static const int samplesNum = 20;
+	static const float2 kernel[20] = {
 		float2( 0.166,  0.000),
 		float2(-0.279,  0.256),
 		float2( 0.039, -0.449),
@@ -533,23 +531,10 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 		float2( 0.846, -0.118),
 		float2(-0.438,  0.821),
 		float2( 0.512,  0.779),
-
 		float2(-0.915,  0.126),
 		float2( 0.931,  0.214),
 		float2(-0.701, -0.622),
-		float2( 0.287,  0.934),
-		float2( 0.043, -0.958),
-		float2(-0.958, -0.041),
-		float2( 0.742, -0.548),
-		float2(-0.312,  0.901),
-		float2( 0.603,  0.742),
-		float2(-0.083, -0.992),
-		float2(-0.553,  0.776),
-		float2( 0.970, -0.018),
-		float2(-0.873,  0.410),
-		float2( 0.414, -0.873),
-		float2(-0.226, -0.952),
-		float2( 0.792,  0.520)
+		float2( 0.287,  0.934)
 	};
 	
 	float4 screenTC;
@@ -571,11 +556,11 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	float maxRadius = cbSSDO.ssdoParams.w;
 	if (int(IN.WPos.x) & 1) maxRadius *= 0.5;
 	if (int(IN.WPos.y) & 1) maxRadius *= 0.5;
-	
-const min16float2 rLarge = clamp(cbSSDO.ssdoParams.xy * cbSSDO.ssdoSecondaryBandRatioWH / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius); // large (from secondary ratio)
-const min16float2 rNear  = clamp(cbSSDO.ssdoParams.xy * 0.700 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // near/contact
-const min16float2 rBase  = clamp(cbSSDO.ssdoParams.xy * 5.800 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // base
-const min16float2 rFar2x = clamp(cbSSDO.ssdoParams.xy * 11.000 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // extra far                   
+	const min16float2 rMicro = clamp(cbSSDO.ssdoParams.xy * 0.520 / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius);
+	const min16float2 rLarge = clamp(cbSSDO.ssdoParams.xy * cbSSDO.ssdoSecondaryBandRatioWH / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius); // large (from secondary ratio)
+	const min16float2 rNear  = clamp(cbSSDO.ssdoParams.xy * 1.300 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // near/contact
+	const min16float2 rBase  = clamp(cbSSDO.ssdoParams.xy * 5.800 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // base
+	const min16float2 rFar2x = clamp(cbSSDO.ssdoParams.xy * 11.000 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // extra far                   
 
     // Compute jittering matrix (add parity offset to break 4x4 repetition)
     const min16float jitterIndex = dot( frac( screenTC.zw ), min16float2( 1, 0.25 ) );
@@ -609,18 +594,19 @@ const min16float2 rFar2x = clamp(cbSSDO.ssdoParams.xy * 11.000 / fCenterDepth,  
 	[unroll]
 	for (int smpl = 0; smpl < samplesNum; smpl += 4)
 	{ 
-		const int bandGroup = smpl / 4; // 0..7 when samplesNum=32
-		const int band = bandGroup / 2; // maps to 0..3
+		const int band = smpl / 4; // 0..3
 		const min16float2 radius =
-				(band == 0) ? rNear  :
-				(band == 1) ? rBase  :
-				(band == 2) ? rLarge : rFar2x;
+			(band == 0) ? rMicro :
+			(band == 1) ? rNear  :
+			(band == 2) ? rBase  :
+			(band == 3) ? rLarge : rFar2x;
 
 		// Weights sum to 1.000
 		const min16float bandWeight =
-			(band == 0) ? 0.320h :
-			(band == 1) ? 0.320h :
-			(band == 2) ? 0.180h : 0.180h;
+			(band == 0) ? 0.25h :
+			(band == 1) ? 0.24h :
+			(band == 2) ? 0.225h :
+			(band == 3) ? 0.15h : 0.135h;
 
 		min16float4 vSampleUV[2];
 		vSampleUV[0].xy = linearUV.xy + rotatedKernel[smpl+0].xy * radius;
@@ -672,20 +658,17 @@ const min16float2 rFar2x = clamp(cbSSDO.ssdoParams.xy * 11.000 / fCenterDepth,  
 		// Compute obscurance using form factor of disks
 		const min16float radiusWS = (radius.x * fCenterDepth) * cbSSDO.viewSpaceParams.x * cbSSDO.nearFarClipDist.y;
 		const min16float emitterScale =
-			(band == 0) ? 1.600h : // near
-			(band == 1) ? 2.200h : // base
-			(band == 2) ? 0.900h : // large secondary (gentle)
+			(band == 0) ? 2.800h : // near
+			(band == 1) ? 1.600h : // near
+			(band == 2) ? 2.700h : // base
+			(band == 3) ? 1.350h : // large secondary (gentle)
 						  0.700h;  // far2x (very gentle)
-		const min16float emitterArea = (emitterScale * PI * radiusWS * radiusWS) / 8.0h;
-		min16float4 fNdotSamp = min16float4(
-			dot(vNormalVS, vSample[0]),
-			dot(vNormalVS, vSample[1]),
-			dot(vNormalVS, vSample[2]),
-			dot(vNormalVS, vSample[3]));
-		min16float4 fObscurance = emitterArea * saturate(fNdotSamp) / (fVecLenSqr + emitterArea) * (fadeoutWH * bandWeight);
+		const min16float emitterArea = (emitterScale * PI * radiusWS * radiusWS) / 5.0h; // 5 bands
+		min16float4 fNdotSamp = min16float4( dot( vNormalVS, vSample[0] ), dot( vNormalVS, vSample[1] ), dot( vNormalVS, vSample[2] ), dot( vNormalVS, vSample[3] ) );
+		min16float4 fObscurance = emitterArea * saturate( fNdotSamp ) / (fVecLenSqr + emitterArea) * (fadeoutWH * bandWeight);
 
 		// Accumulate AO and bent normal as SH basis
-		sh2.w += dot(fObscurance, 1.h);
+		sh2.w += dot( fObscurance, 1.h );
 		sh2.xyz += fObscurance.x * vSample[0] + fObscurance.y * vSample[1] + fObscurance.z * vSample[2] + fObscurance.w * vSample[3];
 	}
 	
