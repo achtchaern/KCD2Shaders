@@ -513,8 +513,8 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	pixout OUT = (pixout) 0;
 	
     // Taps arranged with golden-angle spiral (more isotropic, less patterning)
-	static const int samplesNum = 20;
-	static const float2 kernel[20] = {
+	static const int samplesNum = 24;
+	static const float2 kernel[24] = {
 		float2( 0.166,  0.000),
 		float2(-0.279,  0.256),
 		float2( 0.039, -0.449),
@@ -523,7 +523,11 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 		float2( 0.521, -0.290),
 		float2(-0.192,  0.588),
 		float2(-0.174, -0.597),
-		float2( 0.667,  0.151),
+		float2( 0.043, -0.958),
+		float2(-0.958, -0.041),
+		float2( 0.742, -0.548),
+		float2(-0.312,  0.901),
+		float2( 0.667,  0.151),
 		float2(-0.666,  0.208),
 		float2( 0.097,  0.742),
 		float2( 0.257, -0.733),
@@ -531,11 +535,14 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 		float2( 0.846, -0.118),
 		float2(-0.438,  0.821),
 		float2( 0.512,  0.779),
+	
 		float2(-0.915,  0.126),
 		float2( 0.931,  0.214),
 		float2(-0.701, -0.622),
 		float2( 0.287,  0.934)
+		
 	};
+
 	
 	float4 screenTC;
 	screenTC.xy = IN.WPos.xy * cbSSDO.screenSize.zw;	
@@ -559,6 +566,7 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	const min16float2 rMicro = clamp(cbSSDO.ssdoParams.xy * 0.520 / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius);
 	const min16float2 rLarge = clamp(cbSSDO.ssdoParams.xy * cbSSDO.ssdoSecondaryBandRatioWH / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius); // large (from secondary ratio)
 	const min16float2 rNear  = clamp(cbSSDO.ssdoParams.xy * 1.300 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // near/contact
+	const min16float2 rMid   = clamp(cbSSDO.ssdoParams.xy * 3.200 / fCenterDepth, cbSSDO.ssdoParams.z, maxRadius); // NEW between near/base
 	const min16float2 rBase  = clamp(cbSSDO.ssdoParams.xy * 5.800 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // base
 	const min16float2 rFar2x = clamp(cbSSDO.ssdoParams.xy * 11.000 / fCenterDepth,                                 cbSSDO.ssdoParams.z, maxRadius); // extra far                   
 
@@ -594,19 +602,22 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 	[unroll]
 	for (int smpl = 0; smpl < samplesNum; smpl += 4)
 	{ 
-		const int band = smpl / 4; // 0..3
+		const int band = smpl / 4; // 0..5
 		const min16float2 radius =
 			(band == 0) ? rMicro :
 			(band == 1) ? rNear  :
-			(band == 2) ? rBase  :
-			(band == 3) ? rLarge : rFar2x;
+			(band == 2) ? rMid   :
+			(band == 3) ? rBase  :
+			(band == 4) ? rLarge : rFar2x;
 
 		// Weights sum to 1.000
 		const min16float bandWeight =
-			(band == 0) ? 0.25h :
-			(band == 1) ? 0.24h :
-			(band == 2) ? 0.225h :
-			(band == 3) ? 0.15h : 0.135h;
+			(band == 0) ? 0.24h  : // micro
+			(band == 1) ? 0.22h  : // near
+			(band == 2) ? 0.11h  : // mid (new, now visible)
+			(band == 3) ? 0.22h  : // base
+			(band == 4) ? 0.15h  : // large
+						  0.06h;   // far2x
 
 		min16float4 vSampleUV[2];
 		vSampleUV[0].xy = linearUV.xy + rotatedKernel[smpl+0].xy * radius;
@@ -658,12 +669,13 @@ pixout SSDO_Sampling_PS(vtxOut IN)
 		// Compute obscurance using form factor of disks
 		const min16float radiusWS = (radius.x * fCenterDepth) * cbSSDO.viewSpaceParams.x * cbSSDO.nearFarClipDist.y;
 		const min16float emitterScale =
-			(band == 0) ? 2.800h : // near
+			(band == 0) ? 2.800h : // micro
 			(band == 1) ? 1.600h : // near
-			(band == 2) ? 2.700h : // base
-			(band == 3) ? 1.350h : // large secondary (gentle)
-						  0.700h;  // far2x (very gentle)
-		const min16float emitterArea = (emitterScale * PI * radiusWS * radiusWS) / 5.0h; // 5 bands
+			(band == 2) ? 2.300h : // mid (new)
+			(band == 3) ? 2.700h : // base
+			(band == 4) ? 1.350h : // large
+						  0.700h;  // far2x
+		const min16float emitterArea = (emitterScale * PI * radiusWS * radiusWS) / 6.0h;
 		min16float4 fNdotSamp = min16float4( dot( vNormalVS, vSample[0] ), dot( vNormalVS, vSample[1] ), dot( vNormalVS, vSample[2] ), dot( vNormalVS, vSample[3] ) );
 		min16float4 fObscurance = emitterArea * saturate( fNdotSamp ) / (fVecLenSqr + emitterArea) * (fadeoutWH * bandWeight);
 
